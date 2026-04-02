@@ -1,128 +1,120 @@
 //+------------------------------------------------------------------+
-//|                                           Range_Breakout_EA.mq5  |
-//|                                        Bản quyền: Đối tác lập trình|
+//|                                         Range Breakout Rene.mq5  |
+//|                                        Range Breakout Strategy   |
 //+------------------------------------------------------------------+
-#property copyright "Đối tác lập trình"
-#property version   "1.30"
+#property copyright "Range Breakout Strategy"
+#property version   "2.00"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
-#include <Trade\HistoryOrderInfo.mqh>
 
-//--- ĐỊNH NGHĨA CÁC MENU LỰA CHỌN (ENUM) ---
-enum ENUM_LOT_METHOD {
-    CALC_FIXED_LOT, // Cố định Lot
-    CALC_RISK_MONEY // Tính theo Risk (USD)
+//--- ENUM DEFINITIONS ---
+
+enum ENUM_VOLUME_MODE {
+   VOLUME_FIXED,           // Fixed Lots
+   RISK_PERCENT,           // Risk % of Balance
+   RISK_MONEY,             // Risk Money (USD)
+   FIXED_LOTS_PER_MONEY    // Fixed Lots per x Money
 };
 
-enum ENUM_EXIT_MODE {
-    EXIT_TIME_ONLY,   // 1. Chỉ đóng theo Thời gian (Không TP)
-    EXIT_RR_ONLY,     // 2. Chỉ đóng theo TP (Risk:Reward)
-    EXIT_BOTH_TIME_RR // 3. Kết hợp (Chạm TP trước hoặc Hết giờ)
+enum ENUM_TARGET_CALC_MODE {
+   TARGET_OFF,             // OFF (No TP)
+   TARGET_POINTS,          // Points
+   TARGET_RISK_REWARD      // Risk:Reward Ratio
 };
 
 enum ENUM_STOP_CALC_MODE {
-    CALC_MODE_OFF,     // Tắt (Dùng SL ở biên đối diện)
-    CALC_MODE_FACTOR,  // Tính theo Hệ số (Factor x Range)
-    CALC_MODE_PERCENT, // Tính theo % Giá vào lệnh
-    CALC_MODE_POINTS   // Tính theo số Points cố định
+   STOP_OFF,               // OFF (SL at opposite border)
+   STOP_POINTS,            // Points
+   STOP_FACTOR             // Factor (1.0 = opposite border)
 };
 
-//--- CÁC THÔNG SỐ ĐẦU VÀO (INPUT GROUPS) ---
+//--- INPUT PARAMETERS ---
 
-input group "=== 1. Thiết lập Vùng giá (Giờ Server) ==="
-input ENUM_TIMEFRAMES InpRangeTimeFrame   = PERIOD_M1;  // Khung thời gian đo Range
-input int             InpRangeHourStart   = 3;      // Giờ bắt đầu đo Range
-input int             InpRangeMinuteStart = 0;      // Phút bắt đầu đo Range
-input int             InpRangeHourEnd     = 6;      // Giờ kết thúc đo Range
-input int             InpRangeMinuteEnd   = 0;      // Phút kết thúc đo Range
-input int             InpDeleteOrderHour  = 18;     // Giờ xóa lệnh chờ (Delete Order)
-input int             InpDeleteOrderMinute= 0;      // Phút xóa lệnh chờ
+input group "=== A. General Settings ==="
+input ENUM_TIMEFRAMES     InpRangeTimeFrame      = PERIOD_M1;    // Timeframe Range Calculation
+input ENUM_VOLUME_MODE    InpVolumeMode          = VOLUME_FIXED; // Trading Volume Mode
+input double              InpFixedLots           = 0.01;         // Fixed Lots (for VOLUME_FIXED)
+input double              InpLotsPerMoney        = 1000.0;       // Fixed Lots Per x Money (Balance)
+input double              InpRiskPercent         = 0.5;          // Risk % of Balance
+input double              InpRiskMoney           = 50.0;         // Risk Money (USD)
+input int                 InpOrderBuffer         = 0;            // Order Buffer (Points)
+input ENUM_TARGET_CALC_MODE InpTargetMode        = TARGET_OFF;   // Take Profit Mode
+input double              InpTargetValue         = 100.0;        // TP Value (Points or R:R ratio)
+input ENUM_STOP_CALC_MODE InpStopMode            = STOP_FACTOR;  // Stop Loss Mode
+input double              InpStopValue           = 1.0;          // SL Value (Points or Factor)
+input ulong               InpMagicNumber         = 111;          // Magic Number
 
-input group "=== 2. Cài đặt Thời gian Đóng lệnh ==="
-input int             InpTradingEndHour   = 18;     // Giờ đóng toàn bộ lệnh cuối ngày
-input int             InpTradingEndMinute = 0;      // Phút đóng toàn bộ lệnh
+input group "=== B. Time Settings (Server Time) ==="
+input int                 InpRangeStartHour      = 0;            // Range Start Hour
+input int                 InpRangeStartMinute    = 0;            // Range Start Minute
+input int                 InpRangeEndHour        = 7;            // Range End Hour
+input int                 InpRangeEndMinute      = 30;           // Range End Minute
+input int                 InpDeleteOrderHour     = 18;           // Delete Orders Hour
+input int                 InpDeleteOrderMinute   = 0;            // Delete Orders Minute
+input bool                InpClosePositions      = true;         // Close Positions at End of Day
+input int                 InpClosePositionHour   = 18;           // Close Positions Hour
+input int                 InpClosePositionMinute = 0;            // Close Positions Minute
 
-input group "=== 3. Quản lý Khối lượng (Lot) ==="
-input ENUM_LOT_METHOD InpLotMethod        = CALC_FIXED_LOT; // Cách tính Lot
-input double          InpFixedLot         = 0.1;            // Khối lượng (Nếu chọn Cố định)
-input double          InpRiskMoney        = 50.0;           // Risk Money USD (Nếu chọn Risk)
-input ulong           InpMagicNumber      = 102030;         // Magic Number
+input group "=== C. Trading Frequency & Filters ==="
+input int                 InpMaxLongTrades       = 1;            // Max Long Trades per Day
+input int                 InpMaxShortTrades      = 1;            // Max Short Trades per Day
+input int                 InpMaxTotalTrades      = 2;            // Max Total Trades per Day
+input int                 InpMinRangePoints      = 0;            // Min Range (Points)
+input int                 InpMaxRangePoints      = 100000;       // Max Range (Points)
+input double              InpMinRangePercent     = 0.0;          // Min Range (% of Price)
+input double              InpMaxRangePercent     = 100.0;        // Max Range (% of Price)
 
-input group "=== 4. Quản lý Chốt lời (Take Profit) ==="
-input ENUM_EXIT_MODE  InpExitMode         = EXIT_BOTH_TIME_RR; // Phương pháp Chốt lệnh
-input double          InpRiskReward       = 2.0;               // Tỷ lệ R:R (Ví dụ: 2.0 là 1 mất 2 được)
-
-input group "=== 5. Quản lý Dừng lỗ (Stop Loss) ==="
-input ENUM_STOP_CALC_MODE InpStopCalcMode = CALC_MODE_FACTOR; // Chế độ tính Stop Loss
-input double              InpStopValue    = 1.0;              // Giá trị (Factor/Percent/Points)
-
-input group "=== 6. Trading Frequency ==="
-input int             InpMaxLongTrade     = 1;      // Max Long Trade
-input int             InpMaxShortTrade    = 1;      // Max Short Trade
-input int             InpMaxTotalTrade    = 2;      // Max Total Trade
-
-input group "=== 7. Range Filter ==="
-input int             InpMinRangePoint    = 0;      // Min Range (Points)
-input double          InpMinRangePercent  = 0.0;    // Min Range (%)
-input int             InpMaxRangePoint    = 100000; // Max Range (Points)
-input double          InpMaxRangePercent  = 100.0;  // Max Range (%)
-
-input group "=== 8. Trailing Stop (Chandelier) ==="
-input bool            InpUseTrailing      = true;   // Kích hoạt Trailing Stop
-input int             InpATRPeriod        = 22;     // ATR Period
-input double          InpChandelierMult   = 3.0;    // Chandelier Multiplier
-
-//--- BIẾN TOÀN CỤC ---
+//--- GLOBAL VARIABLES ---
 CTrade         trade;
 CPositionInfo  posInfo;
-int            currentDay          = -1;
-int            dailyLongTrades     = 0;
-int            dailyShortTrades    = 0;
-bool           isRangeCalculated   = false;
-double         RangeHigh           = 0;
-double         RangeLow            = 0;
-int            atrHandle           = INVALID_HANDLE;
-string         eaStateStr          = "Khởi tạo";
 
-// --- Biến tối ưu hiệu suất ---
-bool           isTesting           = false;
-bool           isOptimization      = false;
-bool           isVisualMode        = false;
-bool           dayFullyTraded      = false;   // Đã hết quota trade trong ngày
-bool           closedForDay        = false;   // Đã đóng lệnh cuối ngày rồi
-bool           deletedForDay       = false;   // Đã xóa pending orders rồi
-bool           rangeFilterPassed   = false;   // Range filter đã pass (chỉ cần kiểm tra 1 lần)
-bool           rangeFilterChecked  = false;   // Đã kiểm tra range filter chưa
+int            currentDay           = -1;
+int            dailyLongTrades      = 0;
+int            dailyShortTrades     = 0;
+bool           isRangeCalculated    = false;
+double         RangeHigh            = 0;
+double         RangeLow             = 0;
+string         eaStateStr           = "Initializing";
 
-// --- Biến cache cho Chandelier ---
-datetime       lastChandelierBar   = 0;
-double         cachedChandelierLong  = 0;
-double         cachedChandelierShort = 0;
+// Performance optimization flags
+bool           isTesting            = false;
+bool           isOptimization       = false;
+bool           isVisualMode         = false;
+bool           dayFullyTraded       = false;
+bool           closedForDay         = false;
+bool           deletedForDay        = false;
+bool           rangeFilterPassed    = false;
+bool           rangeFilterChecked   = false;
+bool           pendingOrdersPlaced  = false;
 
-// --- Biến cache pre-computed cho SL/TP (dùng giá tại breakout level thay vì ask/bid) ---
-double         precomputedSlDistBuy  = 0;
-double         precomputedSlDistSell = 0;
-double         precomputedSlBuy      = 0;
-double         precomputedSlSell     = 0;
-double         precomputedTpBuy      = 0;
-double         precomputedTpSell     = 0;
-bool           slTpPrecomputed       = false;
+// Pre-computed SL/TP values
+double         preSlDistBuy         = 0;
+double         preSlDistSell        = 0;
+double         preSlBuy             = 0;
+double         preSlSell            = 0;
+double         preTpBuy             = 0;
+double         preTpSell            = 0;
+double         preBuyEntry          = 0;
+double         preSellEntry         = 0;
+bool           slTpPrecomputed      = false;
 
 //+------------------------------------------------------------------+
-//| Hàm Khởi tạo                                                     |
+//| Expert initialization                                             |
 //+------------------------------------------------------------------+
 int OnInit() {
-    isTesting = (bool)MQLInfoInteger(MQL_TESTER);
+    isTesting      = (bool)MQLInfoInteger(MQL_TESTER);
     isOptimization = (bool)MQLInfoInteger(MQL_OPTIMIZATION);
-    isVisualMode = (bool)MQLInfoInteger(MQL_VISUAL_MODE);
+    isVisualMode   = (bool)MQLInfoInteger(MQL_VISUAL_MODE);
     
     trade.SetExpertMagicNumber(InpMagicNumber);
+    trade.SetDeviationInPoints(10); // Slippage tolerance
     
-    atrHandle = iATR(_Symbol, PERIOD_CURRENT, InpATRPeriod);
-    if(atrHandle == INVALID_HANDLE) {
-        Print("Lỗi tạo ATR Indicator");
-        return(INIT_FAILED);
+    // Validate inputs
+    if(InpRangeStartHour < 0 || InpRangeStartHour > 23 ||
+       InpRangeEndHour < 0   || InpRangeEndHour > 23) {
+        Print("ERROR: Invalid Range Hour settings!");
+        return(INIT_PARAMETERS_INCORRECT);
     }
 
     datetime currentTime = TimeCurrent();
@@ -133,18 +125,17 @@ int OnInit() {
     RecoverState(currentTime, dt);
     
     UpdateDashboard();
-    Print("Bot Morning Range v1.3 khởi chạy thành công!");
+    Print("Range Breakout Rene v2.0 initialized successfully!");
     return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Hàm Deinit                                                       |
+//| Expert deinitialization                                           |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-    if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
-    Comment(""); // Clear dashboard
+    Comment("");
     
-    // Clean up range boxes created by EA
+    // Clean up range box objects
     for(int i = ObjectsTotal(0) - 1; i >= 0; i--) {
         string name = ObjectName(0, i);
         if(StringFind(name, "RangeBox_") == 0) {
@@ -154,33 +145,36 @@ void OnDeinit(const int reason) {
 }
 
 //+------------------------------------------------------------------+
-//| Phục hồi trạng thái khi EA restart (Crash/Mất điện)              |
+//| Recover state on restart (crash/power loss)                       |
 //+------------------------------------------------------------------+
 void RecoverState(datetime currentTime, MqlDateTime &dt) {
-    dailyLongTrades = 0;
+    dailyLongTrades  = 0;
     dailyShortTrades = 0;
     isRangeCalculated = false;
     RangeHigh = 0;
-    RangeLow = 0;
+    RangeLow  = 0;
     eaStateStr = "Recovering...";
 
-    // 1. Phục hồi số lệnh đã giao dịch trong ngày từ History
-    HistorySelect(currentTime - dt.hour*3600 - dt.min*60 - dt.sec, currentTime + 86400); // Lịch sử ngày hôm nay
+    // 1. Count today's trades from history
+    datetime dayStart = currentTime - dt.hour * 3600 - dt.min * 60 - dt.sec;
+    HistorySelect(dayStart, currentTime + 86400);
     for(int i = 0; i < HistoryDealsTotal(); i++) {
         ulong ticket = HistoryDealGetTicket(i);
         if(ticket > 0) {
-            long magic = HistoryDealGetInteger(ticket, DEAL_MAGIC);
+            long   magic  = HistoryDealGetInteger(ticket, DEAL_MAGIC);
             string symbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
-            if(magic == InpMagicNumber && symbol == _Symbol) {
+            if(magic == (long)InpMagicNumber && symbol == _Symbol) {
                 if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_IN) {
-                    if(HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_BUY) dailyLongTrades++;
-                    else if(HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_SELL) dailyShortTrades++;
+                    if(HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_BUY)
+                        dailyLongTrades++;
+                    else if(HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_SELL)
+                        dailyShortTrades++;
                 }
             }
         }
     }
 
-    // Đếm lệnh đang mở (nếu có lệnh in-market thì cũng được tính là đang trade)
+    // Check for open positions
     bool hasOpenTrades = false;
     for(int i = PositionsTotal() - 1; i >= 0; i--) {
         if(posInfo.SelectByIndex(i)) {
@@ -189,27 +183,41 @@ void RecoverState(datetime currentTime, MqlDateTime &dt) {
             }
         }
     }
+    
+    // Check for pending orders
+    bool hasPendingOrders = false;
+    for(int i = OrdersTotal() - 1; i >= 0; i--) {
+        ulong ticket = OrderGetTicket(i);
+        if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == (long)InpMagicNumber) {
+            hasPendingOrders = true;
+        }
+    }
 
-    // 2. Tìm Object RangeBox của ngày hôm nay
-    MqlDateTime startDt = dt; startDt.hour = InpRangeHourStart; startDt.min = InpRangeMinuteStart; startDt.sec = 0;
+    // 2. Recover RangeBox from chart objects
+    MqlDateTime startDt = dt;
+    startDt.hour = InpRangeStartHour;
+    startDt.min  = InpRangeStartMinute;
+    startDt.sec  = 0;
     datetime startTime = StructToTime(startDt);
     string objName = "RangeBox_" + TimeToString(startTime, TIME_DATE);
     
     if(ObjectFind(0, objName) >= 0) {
-        RangeHigh = ObjectGetDouble(0, objName, OBJPROP_PRICE, 0); // Price 1 (High)
-        RangeLow  = ObjectGetDouble(0, objName, OBJPROP_PRICE, 1); // Price 2 (Low)
+        RangeHigh = ObjectGetDouble(0, objName, OBJPROP_PRICE, 0);
+        RangeLow  = ObjectGetDouble(0, objName, OBJPROP_PRICE, 1);
         if(RangeHigh > 0 && RangeLow > 0) {
             isRangeCalculated = true;
-            Print("Đã phục hồi RangeBox: High=", RangeHigh, " Low=", RangeLow);
+            PrecomputeSlTp();
+            Print("Recovered RangeBox: High=", RangeHigh, " Low=", RangeLow);
         }
     }
     
-    // Cập nhật flag quota
-    dayFullyTraded = (dailyLongTrades + dailyShortTrades >= InpMaxTotalTrade);
-    closedForDay = false;
-    deletedForDay = false;
+    // Update flags
+    dayFullyTraded    = (dailyLongTrades + dailyShortTrades >= InpMaxTotalTrades);
+    closedForDay      = false;
+    deletedForDay     = false;
     rangeFilterChecked = false;
-    slTpPrecomputed = false;
+    slTpPrecomputed   = false;
+    pendingOrdersPlaced = hasPendingOrders;
     
     if(dailyLongTrades > 0 || dailyShortTrades > 0 || hasOpenTrades) {
         eaStateStr = "Traded";
@@ -221,25 +229,35 @@ void RecoverState(datetime currentTime, MqlDateTime &dt) {
 }
 
 //+------------------------------------------------------------------+
-//| Cập nhật Dashboard                                               |
+//| Update Dashboard                                                  |
 //+------------------------------------------------------------------+
 void UpdateDashboard() {
-    // Tắt hoàn toàn Dashboard khi Optimization (không có chart)
     if(isOptimization) return;
-    
-    // Trong Tester (không visual): cũng không cần vẽ Dashboard
     if(isTesting && !isVisualMode) return;
     
-    string txt = "\n=== RANGE BREAKOUT RENE ===\n";
+    string txt = "\n=== RANGE BREAKOUT RENE v2.0 ===\n";
     txt += "State: " + eaStateStr + "\n";
-    txt += StringFormat("Trades Today: Long (%d/%d) | Short (%d/%d)\n", dailyLongTrades, InpMaxLongTrade, dailyShortTrades, InpMaxShortTrade);
+    txt += StringFormat("Trades: Long (%d/%d) | Short (%d/%d) | Total (%d/%d)\n",
+           dailyLongTrades, InpMaxLongTrades,
+           dailyShortTrades, InpMaxShortTrades,
+           dailyLongTrades + dailyShortTrades, InpMaxTotalTrades);
     
     if(isRangeCalculated) {
         double rangeSize = RangeHigh - RangeLow;
-        double rangeSizePoints = rangeSize / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-        txt += StringFormat("Range High: %.5f\n", RangeHigh);
-        txt += StringFormat("Range Low : %.5f\n", RangeLow);
-        txt += StringFormat("Range Size: %.1f Points\n", rangeSizePoints);
+        double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+        double rangePts = (point > 0) ? rangeSize / point : 0;
+        txt += StringFormat("Range High : %.5f\n", RangeHigh);
+        txt += StringFormat("Range Low  : %.5f\n", RangeLow);
+        txt += StringFormat("Range Size : %.1f Points\n", rangePts);
+        
+        if(slTpPrecomputed) {
+            txt += StringFormat("Buy Entry  : %.5f | SL: %.5f | TP: %.5f\n", preBuyEntry, preSlBuy, preTpBuy);
+            txt += StringFormat("Sell Entry : %.5f | SL: %.5f | TP: %.5f\n", preSellEntry, preSlSell, preTpSell);
+        }
+        
+        if(rangeFilterChecked && !rangeFilterPassed) {
+            txt += "*** RANGE FILTER: REJECTED ***\n";
+        }
     } else {
         txt += "Range: Not calculated yet\n";
     }
@@ -248,164 +266,100 @@ void UpdateDashboard() {
 }
 
 //+------------------------------------------------------------------+
-//| Hàm Tick (Kiểm tra điều kiện liên tục)                           |
+//| Main tick function                                                |
 //+------------------------------------------------------------------+
 void OnTick() {
     datetime currentTime = TimeCurrent();
     MqlDateTime dt;
     TimeToStruct(currentTime, dt);
 
-    // 1. KIỂM TRA NGÀY MỚI (Reset)
+    // 1. NEW DAY RESET
     if(dt.day_of_year != currentDay) {
-        currentDay = dt.day_of_year;
-        dailyLongTrades = 0;
-        dailyShortTrades = 0;
-        isRangeCalculated = false;
-        RangeHigh = 0;
-        RangeLow = 0;
-        dayFullyTraded = false;
-        closedForDay = false;
-        deletedForDay = false;
+        currentDay         = dt.day_of_year;
+        dailyLongTrades    = 0;
+        dailyShortTrades   = 0;
+        isRangeCalculated  = false;
+        RangeHigh          = 0;
+        RangeLow           = 0;
+        dayFullyTraded     = false;
+        closedForDay       = false;
+        deletedForDay      = false;
         rangeFilterChecked = false;
-        rangeFilterPassed = false;
-        slTpPrecomputed = false;
-        eaStateStr = "Waiting for Range";
+        rangeFilterPassed  = false;
+        slTpPrecomputed    = false;
+        pendingOrdersPlaced = false;
+        eaStateStr         = "Waiting for Range";
     }
 
-    // Thiết lập các mốc thời gian
-    MqlDateTime startDt = dt; startDt.hour = InpRangeHourStart; startDt.min = InpRangeMinuteStart; startDt.sec = 0;
-    MqlDateTime endDt   = dt; endDt.hour   = InpRangeHourEnd;   endDt.min   = InpRangeMinuteEnd;   endDt.sec = 0;
-    MqlDateTime closeDt = dt; closeDt.hour = InpTradingEndHour; closeDt.min = InpTradingEndMinute; closeDt.sec = 0;
-    MqlDateTime delDt   = dt; delDt.hour   = InpDeleteOrderHour; delDt.min = InpDeleteOrderMinute; delDt.sec = 0;
+    // Build time references
+    MqlDateTime startDt = dt; startDt.hour = InpRangeStartHour;    startDt.min = InpRangeStartMinute;    startDt.sec = 0;
+    MqlDateTime endDt   = dt; endDt.hour   = InpRangeEndHour;      endDt.min   = InpRangeEndMinute;      endDt.sec   = 0;
+    MqlDateTime delDt   = dt; delDt.hour   = InpDeleteOrderHour;   delDt.min   = InpDeleteOrderMinute;   delDt.sec   = 0;
+    MqlDateTime closDt  = dt; closDt.hour  = InpClosePositionHour; closDt.min  = InpClosePositionMinute; closDt.sec  = 0;
 
-    datetime startTime = StructToTime(startDt);
-    datetime endTime   = StructToTime(endDt);
-    datetime closeTime = StructToTime(closeDt);
-    datetime deleteTime= StructToTime(delDt);
+    datetime startTime  = StructToTime(startDt);
+    datetime endTime    = StructToTime(endDt);
+    datetime deleteTime = StructToTime(delDt);
+    datetime closeTime  = StructToTime(closDt);
 
+    // Update state display
     if(currentTime < endTime) {
-        eaStateStr = "Waiting for Range";
+        if(eaStateStr != "Traded" && eaStateStr != "Trading Ended")
+            eaStateStr = "Waiting for Range";
     } else if(currentTime >= endTime && isRangeCalculated) {
-        if(eaStateStr != "Traded" && eaStateStr != "Trading Ended for Day") eaStateStr = "Waiting Breakout";
+        if(eaStateStr != "Traded" && eaStateStr != "Trading Ended")
+            eaStateStr = "Waiting Breakout";
     }
 
-    // XÓA LỆNH CHỜ KHI TỚI GIỜ (chỉ thực hiện 1 lần)
+    // 2. DELETE PENDING ORDERS at scheduled time (once per day)
     if(currentTime >= deleteTime && !deletedForDay) {
         DeletePendingOrders();
         deletedForDay = true;
     }
 
-    // 2. ĐÓNG LỆNH THEO THỜI GIAN (chỉ thực hiện 1 lần)
-    if(currentTime >= closeTime) {
+    // 3. CLOSE POSITIONS at scheduled time (once per day)
+    if(currentTime >= closeTime && InpClosePositions) {
         if(!closedForDay) {
-            if(InpExitMode == EXIT_TIME_ONLY || InpExitMode == EXIT_BOTH_TIME_RR) {
-                CloseAllPositions();
-            }
+            CloseAllPositions();
+            DeletePendingOrders();
             closedForDay = true;
         }
-        eaStateStr = "Trading Ended for Day";
+        eaStateStr = "Trading Ended";
         UpdateDashboard();
-        return; // Hết ngày không quét tín hiệu nữa
+        return;
     }
 
-    // 3. TÍNH TOÁN VÙNG GIÁ
+    // 4. CALCULATE RANGE
     if(currentTime >= endTime && !isRangeCalculated) {
-        CalculateMorningRange(startTime, endTime);
+        CalculateRange(startTime, endTime);
     }
 
-    // 4. KIỂM TRA VÀO LỆNH (bỏ qua nếu đã hết quota)
+    // 5. ENTRY CHECK — place pending orders or market orders
     if(isRangeCalculated && currentTime >= endTime && !dayFullyTraded) {
         CheckBreakoutAndTrade();
     }
-    
-    // 5. TRAILING STOP (chỉ khi có lệnh mở)
-    if(InpUseTrailing) {
-        ApplyChandelierTrailingStop();
-    }
-    
+
     UpdateDashboard();
 }
 
 //+------------------------------------------------------------------+
-//| Trailing Stop (Chandelier) - Tối ưu: chỉ tính lại khi nến mới   |
+//| Calculate Range (High/Low) and draw box                           |
 //+------------------------------------------------------------------+
-void ApplyChandelierTrailingStop() {
-    // Early exit: không có position nào thì không cần quét
-    if(PositionsTotal() == 0) return;
-    
-    // Kiểm tra có position nào của EA không (tránh tính toán nặng khi không cần)
-    bool hasOurPositions = false;
-    for(int i = PositionsTotal() - 1; i >= 0; i--) {
-        ulong ticket = PositionGetTicket(i);
-        if(PositionSelectByTicket(ticket)) {
-            if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber) {
-                hasOurPositions = true;
-                break;
-            }
-        }
-    }
-    if(!hasOurPositions) return;
-    
-    // Tính Chandelier 1 lần cho mỗi cây nến mới (dữ liệu từ nến đã đóng không đổi trong cùng 1 nến)
-    datetime currentBarTime = (datetime)SeriesInfoInteger(_Symbol, PERIOD_CURRENT, SERIES_LASTBAR_DATE);
-    
-    if(currentBarTime != lastChandelierBar) {
-        double atr[];
-        if(CopyBuffer(atrHandle, 0, 1, 1, atr) <= 0) return;
-        
-        double high[], low[];
-        if(CopyHigh(_Symbol, PERIOD_CURRENT, 1, InpATRPeriod, high) <= 0 || CopyLow(_Symbol, PERIOD_CURRENT, 1, InpATRPeriod, low) <= 0) return;
-        
-        double highestH = high[ArrayMaximum(high)];
-        double lowestL = low[ArrayMinimum(low)];
-        
-        double atrValue = atr[0];
-        cachedChandelierLong = NormalizeDouble(highestH - atrValue * InpChandelierMult, _Digits);
-        cachedChandelierShort = NormalizeDouble(lowestL + atrValue * InpChandelierMult, _Digits);
-        
-        lastChandelierBar = currentBarTime;
-    }
-    
-    // Áp dụng trailing cho các position của EA
-    for(int i = PositionsTotal() - 1; i >= 0; i--) {
-        ulong ticket = PositionGetTicket(i);
-        if(PositionSelectByTicket(ticket)) {
-            if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber) {
-                double currentSL = PositionGetDouble(POSITION_SL);
-                long type = PositionGetInteger(POSITION_TYPE);
-                double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
-                
-                if(type == POSITION_TYPE_BUY) {
-                    // Dời SL lên nếu Chandelier cao hơn SL hiện tại (và phải thấp hơn giá hiện tại)
-                    if(cachedChandelierLong > currentSL && cachedChandelierLong < currentPrice) {
-                        trade.PositionModify(ticket, cachedChandelierLong, PositionGetDouble(POSITION_TP));
-                    }
-                } else if(type == POSITION_TYPE_SELL) {
-                    // Dời SL xuống nếu Chandelier thấp hơn SL hiện tại (hoặc chưa có SL) và phải cao hơn giá hiện tại
-                    if((cachedChandelierShort < currentSL || currentSL == 0) && cachedChandelierShort > currentPrice) {
-                        trade.PositionModify(ticket, cachedChandelierShort, PositionGetDouble(POSITION_TP));
-                    }
-                }
-            }
-        }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Tính toán Range & Vẽ Hộp                                         |
-//+------------------------------------------------------------------+
-void CalculateMorningRange(datetime startTime, datetime endTime) {
+void CalculateRange(datetime startTime, datetime endTime) {
     double high[], low[];
     
-    if(CopyHigh(_Symbol, InpRangeTimeFrame, startTime, endTime, high) <= 0 || 
-       CopyLow(_Symbol, InpRangeTimeFrame, startTime, endTime, low) <= 0) return;
+    if(CopyHigh(_Symbol, InpRangeTimeFrame, startTime, endTime, high) <= 0 ||
+       CopyLow(_Symbol, InpRangeTimeFrame, startTime, endTime, low) <= 0) {
+        Print("WARNING: Failed to copy range data.");
+        return;
+    }
 
     RangeHigh = high[ArrayMaximum(high)];
     RangeLow  = low[ArrayMinimum(low)];
     isRangeCalculated = true;
     eaStateStr = "Waiting Breakout";
 
-    // Vẽ hộp (bỏ qua khi Optimization hoặc Tester không visual)
+    // Draw range box (skip during optimization / non-visual testing)
     if(!isOptimization && (!isTesting || isVisualMode)) {
         string objName = "RangeBox_" + TimeToString(startTime, TIME_DATE);
         ObjectDelete(0, objName);
@@ -415,175 +369,353 @@ void CalculateMorningRange(datetime startTime, datetime endTime) {
         ObjectSetInteger(0, objName, OBJPROP_BACK, true);
     }
     
-    // Pre-compute SL/TP dựa trên breakout level (RangeHigh/RangeLow) thay vì ask/bid
-    // => Đảm bảo kết quả NHẤT QUÁN giữa Every Tick và M1 OHLC
     PrecomputeSlTp();
 }
 
 //+------------------------------------------------------------------+
-//| Pre-compute SL/TP dựa trên mức breakout cố định                  |
-//| Giải quyết sai khác Every Tick vs M1 OHLC                        |
+//| Pre-compute SL, TP, and Entry levels based on ranges              |
 //+------------------------------------------------------------------+
 void PrecomputeSlTp() {
     double rangeSize = RangeHigh - RangeLow;
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double point     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
     
-    // --- Range Filter (chỉ kiểm tra 1 lần) ---
-    double rangeSizePoints = rangeSize / point;
-    double rangeSizePercent = (rangeSize / RangeLow) * 100.0;
+    // --- RANGE FILTER ---
+    double rangeSizePoints  = (point > 0) ? rangeSize / point : 0;
+    double rangeSizePercent = (RangeLow > 0) ? (rangeSize / RangeLow) * 100.0 : 0;
     
     rangeFilterChecked = true;
-    if(rangeSizePoints < InpMinRangePoint || rangeSizePoints > InpMaxRangePoint) {
+    if(rangeSizePoints < InpMinRangePoints || rangeSizePoints > InpMaxRangePoints) {
         rangeFilterPassed = false;
+        Print("Range REJECTED (Points): ", rangeSizePoints, " not in [", InpMinRangePoints, ", ", InpMaxRangePoints, "]");
         return;
     }
     if(rangeSizePercent < InpMinRangePercent || rangeSizePercent > InpMaxRangePercent) {
         rangeFilterPassed = false;
+        Print("Range REJECTED (%): ", rangeSizePercent, " not in [", InpMinRangePercent, ", ", InpMaxRangePercent, "]");
         return;
     }
     rangeFilterPassed = true;
     
-    // --- Tính SL distance dựa trên breakout level cố định ---
-    // Dùng RangeHigh làm giá vào Buy, RangeLow làm giá vào Sell
-    // => Kết quả GIỐNG NHAU bất kể mô hình tick
-    precomputedSlDistBuy = rangeSize;
-    precomputedSlDistSell = rangeSize;
-
-    if(InpStopCalcMode == CALC_MODE_FACTOR) {
-        precomputedSlDistBuy = rangeSize * InpStopValue;
-        precomputedSlDistSell = rangeSize * InpStopValue;
-    } else if(InpStopCalcMode == CALC_MODE_PERCENT) {
-        precomputedSlDistBuy = RangeHigh * (InpStopValue / 100.0);
-        precomputedSlDistSell = RangeLow * (InpStopValue / 100.0);
-    } else if(InpStopCalcMode == CALC_MODE_POINTS) {
-        precomputedSlDistBuy = InpStopValue * point;
-        precomputedSlDistSell = InpStopValue * point;
+    // --- ENTRY LEVELS (with buffer) ---
+    double bufferDist = InpOrderBuffer * point;
+    preBuyEntry  = NormalizeDouble(RangeHigh + bufferDist, _Digits);
+    preSellEntry = NormalizeDouble(RangeLow  - bufferDist, _Digits);
+    
+    // --- STOP LOSS ---
+    switch(InpStopMode) {
+        case STOP_OFF:
+            // SL at opposite border
+            preSlBuy      = RangeLow;
+            preSlSell     = RangeHigh;
+            preSlDistBuy  = preBuyEntry - RangeLow;
+            preSlDistSell = RangeHigh - preSellEntry;
+            break;
+        case STOP_POINTS:
+            preSlDistBuy  = InpStopValue * point;
+            preSlDistSell = InpStopValue * point;
+            preSlBuy      = NormalizeDouble(preBuyEntry  - preSlDistBuy,  _Digits);
+            preSlSell     = NormalizeDouble(preSellEntry + preSlDistSell, _Digits);
+            break;
+        case STOP_FACTOR:
+            // Factor * RangeSize from entry level
+            // Factor = 1.0 means SL at opposite border distance
+            preSlDistBuy  = rangeSize * InpStopValue;
+            preSlDistSell = rangeSize * InpStopValue;
+            preSlBuy      = NormalizeDouble(preBuyEntry  - preSlDistBuy,  _Digits);
+            preSlSell     = NormalizeDouble(preSellEntry + preSlDistSell, _Digits);
+            break;
     }
-
-    // SL cố định dựa theo breakout level
-    if(InpStopCalcMode == CALC_MODE_OFF) {
-        precomputedSlBuy = RangeLow;
-        precomputedSlSell = RangeHigh;
-    } else {
-        precomputedSlBuy = RangeHigh - precomputedSlDistBuy;
-        precomputedSlSell = RangeLow + precomputedSlDistSell;
-    }
-
-    // TP cố định dựa theo breakout level
-    precomputedTpBuy = 0;
-    precomputedTpSell = 0;
-    if(InpExitMode == EXIT_RR_ONLY || InpExitMode == EXIT_BOTH_TIME_RR) {
-        precomputedTpBuy  = RangeHigh + (precomputedSlDistBuy * InpRiskReward);
-        precomputedTpSell = RangeLow - (precomputedSlDistSell * InpRiskReward);
+    
+    // --- TAKE PROFIT ---
+    preTpBuy  = 0;
+    preTpSell = 0;
+    switch(InpTargetMode) {
+        case TARGET_OFF:
+            // No TP
+            break;
+        case TARGET_POINTS:
+            preTpBuy  = NormalizeDouble(preBuyEntry  + InpTargetValue * point, _Digits);
+            preTpSell = NormalizeDouble(preSellEntry - InpTargetValue * point, _Digits);
+            break;
+        case TARGET_RISK_REWARD:
+            preTpBuy  = NormalizeDouble(preBuyEntry  + preSlDistBuy  * InpTargetValue, _Digits);
+            preTpSell = NormalizeDouble(preSellEntry - preSlDistSell * InpTargetValue, _Digits);
+            break;
     }
     
     slTpPrecomputed = true;
+    
+    PrintFormat("Pre-computed: BuyEntry=%.5f SL=%.5f TP=%.5f | SellEntry=%.5f SL=%.5f TP=%.5f",
+                preBuyEntry, preSlBuy, preTpBuy, preSellEntry, preSlSell, preTpSell);
 }
 
 //+------------------------------------------------------------------+
-//| Kiểm tra Phá vỡ & Vào lệnh (Kết hợp R:R)                         |
+//| Check for breakout and execute trades                             |
 //+------------------------------------------------------------------+
 void CheckBreakoutAndTrade() {
     if(dayFullyTraded) return;
     
-    // Range filter đã fail => không cần check nữa
+    // Range filter failed => skip
     if(rangeFilterChecked && !rangeFilterPassed) return;
     
-    // Chưa precompute SL/TP => không trade
+    // SL/TP not ready => skip
     if(!slTpPrecomputed) return;
 
-    // Phân tích trạng thái lệnh đang mở
-    bool hasOpenLong = false;
+    // Count open positions of this EA
+    bool hasOpenLong  = false;
     bool hasOpenShort = false;
     for(int i = PositionsTotal() - 1; i >= 0; i--) {
         ulong ticket = PositionGetTicket(i);
-        if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber) {
-            long type = PositionGetInteger(POSITION_TYPE);
-            if(type == POSITION_TYPE_BUY) hasOpenLong = true;
-            if(type == POSITION_TYPE_SELL) hasOpenShort = true;
+        if(PositionSelectByTicket(ticket)) {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+               PositionGetInteger(POSITION_MAGIC) == (long)InpMagicNumber) {
+                long type = PositionGetInteger(POSITION_TYPE);
+                if(type == POSITION_TYPE_BUY)  hasOpenLong  = true;
+                if(type == POSITION_TYPE_SELL) hasOpenShort = true;
+            }
+        }
+    }
+    
+    // Check pending orders already placed
+    bool hasPendingBuyStop  = false;
+    bool hasPendingSellStop = false;
+    for(int i = OrdersTotal() - 1; i >= 0; i--) {
+        ulong ticket = OrderGetTicket(i);
+        if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+           OrderGetInteger(ORDER_MAGIC) == (long)InpMagicNumber) {
+            long orderType = OrderGetInteger(ORDER_TYPE);
+            if(orderType == ORDER_TYPE_BUY_STOP)  hasPendingBuyStop  = true;
+            if(orderType == ORDER_TYPE_SELL_STOP) hasPendingSellStop = true;
         }
     }
 
-    bool canBuy = (!hasOpenLong) && (dailyLongTrades < InpMaxLongTrade) && ((dailyLongTrades + dailyShortTrades) < InpMaxTotalTrade);
-    bool canSell = (!hasOpenShort) && (dailyShortTrades < InpMaxShortTrade) && ((dailyLongTrades + dailyShortTrades) < InpMaxTotalTrade);
+    int totalTrades = dailyLongTrades + dailyShortTrades;
+    bool canBuy  = !hasOpenLong  && !hasPendingBuyStop  && (dailyLongTrades  < InpMaxLongTrades)  && (totalTrades < InpMaxTotalTrades);
+    bool canSell = !hasOpenShort && !hasPendingSellStop && (dailyShortTrades < InpMaxShortTrades) && (totalTrades < InpMaxTotalTrades);
+    
     if(!canBuy && !canSell) return;
 
     double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-    // Kích hoạt BUY - Dùng SL/TP đã pre-compute từ breakout level
-    if(canBuy && ask > RangeHigh) {
-        double lotSizeBuy = CalculateLotSize(precomputedSlDistBuy);
-        if(lotSizeBuy <= 0) return;
-        if(trade.Buy(lotSizeBuy, _Symbol, ask, precomputedSlBuy, precomputedTpBuy, "Breakout Buy")) {
-            dailyLongTrades++;
-            eaStateStr = "Traded";
-            dayFullyTraded = (dailyLongTrades + dailyShortTrades >= InpMaxTotalTrade);
-            PrintFormat(">> Mở BUY. Lot: %.2f | SL: %f | TP: %f", lotSizeBuy, precomputedSlBuy, precomputedTpBuy);
+    // --- BUY LOGIC ---
+    if(canBuy) {
+        double lotBuy = CalculateLotSize(preSlDistBuy);
+        if(lotBuy > 0) {
+            if(ask > preBuyEntry) {
+                // Price already above entry => Market Order Buy
+                if(trade.Buy(lotBuy, _Symbol, ask, preSlBuy, preTpBuy, "RangeBreakout Buy")) {
+                    dailyLongTrades++;
+                    eaStateStr = "Traded";
+                    dayFullyTraded = (dailyLongTrades + dailyShortTrades >= InpMaxTotalTrades);
+                    PrintFormat(">> MARKET BUY. Lot: %.2f | Entry: %.5f | SL: %.5f | TP: %.5f",
+                               lotBuy, ask, preSlBuy, preTpBuy);
+                }
+            } else {
+                // Price below entry => Place Buy Stop
+                if(trade.BuyStop(lotBuy, preBuyEntry, _Symbol, preSlBuy, preTpBuy, ORDER_TIME_DAY, 0, "RangeBreakout BuyStop")) {
+                    PrintFormat(">> BUY STOP placed at %.5f | Lot: %.2f | SL: %.5f | TP: %.5f",
+                               preBuyEntry, lotBuy, preSlBuy, preTpBuy);
+                } else {
+                    PrintFormat("WARNING: BuyStop failed. Error: %d", GetLastError());
+                }
+            }
         }
     }
-    // Kích hoạt SELL
-    else if(canSell && bid < RangeLow) {
-        double lotSizeSell = CalculateLotSize(precomputedSlDistSell);
-        if(lotSizeSell <= 0) return;
-        if(trade.Sell(lotSizeSell, _Symbol, bid, precomputedSlSell, precomputedTpSell, "Breakout Sell")) {
-            dailyShortTrades++;
-            eaStateStr = "Traded";
-            dayFullyTraded = (dailyLongTrades + dailyShortTrades >= InpMaxTotalTrade);
-            PrintFormat(">> Mở SELL. Lot: %.2f | SL: %f | TP: %f", lotSizeSell, precomputedSlSell, precomputedTpSell);
+
+    // --- SELL LOGIC ---
+    if(canSell) {
+        double lotSell = CalculateLotSize(preSlDistSell);
+        if(lotSell > 0) {
+            if(bid < preSellEntry) {
+                // Price already below entry => Market Order Sell
+                if(trade.Sell(lotSell, _Symbol, bid, preSlSell, preTpSell, "RangeBreakout Sell")) {
+                    dailyShortTrades++;
+                    eaStateStr = "Traded";
+                    dayFullyTraded = (dailyLongTrades + dailyShortTrades >= InpMaxTotalTrades);
+                    PrintFormat(">> MARKET SELL. Lot: %.2f | Entry: %.5f | SL: %.5f | TP: %.5f",
+                               lotSell, bid, preSlSell, preTpSell);
+                }
+            } else {
+                // Price above entry => Place Sell Stop
+                if(trade.SellStop(lotSell, preSellEntry, _Symbol, preSlSell, preTpSell, ORDER_TIME_DAY, 0, "RangeBreakout SellStop")) {
+                    PrintFormat(">> SELL STOP placed at %.5f | Lot: %.2f | SL: %.5f | TP: %.5f",
+                               preSellEntry, lotSell, preSlSell, preTpSell);
+                } else {
+                    PrintFormat("WARNING: SellStop failed. Error: %d", GetLastError());
+                }
+            }
         }
     }
 }
 
 //+------------------------------------------------------------------+
-//| Tính toán Lot (Hỗ trợ 2 chế độ: Cố định / Risk)                  |
+//| Calculate lot size based on volume mode                           |
 //+------------------------------------------------------------------+
 double CalculateLotSize(double slDistance) {
-    if(InpLotMethod == CALC_FIXED_LOT) {
-        return InpFixedLot;
+    double lotSize = 0;
+    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    switch(InpVolumeMode) {
+        case VOLUME_FIXED:
+            lotSize = InpFixedLots;
+            break;
+            
+        case RISK_PERCENT: {
+            double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+            double riskMoney = balance * (InpRiskPercent / 100.0);
+            lotSize = CalcLotFromRisk(riskMoney, slDistance);
+            break;
+        }
+        
+        case RISK_MONEY:
+            lotSize = CalcLotFromRisk(InpRiskMoney, slDistance);
+            break;
+            
+        case FIXED_LOTS_PER_MONEY: {
+            double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+            if(InpLotsPerMoney > 0) {
+                lotSize = InpFixedLots * MathFloor(balance / InpLotsPerMoney);
+            }
+            if(lotSize <= 0) lotSize = InpFixedLots; // Minimum 1 unit
+            break;
+        }
     }
+    
+    // Normalize to lot step
+    if(lotStep > 0)
+        lotSize = MathFloor(lotSize / lotStep) * lotStep;
+    
+    // Clamp to min/max
+    if(lotSize < minLot) lotSize = minLot;
+    if(lotSize > maxLot) lotSize = maxLot;
+    
+    return lotSize;
+}
 
+//+------------------------------------------------------------------+
+//| Helper: Calculate lots from risk money and SL distance            |
+//+------------------------------------------------------------------+
+double CalcLotFromRisk(double riskMoney, double slDistance) {
+    if(slDistance <= 0) return 0;
+    
     double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
     double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double lotStep   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
     
-    if(slDistance <= 0 || tickSize <= 0 || tickValue <= 0) return 0.0;
-
-    double rawLot = InpRiskMoney / ((slDistance / tickSize) * tickValue);
-    double finalLot = MathFloor(rawLot / lotStep) * lotStep;
+    if(tickSize <= 0 || tickValue <= 0) return 0;
     
-    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-    if(finalLot < minLot) finalLot = minLot;
-    if(finalLot > maxLot) finalLot = maxLot;
-
-    return finalLot;
+    double lot = riskMoney / ((slDistance / tickSize) * tickValue);
+    return lot;
 }
 
 //+------------------------------------------------------------------+
-//| Đóng lệnh cuối ngày                                              |
+//| Close all open positions of this EA                               |
 //+------------------------------------------------------------------+
 void CloseAllPositions() {
-    if(PositionsTotal() == 0) return; 
-
+    if(PositionsTotal() == 0) return;
+    
     for(int i = PositionsTotal() - 1; i >= 0; i--) {
         ulong ticket = PositionGetTicket(i);
-        if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber) {
-            trade.PositionClose(ticket);
+        if(PositionSelectByTicket(ticket)) {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+               PositionGetInteger(POSITION_MAGIC) == (long)InpMagicNumber) {
+                if(!trade.PositionClose(ticket)) {
+                    PrintFormat("WARNING: Failed to close position #%d. Error: %d", ticket, GetLastError());
+                }
+            }
         }
     }
 }
 
 //+------------------------------------------------------------------+
-//| Xóa tất cả các lệnh chờ (Pending Orders)                         |
+//| Delete all pending orders of this EA                              |
 //+------------------------------------------------------------------+
 void DeletePendingOrders() {
-    if(OrdersTotal() == 0) return; 
-
+    if(OrdersTotal() == 0) return;
+    
     for(int i = OrdersTotal() - 1; i >= 0; i--) {
         ulong ticket = OrderGetTicket(i);
-        if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == InpMagicNumber) {
-            trade.OrderDelete(ticket);
+        if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+           OrderGetInteger(ORDER_MAGIC) == (long)InpMagicNumber) {
+            if(!trade.OrderDelete(ticket)) {
+                PrintFormat("WARNING: Failed to delete order #%d. Error: %d", ticket, GetLastError());
+            }
         }
     }
 }
+
+//+------------------------------------------------------------------+
+//| Trade transaction handler — track pending order fills             |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result) {
+    // When a pending order is filled, update the daily trade counter
+    if(trans.type == TRADE_TRANSACTION_DEAL_ADD) {
+        ulong dealTicket = trans.deal;
+        if(HistoryDealSelect(dealTicket)) {
+            long magic  = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+            string sym  = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+            long entry  = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+            long dtype  = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+            
+            if(magic == (long)InpMagicNumber && sym == _Symbol && entry == DEAL_ENTRY_IN) {
+                if(dtype == DEAL_TYPE_BUY) {
+                    // Only count if not already counted (market orders count in CheckBreakoutAndTrade)
+                    // For pending order fills, we need to increment here
+                    // Check if this was from a pending order (not a direct market order)
+                    long orderTicket = (long)HistoryDealGetInteger(dealTicket, DEAL_ORDER);
+                    if(orderTicket > 0) {
+                        // Re-sync trade count from history to avoid double-counting
+                        ResyncTradeCount();
+                    }
+                } else if(dtype == DEAL_TYPE_SELL) {
+                    long orderTicket = (long)HistoryDealGetInteger(dealTicket, DEAL_ORDER);
+                    if(orderTicket > 0) {
+                        ResyncTradeCount();
+                    }
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Re-synchronize daily trade count from history                     |
+//+------------------------------------------------------------------+
+void ResyncTradeCount() {
+    datetime currentTime = TimeCurrent();
+    MqlDateTime dt;
+    TimeToStruct(currentTime, dt);
+    datetime dayStart = currentTime - dt.hour * 3600 - dt.min * 60 - dt.sec;
+    
+    int longCount  = 0;
+    int shortCount = 0;
+    
+    HistorySelect(dayStart, currentTime + 86400);
+    for(int i = 0; i < HistoryDealsTotal(); i++) {
+        ulong ticket = HistoryDealGetTicket(i);
+        if(ticket > 0) {
+            long   magic = HistoryDealGetInteger(ticket, DEAL_MAGIC);
+            string sym   = HistoryDealGetString(ticket, DEAL_SYMBOL);
+            if(magic == (long)InpMagicNumber && sym == _Symbol) {
+                if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_IN) {
+                    if(HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_BUY)
+                        longCount++;
+                    else if(HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_SELL)
+                        shortCount++;
+                }
+            }
+        }
+    }
+    
+    dailyLongTrades  = longCount;
+    dailyShortTrades = shortCount;
+    dayFullyTraded   = (dailyLongTrades + dailyShortTrades >= InpMaxTotalTrades);
+    
+    if(dailyLongTrades > 0 || dailyShortTrades > 0)
+        eaStateStr = "Traded";
+}
+//+------------------------------------------------------------------+
