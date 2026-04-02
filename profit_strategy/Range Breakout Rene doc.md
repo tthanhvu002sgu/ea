@@ -11,6 +11,22 @@ uj cũng ngon
 stoploss: theo % tk hay theo factor cũng ổn
 
 
+xauusd - peperstone
+20 - 26
+fixed lot : 0.01
+stoploss: factor 1
+profit:1723
+dd: 19%
+
+xauusd - pepperstone
+20 - 26
+fixed lot: 0.01
+stoploss: % balance
+profit: 1743
+dd: 14%   
+=> giống với EA của Rene
+
+
 =====
 kết hơp TP + thời gian
 
@@ -59,10 +75,10 @@ tệ hơn nhiều
 #### 5. Thoát lệnh & Quản trị rủi ro (Exit & Risk Management)
 * **Stop Loss (SL):** 
     * **Mặc định:** Đặt tại biên đối diện của Range Box (Mua ở High, SL ở Low).
-    * **Tùy chọn:** Đặt theo hệ số nhân với Range (Ví dụ: 1.0 * biên độ Range) hoặc theo số Points cố định.
+    * **Tùy chọn:** Đặt theo hệ số nhân với Range (Ví dụ: 1.0 * biên độ Range), theo số Points cố định, hoặc cắt lỗ theo **Phần trăm (%) Tài khoản** (STOP_ACCOUNT_PERCENT).
 * **Take Profit (TP):** 
     * **Tỷ lệ R:R:** Chốt lời tại mức giá đạt tỷ lệ rủi ro/lợi nhuận là **1:2** (hoặc tùy cấu hình).
-    * **Thời gian:** Tự động đóng toàn bộ vị thế tại giờ kết thúc ngày giao dịch (Mặc định: 18:00 Server).
+    * **Thời gian:** Tự động đóng vị thế tại khung giờ tùy chọn. Đã nâng cấp để có thể **phân tách khung giờ đóng lệnh Buy và Sell riêng biệt** (Ví dụ: Close Long lúc 18:00, Close Short lúc 19:00).
 * **Trailing Stop:** (Chiến lược hiện tại tập trung vào chốt lời mục tiêu cố định hoặc theo thời gian để tối ưu hóa xác suất).
 * **Quy mổ vị thế (Position Sizing):** 
     * **Fixed Lot:** Khối lượng cố định (Ví dụ: 0.1 Lot).
