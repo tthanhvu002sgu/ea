@@ -1,0 +1,78 @@
+{
+  "metadata": {
+    "file": "EURGBP_H1.csv",
+    "total_candles": 15308,
+    "analysis_date": "2026-02-10 17:34:17.650265"
+  },
+  "mei_score": 81.52894363255007,
+  "classification": {
+    "class": "HIGHLY EFFICIENT",
+    "color": "\ud83d\udd34",
+    "description": "Very hard to profit",
+    "recommendation": "AVOID OR MINIMIZE",
+    "strategies": [
+      "Market making only",
+      "Ultra HFT strategies",
+      "Find other markets",
+      "Focus on fundamentals"
+    ]
+  },
+  "components": {
+    "hurst": {
+      "value": 0.44527859268029046,
+      "score": 89.0557185360581,
+      "interpretation": "Moderate Mean Reversion (Moderately inefficient)"
+    },
+    "autocorr": {
+      "value": 0.014110946012269301,
+      "lags": {
+        "lag_1": 0.05850524724896167,
+        "lag_2": 0.003830274061845944,
+        "lag_3": 0.00024664877786339737,
+        "lag_4": 0.009350264071947308,
+        "lag_5": 0.0004275823499159182,
+        "lag_6": 0.01770624717026617,
+        "lag_7": 0.00983963399079211,
+        "lag_8": 0.028584201644325843,
+        "lag_9": 0.010923360686706409,
+        "lag_10": 0.0016960001200682334
+      },
+      "score": 85.8890539877307,
+      "interpretation": "Low serial correlation - Efficient"
+    },
+    "variance_ratio": {
+      "value": 0.8945152838063439,
+      "z_statistic": -1.7563196447049323,
+      "significant": false,
+      "score": 94.7257641903172,
+      "interpretation": "Random walk"
+    },
+    "runs_test": {
+      "actual_runs": 2605,
+      "expected_runs": 2470.4772221097387,
+      "z_score": 3.8287260688219655,
+      "score": 0.0,
+      "interpretation": "Too many runs (mean reverting)"
+    },
+    "entropy": {
+      "value": 4.364875493905752,
+      "normalized": 0.9519980792033115,
+      "patterns_found": 24,
+      "patterns_possible": 24,
+      "score": 95.19980792033115,
+      "interpretation": "Highly random (efficient)"
+    },
+    "predictability": {
+      "ma_sharpe": -1.136368545433688,
+      "rsi_sharpe": 2.02643986382178,
+      "momentum_sharpe": -1.7039112436741668,
+      "avg_sharpe": -0.27127997509535823,
+      "score": 100.0,
+      "interpretation": "Simple strategies fail (Efficient)"
+    }
+  },
+  "summary": [
+    "Market shows mean-reverting behavior - good for reversal strategies",
+    "Low autocorrelation - market is efficient"
+  ]
+}

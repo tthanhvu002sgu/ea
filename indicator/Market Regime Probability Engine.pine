@@ -1,0 +1,260 @@
+//@version=5
+indicator("The 5 Market Regimes - Probabilistic Engine (3-Body Chaos)", shorttitle="5 Regimes (3-Body)", overlay=true)
+
+// =========================================================================
+// KIẾN TRÚC 3 VẬT THỂ & ĐIỂM LAGRANGE (3-BODY CHAOS)
+// =========================================================================
+
+// --- Inputs ---
+N_base  = input.int(20, "Khung thời gian gốc (Base M)", minval=5)
+N_min   = input.int(5,  "N Tối thiểu (Chaos/Lagrange)", minval=2)
+N_max   = input.int(50, "N Tối đa (Trending/Surfing)", maxval=200)
+len_roc = input.int(5,  "Chu kỳ Đạo hàm (Độ dốc nến)", minval=2)
+
+// Cấp phát tĩnh để tránh lỗi "max_bars_back" khi dùng mảng động
+_dummy_c = nz(close[200])
+_dummy_v = nz(volume[200])
+_dummy_h = nz(high[200])
+_dummy_l = nz(low[200])
+_dummy_o = nz(open[200])
+
+// --- Hàm Hỗ Trợ (Fuzzy Logic) ---
+f_up(x, a, b) => math.max(0.0, math.min(1.0, (x - a) / (b - a)))
+f_down(x, a, b) => math.max(0.0, math.min(1.0, (b - x) / (b - a)))
+
+// --- Hàm Tính Toán Động (Dynamic Length Functions) ---
+// Thay thế hàm ta.sma, ta.variance bằng vòng lặp để hỗ trợ 'series int' cho độ dài N động
+f_dyn_mean(src, len) =>
+    float sum = 0.0
+    int l = math.max(1, len)
+    for i = 0 to l - 1
+        sum += nz(src[i])
+    sum / l
+
+f_dyn_variance(src, len) =>
+    float mean = f_dyn_mean(src, len)
+    float sum_sq = 0.0
+    int l = math.max(1, len)
+    for i = 0 to l - 1
+        sum_sq += math.pow(nz(src[i]) - mean, 2)
+    sum_sq / l
+
+f_dyn_stdev(src, len) => math.sqrt(f_dyn_variance(src, len))
+
+// =========================================================================
+// 🧮 LỚP 0: ĐO LƯỜNG HỖN LOẠN & CỬA SỔ THÍCH NGHI (CHAOS & ADAPTIVE N)
+// =========================================================================
+float log_ret = close > 0 and nz(close[1]) > 0 ? math.log(close / close[1]) : 0.0
+float ret_2p  = close > 0 and nz(close[2]) > 0 ? math.log(close / close[2]) : 0.0
+
+float var_1p_base = ta.variance(log_ret, N_base)
+float var_2p_base = ta.variance(ret_2p, N_base) 
+float VR_base     = var_1p_base > 0 ? var_2p_base / (2.0 * var_1p_base) : 1.0
+float H_base      = math.max(0.1, math.min(0.9, 0.5 * math.log(math.max(VR_base, 0.01)) / math.log(2) + 0.5))
+
+// Cấp độ hỗn loạn: 1.0 (Maximum Chaos khi H = 0.5) -> 0.0 (Trend Rõ)
+float chaos_factor = f_down(math.abs(H_base - 0.5), 0.0, 0.2) 
+
+// N Thích nghi (Adaptive N): Càng hỗn loạn, N càng nhỏ (phản ứng nhanh như lướt sóng)
+int N_dyn = int(math.round(N_max - chaos_factor * (N_max - N_min)))
+
+// =========================================================================
+// 🧮 LỚP 1: 3 VẬT THỂ HẤP DẪN (FEATURE ENGINEERING VỚI N_DYN)
+// =========================================================================
+
+// ☄️ VẬT THỂ 1: LỰC QUÁN TÍNH CHÍNH (Price Action & Trend) - Hệ số Hurst & Skewness
+float var_1p_dyn = f_dyn_variance(log_ret, N_dyn)
+float var_2p_dyn = f_dyn_variance(ret_2p, N_dyn)
+float VR_dyn     = var_1p_dyn > 0 ? var_2p_dyn / (2.0 * var_1p_dyn) : 1.0
+float H          = math.max(0.1, math.min(0.9, 0.5 * math.log(math.max(VR_dyn, 0.01)) / math.log(2) + 0.5))
+
+float mean_ret   = f_dyn_mean(log_ret, N_dyn)
+float std_ret    = f_dyn_stdev(log_ret, N_dyn)
+float sum_skew   = 0.0
+for i = 0 to N_dyn - 1
+    float diff = nz(log_ret[i]) - mean_ret
+    sum_skew += math.pow(diff, 3)
+float S = std_ret > 0 ? (sum_skew / N_dyn) / math.pow(std_ret, 3) : 0.0
+
+// 🌑 VẬT THỂ 2: LỰC CẢN KHÔNG-THỜI GIAN (Volatility Squeeze/Expansion) - BB/ATR
+float bb_stdev = f_dyn_stdev(close, N_dyn)
+float tr_val   = math.max(math.max(high - low, math.abs(high - nz(close[1]))), math.abs(low - nz(close[1])))
+float dyn_atr  = f_dyn_mean(tr_val, N_dyn)
+float V        = dyn_atr > 0 ? (2.0 * bb_stdev) / (1.5 * dyn_atr) : 1.0
+
+// 🌍 VẬT THỂ 3: ĐỘNG CƠ XUNG LỰC BÊN NGOÀI (CVD Z-Score Dòng Tiền)
+float hl_diff   = high - low
+float delta_vol = hl_diff > 0 ? volume * (close - open) / hl_diff : (close > open ? volume : (close < open ? -volume : 0))
+float mean_dv   = f_dyn_mean(delta_vol, N_dyn)
+float std_dv    = f_dyn_stdev(delta_vol, N_dyn)
+
+int half_n      = math.max(3, int(N_dyn / 2))
+float signal_dv = 0.0
+for i = 0 to half_n - 1
+    signal_dv += nz(delta_vol[i])
+
+float baseline = mean_dv * half_n
+float spread   = std_dv * math.sqrt(half_n)
+float Z        = spread > 0 ? (signal_dv - baseline) / spread : 0.0
+
+// =========================================================================
+// 🧠 LỚP 2: ĐỘNG CƠ CHẤM ĐIỂM XÁC SUẤT BẰNG FUZZY LOGIC
+// =========================================================================
+float score_Acc      = 1.0 * f_down(H, 0.4, 0.55) + 1.5 * f_up(S, 0.0, 1.0)      + 2.0 * f_down(V, 0.8, 1.2) + 1.5 * f_up(Z, 0.5, 1.5)
+float score_Dist     = 1.0 * f_down(H, 0.4, 0.55) + 1.5 * f_down(S, -1.0, 0.0)   + 2.0 * f_up(V, 1.0, 1.4)   + 1.5 * f_down(Z, -1.5, -0.5)
+float score_Markup   = 1.5 * f_up(H, 0.5, 0.7)    + 0.5 * f_up(S, 0.0, 0.4)      + 1.0 * f_up(V, 1.2, 1.8)   + 2.0 * f_up(Z, 1.0, 3.0)
+float score_Markdown = 1.5 * f_up(H, 0.5, 0.7)    + 0.5 * f_down(S, -0.4, 0.0)   + 1.0 * f_up(V, 1.2, 1.8)   + 2.0 * f_down(Z, -3.0, -1.0)
+float score_Chop     = 2.0 * f_down(math.abs(H - 0.5), 0.0, 0.15) + 1.0 * f_down(math.abs(S), 0.0, 0.5) + 1.0 * f_down(math.abs(V - 1.0), 0.0, 0.3) + 2.0 * f_down(math.abs(Z), 0.0, 1.0)
+
+// =========================================================================
+// 🌐 THUẬT TOÁN CHUẨN HÓA (SOFTMAX)
+// =========================================================================
+float max_score = math.max(score_Acc, score_Dist, score_Markup, score_Markdown, score_Chop)
+
+float e_Acc      = math.exp(score_Acc - max_score)
+float e_Dist     = math.exp(score_Dist - max_score)
+float e_Markup   = math.exp(score_Markup - max_score)
+float e_Markdown = math.exp(score_Markdown - max_score)
+float e_Chop     = math.exp(score_Chop - max_score)
+
+float sum_e = e_Acc + e_Dist + e_Markup + e_Markdown + e_Chop
+
+float P_Acc      = (e_Acc / sum_e) * 100.0
+float P_Dist     = (e_Dist / sum_e) * 100.0
+float P_Markup   = (e_Markup / sum_e) * 100.0
+float P_Markdown = (e_Markdown / sum_e) * 100.0
+float P_Chop     = (e_Chop / sum_e) * 100.0
+
+// =========================================================================
+// 📈 LƯỚT SÓNG ĐIỂM LAGRANGE (HIỆU ỨNG CÁNH BƯỚM)
+// =========================================================================
+float slope_Markup   = ta.linreg(P_Markup, len_roc, 0) - ta.linreg(P_Markup, len_roc, 1)
+float slope_Markdown = ta.linreg(P_Markdown, len_roc, 0) - ta.linreg(P_Markdown, len_roc, 1)
+float slope_Acc      = ta.linreg(P_Acc, len_roc, 0) - ta.linreg(P_Acc, len_roc, 1)
+float slope_Dist     = ta.linreg(P_Dist, len_roc, 0) - ta.linreg(P_Dist, len_roc, 1)
+float slope_Z        = ta.linreg(Z, len_roc, 0) - ta.linreg(Z, len_roc, 1)
+
+// 🌌 TÌM ĐIỂM LAGRANGE (Vùng Cân Bằng Lực)
+// Khi P_Chop vượt 75%, Biến động (V) nén < 1.0 và Dòng tiền lặng (Z ~ 0)
+bool is_lagrange = P_Chop > 75.0 and V < 1.0 and math.abs(Z) < 0.8
+
+// 🦋 HIỆU ỨNG CÁNH BƯỚM (Butterfly Breakout)
+// Không đợi xác suất đổi kịch bản, ta lướt ngay khi Dòng tiền Z bùng nổ từ Điểm Lagrange
+bool butterfly_buy  = (is_lagrange[1] or is_lagrange[2]) and Z > 1.0 and slope_Z > 0 and close > open
+bool butterfly_sell = (is_lagrange[1] or is_lagrange[2]) and Z < -1.0 and slope_Z < 0 and close < open
+
+// Giao cắt tĩnh truyền thống (Hệ thống cũ)
+bool early_buy_signal  = ta.crossover(P_Markup, P_Acc) and slope_Markup > 0 and P_Markup > 25 and P_Chop < 35
+bool early_sell_signal = ta.crossover(P_Markdown, P_Dist) and slope_Markdown > 0 and P_Markdown > 25 and P_Chop < 35
+
+// Tổng hợp
+bool go_long  = butterfly_buy or early_buy_signal
+bool go_short = butterfly_sell or early_sell_signal
+
+// =========================================================================
+// 🎨 MÀU SẮC & DASHBOARD
+// =========================================================================
+color col_Markup   = color.new(#00E676, 10)
+color col_Markdown = color.new(#FF1744, 10)
+color col_Acc      = color.new(#2962FF, 10)
+color col_Dist     = color.new(#FF9100, 10)
+color col_Chop     = color.new(#9E9E9E, 30)
+
+// Vẽ Signal lên Chart (đã ẩn)
+
+color CLR_BG       = color.new(#0D1117, 10)
+color CLR_BG_ROW   = color.new(#161B22, 10)
+color CLR_BORDER   = color.new(#30363D, 0)
+color CLR_TEXT     = color.new(#E6EDF3, 0)
+color CLR_DIM      = color.new(#8B949E, 0)
+
+float max_P = math.max(P_Acc, P_Dist, P_Markup, P_Markdown, P_Chop)
+string dom_regime_name = "Chop"
+string dom_action = ""
+color dom_color = col_Chop
+
+if max_P == P_Markup
+    dom_regime_name := "📈 TĂNG TRƯỞNG"
+    dom_action := "→ Lướt sóng Kéo dài (Surfing)"
+    dom_color := col_Markup
+else if max_P == P_Markdown
+    dom_regime_name := "📉 SUY THOÁI"
+    dom_action := "→ Tránh Mua / Bán Khống"
+    dom_color := col_Markdown
+else if max_P == P_Acc
+    dom_regime_name := "🔋 TÍCH LŨY"
+    dom_action := "→ Lên đạn (Chờ Cánh bướm)"
+    dom_color := col_Acc
+else if max_P == P_Dist
+    dom_regime_name := "⚠️ PHÂN PHỐI"
+    dom_action := "→ Thoát vị thế"
+    dom_color := col_Dist
+else
+    dom_regime_name := "🌀 LAGRANGE (CHOP)"
+    dom_action := "→ Điểm mồi nổ (Squeeze)"
+    dom_color := col_Chop
+
+string signal_text = butterfly_buy ? "🦋 BUTTERFLY: Lướt Mua" : (butterfly_sell ? "🦋 BUTTERFLY: Lướt Bán" : (early_buy_signal ? "🟢 MUA SỚM" : (early_sell_signal ? "🔴 BÁN SỚM" : (is_lagrange ? "🌌 TẠI ĐIỂM LAGRANGE" : "— Chờ đợi"))))
+
+color  signal_clr  = butterfly_buy ? col_Markup : (butterfly_sell ? col_Markdown : (early_buy_signal ? col_Markup : (early_sell_signal ? col_Markdown : (is_lagrange ? color.new(#AB47BC, 0) : CLR_DIM))))
+
+var table HUD = table.new(position.bottom_right, 3, 16, bgcolor=CLR_BG, border_color=CLR_BORDER, border_width=1, frame_color=CLR_BORDER, frame_width=1)
+
+if barstate.islast
+    table.cell(HUD, 0, 0, "🧠 MARKET REGIME (3-BODY CHAOS)", text_color=color.new(#FFD600, 0), text_size=size.normal, bgcolor=color.new(#1565C0, 30), text_halign=text.align_center)
+    table.merge_cells(HUD, 0, 0, 2, 0)
+
+    table.cell(HUD, 0, 1, dom_regime_name + "\n" + str.tostring(max_P, "#.#") + "% xác suất", text_color=dom_color, text_size=size.normal, bgcolor=color.new(dom_color, 88), text_halign=text.align_center)
+    table.merge_cells(HUD, 0, 1, 2, 1)
+
+    table.cell(HUD, 0, 2, dom_action, text_color=dom_color, text_size=size.small, bgcolor=CLR_BG, text_halign=text.align_center)
+    table.merge_cells(HUD, 0, 2, 2, 2)
+
+    table.cell(HUD, 0, 3, signal_text, text_color=color.white, text_size=size.small, bgcolor=color.new(signal_clr, 50), text_halign=text.align_center)
+    table.merge_cells(HUD, 0, 3, 2, 3)
+
+    table.cell(HUD, 0, 4, "── Xác suất Regime ──", text_color=CLR_DIM, text_size=size.tiny, bgcolor=CLR_BG, text_halign=text.align_center)
+    table.merge_cells(HUD, 0, 4, 2, 4)
+
+    table.cell(HUD, 0, 5, "📈 Tăng trưởng", text_color=col_Markup, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 5, str.tostring(P_Markup, "#.#") + "%", text_color=col_Markup, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_right)
+    table.cell(HUD, 2, 5, slope_Markup > 0 ? "▲" : (slope_Markup < 0 ? "▼" : "►"), text_color=slope_Markup > 0 ? col_Markup : (slope_Markup < 0 ? col_Markdown : CLR_DIM), text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_center)
+
+    table.cell(HUD, 0, 6, "🔋 Tích lũy", text_color=col_Acc, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 6, str.tostring(P_Acc, "#.#") + "%", text_color=col_Acc, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_right)
+    table.cell(HUD, 2, 6, slope_Acc > 0 ? "▲" : (slope_Acc < 0 ? "▼" : "►"), text_color=slope_Acc > 0 ? col_Markup : (slope_Acc < 0 ? col_Markdown : CLR_DIM), text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_center)
+
+    table.cell(HUD, 0, 7, "⚠️ Phân phối", text_color=col_Dist, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 7, str.tostring(P_Dist, "#.#") + "%", text_color=col_Dist, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_right)
+    table.cell(HUD, 2, 7, slope_Dist > 0 ? "▲" : (slope_Dist < 0 ? "▼" : "►"), text_color=slope_Dist > 0 ? col_Markdown : (slope_Dist < 0 ? col_Markup : CLR_DIM), text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_center)
+
+    table.cell(HUD, 0, 8, "📉 Suy thoái", text_color=col_Markdown, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 8, str.tostring(P_Markdown, "#.#") + "%", text_color=col_Markdown, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_right)
+    table.cell(HUD, 2, 8, slope_Markdown > 0 ? "▲" : (slope_Markdown < 0 ? "▼" : "►"), text_color=slope_Markdown > 0 ? col_Markdown : (slope_Markdown < 0 ? col_Markup : CLR_DIM), text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_center)
+
+    table.cell(HUD, 0, 9, "🌀 Nhiễu (Chop)", text_color=col_Chop, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 9, str.tostring(P_Chop, "#.#") + "%", text_color=col_Chop, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_right)
+    table.cell(HUD, 2, 9, "", bgcolor=CLR_BG_ROW)
+
+    table.cell(HUD, 0, 10, "── Lực Nội Tại (3 Bodies) ──", text_color=CLR_DIM, text_size=size.tiny, bgcolor=CLR_BG, text_halign=text.align_center)
+    table.merge_cells(HUD, 0, 10, 2, 10)
+
+    table.cell(HUD, 0, 11, "Chu kỳ N Động", text_color=color.new(#00E5FF,0), text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 11, str.tostring(N_dyn) + " nến", text_color=color.white, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_center)
+    table.cell(HUD, 2, 11, "Chaos=" + str.tostring(chaos_factor, "#.##"), text_color=CLR_DIM, text_size=size.tiny, bgcolor=CLR_BG_ROW, text_halign=text.align_right)
+
+    table.cell(HUD, 0, 12, "Xu hướng (H)", text_color=CLR_DIM, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 12, H > 0.6 ? "Có trend rõ" : (H < 0.45 ? "Chop" : "Chưa rõ"), text_color=H > 0.6 ? col_Markup : (H < 0.45 ? col_Dist : col_Chop), text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_center)
+    table.cell(HUD, 2, 12, str.tostring(H, "#.##"), text_color=CLR_DIM, text_size=size.tiny, bgcolor=CLR_BG_ROW, text_halign=text.align_right)
+
+    table.cell(HUD, 0, 13, "Thiên hướng (S)", text_color=CLR_DIM, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 13, S > 0.2 ? "Nghiêng tăng" : (S < -0.2 ? "Nghiêng giảm" : "Cân bằng"), text_color=S > 0.2 ? col_Markup : (S < -0.2 ? col_Markdown : col_Chop), text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_center)
+    table.cell(HUD, 2, 13, str.tostring(S, "#.##"), text_color=CLR_DIM, text_size=size.tiny, bgcolor=CLR_BG_ROW, text_halign=text.align_right)
+
+    table.cell(HUD, 0, 14, "Biến động (V)", text_color=CLR_DIM, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 14, V > 1.2 ? "Vượt nén" : (V < 1.0 ? "Nén chặt" : "Bình thường"), text_color=V > 1.2 ? col_Markdown : (V < 1.0 ? col_Acc : col_Chop), text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_center)
+    table.cell(HUD, 2, 14, str.tostring(V, "#.##"), text_color=CLR_DIM, text_size=size.tiny, bgcolor=CLR_BG_ROW, text_halign=text.align_right)
+
+    table.cell(HUD, 0, 15, "Dòng tiền (Z)", text_color=CLR_DIM, text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_left)
+    table.cell(HUD, 1, 15, Z > 1.0 ? "Tiền vào" : (Z < -1.0 ? "Tiền ra" : "Trung"), text_color=Z > 1.0 ? col_Markup : (Z < -1.0 ? col_Markdown : col_Chop), text_size=size.small, bgcolor=CLR_BG_ROW, text_halign=text.align_center)
+    table.cell(HUD, 2, 15, str.tostring(Z, "#.##"), text_color=CLR_DIM, text_size=size.tiny, bgcolor=CLR_BG_ROW, text_halign=text.align_right)

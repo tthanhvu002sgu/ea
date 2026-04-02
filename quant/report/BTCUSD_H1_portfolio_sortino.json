@@ -1,0 +1,118 @@
+{
+  "metadata": {
+    "analysis_file": "report\\BTCUSD_H1_analysis.json",
+    "total_strategies_analyzed": 32,
+    "selected_strategies": 3,
+    "optimization_success": true
+  },
+  "portfolio_allocation": [
+    {
+      "strategy": "combined_strategies_breakout_trend_volume",
+      "category": "combined_strategies",
+      "allocation": 50.00000000116128,
+      "win_rate": 48.713235294117645,
+      "profit_factor": 1.8032829463404498,
+      "avg_profit": 8.527941176470586,
+      "total_trades": 544
+    },
+    {
+      "strategy": "combined_strategies_mean_reversion_volume",
+      "category": "combined_strategies",
+      "allocation": 43.73779457426192,
+      "win_rate": 48.402948402948404,
+      "profit_factor": 1.3278352887048548,
+      "avg_profit": 3.501474201474202,
+      "total_trades": 407
+    },
+    {
+      "strategy": "combined_strategies_consecutive_rsi_reversal",
+      "category": "combined_strategies",
+      "allocation": 6.262205424576803,
+      "win_rate": 56.75675675675676,
+      "profit_factor": 2.031449044585987,
+      "avg_profit": 7.002702702702701,
+      "total_trades": 148
+    }
+  ],
+  "optimized_portfolio_metrics": {
+    "sharpe_ratio": 0.24043007498320973,
+    "sortino_ratio": 1.9482164963203787,
+    "mean_return_per_trade": 6.629059221715706,
+    "std_return": 27.571672230184355,
+    "max_drawdown": 198.35800467831677,
+    "expected_total_return": 6629.059221715706
+  },
+  "equal_weight_portfolio_metrics": {
+    "sharpe_ratio": 0.12265600955520015,
+    "sortino_ratio": 0.5671120592238006,
+    "mean_return_per_trade": 61.47821537025964,
+    "std_return": 501.22464927078823,
+    "max_drawdown": 8804.861910896929
+  },
+  "improvement": {
+    "sharpe_improvement": 96.01980845056475,
+    "return_improvement": -89.21722242294862
+  },
+  "individual_strategy_metrics": [
+    {
+      "strategy": "combined_strategies_consecutive_rsi_reversal",
+      "sharpe_ratio": 0.33374333047202953,
+      "mean_return": 6.773573493470452,
+      "std_return": 20.295756873673717
+    },
+    {
+      "strategy": "combined_strategies_breakout_trend_volume",
+      "sharpe_ratio": 0.29309077083384255,
+      "mean_return": 8.984380605866384,
+      "std_return": 30.653918512363397
+    },
+    {
+      "strategy": "support_resistance_buy_swing_low",
+      "sharpe_ratio": 0.21712610152068756,
+      "mean_return": 192.80471662906947,
+      "std_return": 887.9849786770073
+    },
+    {
+      "strategy": "consecutive_candles_bull_streak_5",
+      "sharpe_ratio": 0.16264186182123672,
+      "mean_return": 110.71819854884785,
+      "std_return": 680.7484697300175
+    },
+    {
+      "strategy": "support_resistance_sell_swing_high",
+      "sharpe_ratio": 0.1523100308435588,
+      "mean_return": 137.2294426337952,
+      "std_return": 900.9875572459623
+    },
+    {
+      "strategy": "combined_strategies_mean_reversion_volume",
+      "sharpe_ratio": 0.1534841741414917,
+      "mean_return": 3.9158211990419693,
+      "std_return": 25.51286620229725
+    },
+    {
+      "strategy": "rsi_extremes_rsi_oversold_30",
+      "sharpe_ratio": 0.08160881049257675,
+      "mean_return": 59.26117178510499,
+      "std_return": 726.1614454054011
+    },
+    {
+      "strategy": "consecutive_candles_bull_streak_6",
+      "sharpe_ratio": 0.06211696465840587,
+      "mean_return": 37.62550670890622,
+      "std_return": 605.7203038786058
+    },
+    {
+      "strategy": "consecutive_candles_bear_streak_3",
+      "sharpe_ratio": 0.05241126465390374,
+      "mean_return": 32.46041287946941,
+      "std_return": 619.3403859613157
+    },
+    {
+      "strategy": "consecutive_candles_bull_streak_4",
+      "sharpe_ratio": 0.041322857841153984,
+      "mean_return": 25.008929219024445,
+      "std_return": 605.208122709212
+    }
+  ]
+}

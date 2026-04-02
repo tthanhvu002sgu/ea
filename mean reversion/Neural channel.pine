@@ -1,0 +1,126 @@
+//@version=5
+// -----------------------------------------------------------------------------
+// | © AlgoPoint                                                               |
+// | Indicator: Neural Probability Channel [AlgoPoint].                        |
+// | Developer: Harmony Algo & AlgoPoint Collaboration                         |
+// -----------------------------------------------------------------------------
+
+indicator("Neural Probability Channel [AlgoPoint]", shorttitle="Neural Probability Channel [AlgoPoint]", overlay=true, max_bars_back=500, max_labels_count = 500)
+
+// -------------------------------------------------------------------------
+// INPUT SETTINGS
+// -------------------------------------------------------------------------
+group_ml = "Machine Learning Core"
+//src = input.source(hlc3, "Source Data", tooltip="Using HLC3 reduces noise compared to Close.", group=group_ml) 
+src = hlc3
+length = input.int(24, "Lookback Window", minval=3, tooltip="Number of past bars used for kernel regression.", group=group_ml)
+h_param = input.float(8.0, "Smoothness (Bandwidth)", minval=0.1, tooltip="Controls the smoothness of the curve. Higher values = smoother.", group=group_ml)
+r_param = input.float(2.0, "Regression Alpha", minval=0.1, tooltip="Weight distribution control. Lower values focus on local price action.", group=group_ml)
+
+group_stats = "Channel Width (Volatility)"
+mult_inner = input.float(1.5, "Inner Channel Multiplier", step=0.1, group=group_stats)
+mult_outer = input.float(2.5, "Outer Channel Multiplier", step=0.1, group=group_stats)
+
+group_vis = "Visuals"
+col_up = input.color(color.new(#089981, 0), "Bullish Color", group=group_vis)
+col_dn = input.color(color.new(#F23645, 0), "Bearish Color", group=group_vis)
+
+// -------------------------------------------------------------------------
+// MATHEMATICAL KERNEL ENGINE
+// -------------------------------------------------------------------------
+
+// Rational Quadratic Kernel Function
+// Determines the "weight" or importance of past data points relative to the current bar.
+get_weight(index, current_index, _h, _r) =>
+    float d = math.pow(index - current_index, 2)
+    math.pow(1 + d / (2 * _r * math.pow(_h, 2)), -_r)
+
+// STEP 1: Kernel Regression (Baseline) Calculation
+// Calculating the "Fair Value" of the price.
+var float y_hat = 0.0
+float numerator = 0.0
+float denominator = 0.0
+
+// Loop: Scans past 'length' bars and calculates weighted average.
+for i = 0 to length - 1
+    float w = get_weight(i, 0, h_param, r_param)
+    numerator += src[i] * w 
+    denominator += w
+
+y_hat := numerator / denominator
+
+// -------------------------------------------------------------------------
+// VOLATILITY & ERROR CALCULATION
+// -------------------------------------------------------------------------
+
+// STEP 2: Standard Error Calculation
+// Measuring how much the price deviates from the Kernel Baseline.
+float error_sum = 0.0
+for i = 0 to length - 1
+    float diff = math.abs(src[i] - y_hat) 
+    error_sum += diff
+
+// Mean Deviation
+float mean_deviation = error_sum / length
+
+// Hybrid Volatility: Average of Mean Deviation and ATR for stability.
+float volatility = (mean_deviation + ta.atr(length)) / 2 
+
+// -------------------------------------------------------------------------
+// PLOTTING & LOGIC
+// -------------------------------------------------------------------------
+
+// Channel Boundaries
+upper_inner = y_hat + (volatility * mult_inner)
+lower_inner = y_hat - (volatility * mult_inner)
+upper_outer = y_hat + (volatility * mult_outer)
+lower_outer = y_hat - (volatility * mult_outer)
+
+// Trend Color Logic
+bool is_uptrend = y_hat > y_hat[1]
+color trend_color = is_uptrend ? col_up : col_dn
+color fill_color = is_uptrend ? color.new(col_up, 90) : color.new(col_dn, 90)
+
+// Plots
+//plot(y_hat, "Neural Baseline", color=trend_color, linewidth=2)
+
+p1 = plot(upper_inner, "Upper Inner", color=color.new(col_up, 70))
+p2 = plot(lower_inner, "Lower Inner", color=color.new(col_dn, 70))
+//fill(p1, p2, fill_color) 
+
+p3 = plot(upper_outer, "Upper Outer", color=col_up, linewidth=1)
+p4 = plot(lower_outer, "Lower Outer", color=col_dn, linewidth=1)
+
+// -------------------------------------------------------------------------
+// SIGNALS & ALERTS
+// -------------------------------------------------------------------------
+
+// Signal Conditions
+// Long: Price crosses OVER the Lower Outer Band (Mean Reversion)
+bool long_cond = ta.crossover(close, lower_outer) 
+// Short: Price crosses UNDER the Upper Outer Band (Mean Reversion)
+bool short_cond = ta.crossunder(close, upper_outer) 
+
+// Trend Reversal Conditions (Crossing the Center Line)
+bool trend_bull = ta.crossover(close, y_hat)
+bool trend_bear = ta.crossunder(close, y_hat)
+
+// Visual Signals on Chart
+//barcolor(close > upper_outer ? color.new(col_up, 0) : close < lower_outer ? color.new(col_dn, 0) : na)
+// plotshape(long_cond, "Long Signal", shape.labelup, location.belowbar, color=col_up, text="BUY", textcolor=color.black, size=size.tiny)
+// plotshape(short_cond, "Short Signal", shape.labeldown, location.abovebar, color=col_dn, text="SELL", textcolor=color.white, size=size.tiny)
+y1 = low - (ta.atr(30) * 0.8)
+y2 = high + (ta.atr(30) * 0.8)
+
+if (long_cond)
+    label.new(bar_index , y1, "Buy", color=#018208, style=label.style_label_up, textcolor=color.white, size=size.small)
+if (short_cond)
+    label.new(bar_index , y2, "Sell", color=#d12208, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+
+// ALERTS (For TradingView Server Side)
+
+alertcondition(long_cond, title="BUY Signal (Extreme Reversion)", message="AlgoPoint NPC: Price reversed from Lower Outer Band (Buy Signal).")
+alertcondition(short_cond, title="SELL Signal (Extreme Reversion)", message="AlgoPoint NPC: Price reversed from Upper Outer Band (Sell Signal).")
+alertcondition(trend_bull, title="Trend Change: Bullish", message="AlgoPoint NPC: Price crossed above Neural Baseline.")
+alertcondition(trend_bear, title="Trend Change: Bearish", message="AlgoPoint NPC: Price crossed below Neural Baseline.")

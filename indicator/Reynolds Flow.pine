@@ -1,0 +1,312 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Reynolds Flow Indicator - Market Turbulence Analysis
+// Based on Fluid Dynamics Concept adapted for Financial Markets
+
+//@version=5
+indicator("Reynolds Flow - Energy River", shorttitle="ReFlow", overlay=false, precision=2)
+
+//=============================================================================
+// INPUT PARAMETERS
+//=============================================================================
+
+// === CORE SETTINGS ===
+ma_period       = input.int(20, "MA Period (Trend Direction)", minval=5, maxval=200, group="Core Settings")
+atr_period      = input.int(14, "ATR Period (Volatility)", minval=5, maxval=50, group="Core Settings")
+norm_period     = input.int(100, "Normalization Period", minval=20, maxval=500, group="Core Settings")
+percentile_len  = input.int(100, "Percentile Lookback", minval=50, maxval=500, group="Core Settings")
+
+// === REGIME DETECTION ===
+regime_period   = input.int(50, "Regime Detection Period", minval=20, maxval=200, group="Regime Detection")
+bull_threshold  = input.float(0.6, "Bull Regime Threshold", minval=0.5, maxval=0.8, step=0.05, group="Regime Detection")
+bear_threshold  = input.float(0.4, "Bear Regime Threshold", minval=0.2, maxval=0.5, step=0.05, group="Regime Detection")
+
+// === FLOW ZONE THRESHOLDS ===
+turb_bull_pct   = input.int(90, "Turbulent Threshold (Bull)", minval=70, maxval=99, group="Flow Zones")
+turb_bear_pct   = input.int(60, "Turbulent Threshold (Bear)", minval=40, maxval=80, group="Flow Zones")
+laminar_low_pct = input.int(40, "Laminar Lower Bound", minval=20, maxval=60, group="Flow Zones")
+viscous_pct     = input.int(30, "Viscous Threshold", minval=10, maxval=50, group="Flow Zones")
+sideway_low_pct = input.int(20, "Sideway Noise Lower", minval=10, maxval=40, group="Flow Zones")
+sideway_hi_pct  = input.int(80, "Sideway Noise Upper", minval=60, maxval=95, group="Flow Zones")
+
+// === DISPLAY SETTINGS ===
+show_river      = input.bool(true, "Show Energy River", group="Display")
+show_signals    = input.bool(true, "Show Trading Signals", group="Display")
+show_regime     = input.bool(true, "Show Regime Label", group="Display")
+river_width     = input.int(2, "River Line Width", minval=1, maxval=5, group="Display")
+
+// === COLORS ===
+color_laminar   = input.color(color.new(#00E676, 0), "Laminar Flow (Green)", group="Colors")
+color_turbulent = input.color(color.new(#FF1744, 0), "Turbulent Flow (Red)", group="Colors")
+color_viscous   = input.color(color.new(#9E9E9E, 0), "Viscous Flow (Gray)", group="Colors")
+color_bull      = input.color(color.new(#4CAF50, 70), "Bull Background", group="Colors")
+color_bear      = input.color(color.new(#F44336, 70), "Bear Background", group="Colors")
+color_sideway   = input.color(color.new(#9E9E9E, 80), "Sideway Background", group="Colors")
+
+//=============================================================================
+// LAYER 1: CALCULATE RAW REYNOLDS NUMBER (Re_raw)
+//=============================================================================
+
+// Momentum: Absolute candle body size
+momentum = math.abs(close - open)
+
+// Direction: Sign based on price vs MA
+ma_value = ta.sma(close, ma_period)
+direction = close >= ma_value ? 1.0 : -1.0
+
+// Volatility: ATR as viscosity/friction
+atr_value = ta.atr(atr_period)
+epsilon = syminfo.mintick  // Avoid division by zero
+
+// Raw Reynolds Number
+// Re_raw = |Close - Open| × Sign(Close - MA) / (ATR + ε)
+re_raw = (momentum * direction) / (atr_value + epsilon)
+
+//=============================================================================
+// LAYER 2: SELF-NORMALIZATION (Re_norm)
+//=============================================================================
+
+// SMA of absolute Re_raw for normalization
+re_raw_abs = math.abs(re_raw)
+re_raw_sma = ta.sma(re_raw_abs, norm_period)
+
+// Normalized Reynolds Number
+// Re_norm = Re_raw / SMA(|Re_raw|, 100)
+re_norm = re_raw_sma != 0 ? re_raw / re_raw_sma : 0
+re_norm_abs = math.abs(re_norm)
+
+//=============================================================================
+// MARKET REGIME DETECTION
+//=============================================================================
+
+// Calculate trend strength using price position relative to MA
+price_above_ma = close > ma_value ? 1.0 : 0.0
+regime_score = ta.sma(price_above_ma, regime_period)
+
+// Regime classification
+is_bull_regime = regime_score >= bull_threshold
+is_bear_regime = regime_score <= bear_threshold
+is_sideway_regime = not is_bull_regime and not is_bear_regime
+
+// Get regime string for display
+regime_text = is_bull_regime ? "🐂 BULL" : is_bear_regime ? "🐻 BEAR" : "📊 SIDEWAY"
+regime_color = is_bull_regime ? color_bull : is_bear_regime ? color_bear : color_sideway
+
+//=============================================================================
+// DYNAMIC PERCENTILE THRESHOLDS
+//=============================================================================
+
+// Custom percentile function
+percentile(src, len, pct) =>
+    float result = 0.0
+    arr = array.new_float(0)
+    for i = 0 to len - 1
+        array.push(arr, src[i])
+    array.sort(arr, order.ascending)
+    idx = int(len * pct / 100)
+    result := array.get(arr, math.min(idx, array.size(arr) - 1))
+    result
+
+// Calculate dynamic percentile thresholds based on |Re_norm|
+pct_90 = percentile(re_norm_abs, percentile_len, 90)
+pct_80 = percentile(re_norm_abs, percentile_len, 80)
+pct_60 = percentile(re_norm_abs, percentile_len, 60)
+pct_40 = percentile(re_norm_abs, percentile_len, 40)
+pct_30 = percentile(re_norm_abs, percentile_len, 30)
+pct_20 = percentile(re_norm_abs, percentile_len, 20)
+
+//=============================================================================
+// ADAPTIVE TURBULENT THRESHOLD BY REGIME
+//=============================================================================
+
+// Dynamic turbulent threshold based on market regime
+float turbulent_threshold = 0.0
+
+if is_bull_regime
+    // Bull Market: Relaxed threshold - only warn at extreme levels
+    turbulent_threshold := percentile(re_norm_abs, percentile_len, turb_bull_pct)
+else if is_bear_regime
+    // Bear Market: Tight threshold - sensitive to volatility spikes
+    turbulent_threshold := percentile(re_norm_abs, percentile_len, turb_bear_pct)
+else
+    // Sideway: Moderate threshold
+    turbulent_threshold := percentile(re_norm_abs, percentile_len, 75)
+
+//=============================================================================
+// FLOW ZONE CLASSIFICATION
+//=============================================================================
+
+// Laminar threshold (lower bound of sweet spot)
+laminar_threshold = percentile(re_norm_abs, percentile_len, laminar_low_pct)
+
+// Viscous threshold (dead zone)
+viscous_threshold = percentile(re_norm_abs, percentile_len, viscous_pct)
+
+// Sideway noise bands
+sideway_low = percentile(re_norm_abs, percentile_len, sideway_low_pct)
+sideway_high = percentile(re_norm_abs, percentile_len, sideway_hi_pct)
+
+// Flow state determination
+bool is_turbulent = re_norm_abs >= turbulent_threshold
+bool is_laminar = re_norm_abs >= laminar_threshold and re_norm_abs < turbulent_threshold
+bool is_viscous = re_norm_abs < viscous_threshold
+bool is_noise = is_sideway_regime and re_norm_abs >= sideway_low and re_norm_abs <= sideway_high
+
+// Override: In sideway, noise zone becomes viscous (gray)
+if is_noise
+    is_viscous := true
+    is_laminar := false
+
+// Flow state color
+flow_color = is_turbulent ? color_turbulent : is_laminar ? color_laminar : color_viscous
+
+// Flow state text
+flow_text = is_turbulent ? "TURBULENT ⚠️" : is_laminar ? "LAMINAR ✓" : "VISCOUS ○"
+
+//=============================================================================
+// PLOTTING - ENERGY RIVER VISUALIZATION
+//=============================================================================
+
+// Zero line
+hline(0, "Zero", color.new(color.white, 70), hline.style_solid)
+
+// Threshold levels (dynamic bands)
+upper_turb = plot(turbulent_threshold, "Upper Turbulent", color.new(color_turbulent, 70), display=display.none)
+lower_turb = plot(-turbulent_threshold, "Lower Turbulent", color.new(color_turbulent, 70), display=display.none)
+
+upper_laminar = plot(laminar_threshold, "Upper Laminar", color.new(color_laminar, 80), display=display.none)
+lower_laminar = plot(-laminar_threshold, "Lower Laminar", color.new(color_laminar, 80), display=display.none)
+
+upper_viscous = plot(viscous_threshold, "Upper Viscous", color.new(color_viscous, 80), display=display.none)
+lower_viscous = plot(-viscous_threshold, "Lower Viscous", color.new(color_viscous, 80), display=display.none)
+
+// Fill zones to create "Energy River"
+// Using conditional colors since fill() cannot be in local scope
+turb_fill_color = show_river ? color.new(color_turbulent, 85) : na
+laminar_fill_color = show_river ? color.new(color_laminar, 85) : na
+viscous_fill_color = show_river ? color.new(color_viscous, 90) : na
+
+// Turbulent zone (outer red)
+fill(upper_turb, upper_laminar, turb_fill_color, title="Upper Turbulent Zone")
+fill(lower_turb, lower_laminar, turb_fill_color, title="Lower Turbulent Zone")
+
+// Laminar zone (green sweet spot)
+fill(upper_laminar, upper_viscous, laminar_fill_color, title="Upper Laminar Zone")
+fill(lower_laminar, lower_viscous, laminar_fill_color, title="Lower Laminar Zone")
+
+// Viscous zone (gray dead zone around zero)
+fill(upper_viscous, lower_viscous, viscous_fill_color, title="Viscous Dead Zone")
+
+// Main Reynolds Flow line
+plot(re_norm, "Reynolds Flow", flow_color, linewidth=river_width, style=plot.style_line)
+
+// Histogram for direction clarity
+plot(re_norm, "Re Histogram", color.new(flow_color, 50), style=plot.style_histogram, linewidth=1)
+
+//=============================================================================
+// SIGNAL GENERATION
+//=============================================================================
+
+// Laminar entry signals (entering sweet spot)
+laminar_entry_long = is_laminar and re_norm > 0 and not is_laminar[1]
+laminar_entry_short = is_laminar and re_norm < 0 and not is_laminar[1]
+
+// Turbulent warning signals (entering danger zone)
+turbulent_warning = is_turbulent and not is_turbulent[1]
+
+// Viscous exit signals (momentum dying)
+viscous_signal = is_viscous and not is_viscous[1]
+
+// Flow state changes
+state_to_laminar = is_laminar and not is_laminar[1]
+state_to_turbulent = is_turbulent and not is_turbulent[1]
+state_to_viscous = is_viscous and not is_viscous[1]
+
+// Plot signals
+plotshape(show_signals and laminar_entry_long, "Laminar Long", shape.triangleup, 
+          location.bottom, color_laminar, size=size.small)
+plotshape(show_signals and laminar_entry_short, "Laminar Short", shape.triangledown, 
+          location.top, color_laminar, size=size.small)
+plotshape(show_signals and turbulent_warning, "Turbulent Warning", shape.xcross, 
+          location.absolute, color_turbulent, size=size.small, offset=0, text="⚠️")
+plotshape(show_signals and viscous_signal, "Viscous Signal", shape.circle, 
+          location.absolute, color_viscous, size=size.tiny)
+
+//=============================================================================
+// INFORMATION TABLE
+//=============================================================================
+
+var table info_table = table.new(position.top_right, 2, 10, 
+                                  bgcolor=color.new(color.black, 80), 
+                                  border_color=color.new(color.white, 80),
+                                  border_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(info_table, 0, 0, "REYNOLDS FLOW", text_color=color.white, 
+               text_size=size.normal, bgcolor=color.new(color.blue, 60), text_halign=text.align_center)
+    table.merge_cells(info_table, 0, 0, 1, 0)
+    
+    // Regime
+    table.cell(info_table, 0, 1, "Regime", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 1, regime_text, text_color=is_bull_regime ? color.green : is_bear_regime ? color.red : color.gray, 
+               text_size=size.small)
+    
+    // Re_raw
+    table.cell(info_table, 0, 2, "Re_raw", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 2, str.tostring(re_raw, "#.###"), text_color=color.white, text_size=size.small)
+    
+    // Re_norm
+    table.cell(info_table, 0, 3, "Re_norm", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 3, str.tostring(re_norm, "#.##"), text_color=flow_color, text_size=size.small)
+    
+    // |Re_norm|
+    table.cell(info_table, 0, 4, "|Re_norm|", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 4, str.tostring(re_norm_abs, "#.##"), text_color=color.white, text_size=size.small)
+    
+    // Flow State
+    table.cell(info_table, 0, 5, "Flow State", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 5, flow_text, text_color=flow_color, text_size=size.small)
+    
+    // Turbulent Threshold
+    table.cell(info_table, 0, 6, "Turb. Thresh", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 6, str.tostring(turbulent_threshold, "#.##"), text_color=color_turbulent, text_size=size.small)
+    
+    // Direction
+    dir_text = re_norm > 0 ? "📈 BULLISH" : re_norm < 0 ? "📉 BEARISH" : "➖ NEUTRAL"
+    dir_color = re_norm > 0 ? color.green : re_norm < 0 ? color.red : color.gray
+    table.cell(info_table, 0, 7, "Direction", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 7, dir_text, text_color=dir_color, text_size=size.small)
+    
+    // Interpretation
+    interp = ""
+    if is_turbulent
+        interp := "⚠️ Take Profit / Tighten SL"
+    else if is_laminar
+        interp := "✅ Sweet Spot - Hold"
+    else
+        interp := "⏸️ Dead Zone - Stay Out"
+    
+    table.cell(info_table, 0, 8, "Action", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 8, interp, text_color=flow_color, text_size=size.small)
+    
+    // ATR Reference
+    table.cell(info_table, 0, 9, "ATR", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 9, str.tostring(atr_value, "#.#####"), text_color=color.white, text_size=size.small)
+
+//=============================================================================
+// ALERTS
+//=============================================================================
+
+alertcondition(laminar_entry_long, "Laminar Long Entry", "Reynolds Flow: Entering LAMINAR zone (Bullish) - Sweet Spot for Long")
+alertcondition(laminar_entry_short, "Laminar Short Entry", "Reynolds Flow: Entering LAMINAR zone (Bearish) - Sweet Spot for Short")
+alertcondition(turbulent_warning, "Turbulent Warning", "Reynolds Flow: Entering TURBULENT zone - Consider Taking Profit!")
+alertcondition(viscous_signal, "Viscous Dead Zone", "Reynolds Flow: Entering VISCOUS zone - Momentum Dying")
+alertcondition(is_bull_regime and not is_bull_regime[1], "Bull Regime Started", "Reynolds Flow: Market shifted to BULL regime")
+alertcondition(is_bear_regime and not is_bear_regime[1], "Bear Regime Started", "Reynolds Flow: Market shifted to BEAR regime")
+
+//=============================================================================
+// BACKGROUND COLOR BY REGIME (optional subtle indicator)
+//=============================================================================
+
+bgcolor(show_regime ? regime_color : na, title="Regime Background")

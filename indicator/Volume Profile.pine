@@ -1,0 +1,186 @@
+//@version=5
+indicator("Adaptive Volume Profile Engine", "", true, max_labels_count=500, max_lines_count=500)
+
+// ═══════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════
+group_core    = "🔧 Core"
+vp_cnum       = input.int(24, 'Row Size', minval=5, maxval=100, group=group_core)
+
+group_score   = "📊 Scoring"
+w_shape       = input.float(0.5, 'W1: Shape (Prominence)', minval=0, maxval=1, step=0.05, group=group_score)
+w_friction    = input.float(0.5, 'W2: Friction (S/R)', minval=0, maxval=1, step=0.05, group=group_score)
+touch_mult    = input.float(0.3, 'Touch Zone (× ATR)', minval=0.05, maxval=1, step=0.05, group=group_score)
+friction_lb   = input.int(50, 'Friction Lookback', minval=10, maxval=200, group=group_score)
+
+group_decay   = "⏳ Decay & Kill"
+decay_rate    = input.float(0.97, 'Time Decay Rate', minval=0.8, maxval=1, step=0.01, group=group_decay)
+kill_zscore   = input.float(2.0, 'Kill Z-Score', minval=1, maxval=4, step=0.1, group=group_decay)
+kill_lb       = input.int(10, 'Kill Lookback', minval=1, maxval=50, group=group_decay)
+
+group_disp    = "🎨 Display"
+show_all      = input.bool(false, 'Show All Candidate POCs', group=group_disp)
+show_table    = input.bool(true, 'Show Score Table', group=group_disp)
+
+// ═══════════════════════════════════════════════════
+// HELPER
+// ═══════════════════════════════════════════════════
+get_vol(y11, y12, y21, y22, height, vol) =>
+    nz(math.max(math.min(math.max(y11, y12), math.max(y21, y22)) - math.max(math.min(y11, y12), math.min(y21, y22)), 0) * vol / height)
+
+// ═══════════════════════════════════════════════════
+// PRE-COMPUTE (ta.* requires simple int length)
+// ═══════════════════════════════════════════════════
+float top20  = ta.highest(high, 20),   float bot20  = ta.lowest(low, 20)
+float top50  = ta.highest(high, 50),   float bot50  = ta.lowest(low, 50)
+float top100 = ta.highest(high, 100),  float bot100 = ta.lowest(low, 100)
+float top200 = ta.highest(high, 200),  float bot200 = ta.lowest(low, 200)
+float top500 = ta.highest(high, 500),  float bot500 = ta.lowest(low, 500)
+
+float atr14   = ta.atr(14)
+float vol_sma = ta.sma(volume, 50)
+float vol_std = ta.stdev(volume, 50)
+
+// ═══════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════
+var float best_poc_plot = na
+var line  best_line_obj = na
+var line[] all_lines    = array.new_line(5, na)
+var table scoreTable    = table.new(position.top_right, 7, 7, border_width=1, border_color=color.new(color.white, 80), bgcolor=color.new(#1a1a2e, 10))
+
+// Tournament periods & colors
+var int[]   periods = array.from(20, 50, 100, 200, 500)
+var color[] pclrs   = array.from(#FF6B6B, #4ECDC4, #45B7D1, #96CEB4, #FFEAA7)
+
+// ═══════════════════════════════════════════════════
+// ADAPTIVE TOURNAMENT (last bar only)
+// ═══════════════════════════════════════════════════
+if barstate.islast
+    // --- Cleanup ---
+    for i = 0 to 4
+        line.delete(array.get(all_lines, i))
+    line.delete(best_line_obj)
+
+    // --- Result arrays ---
+    float[] poc_arr   = array.new_float(5, na)
+    float[] sh_arr    = array.new_float(5, 0.0)
+    float[] fr_arr    = array.new_float(5, 0.0)
+    float[] tot_arr   = array.new_float(5, 0.0)
+    bool[]  kill_arr  = array.new_bool(5, false)
+    float[] tops      = array.from(top20, top50, top100, top200, top500)
+    float[] bots      = array.from(bot20, bot50, bot100, bot200, bot500)
+
+    // === STEP 1: Compute VP, POC, Shape Score for each period ===
+    for idx = 0 to 4
+        int period   = array.get(periods, idx)
+        float vp_top = array.get(tops, idx)
+        float vp_bot = array.get(bots, idx)
+        float step   = (vp_top - vp_bot) / vp_cnum
+
+        if step > 0 and bar_index >= period
+            // Build Volume Profile
+            levels  = array.new_float(vp_cnum + 1)
+            volumes = array.new_float(vp_cnum, 0.0)
+            for x = 0 to vp_cnum
+                array.set(levels, x, vp_bot + step * x)
+            for b = 0 to period - 1
+                float rng = high[b] - low[b]
+                if rng > 0
+                    for x = 0 to vp_cnum - 1
+                        float v = get_vol(array.get(levels, x), array.get(levels, x + 1), low[b], high[b], rng, volume[b])
+                        array.set(volumes, x, array.get(volumes, x) + v)
+
+            // Find POC
+            float max_vol = array.max(volumes)
+            int poc_idx   = array.indexof(volumes, max_vol)
+            if poc_idx > -1
+                float poc = (array.get(levels, poc_idx) + array.get(levels, poc_idx + 1)) / 2.0
+                array.set(poc_arr, idx, poc)
+
+                // Shape Score = POC_Volume / Mean_Volume (Kurtosis proxy)
+                float mean_v = array.avg(volumes)
+                array.set(sh_arr, idx, mean_v > 0 ? max_vol / mean_v : 0.0)
+
+                // === STEP 2: Friction Score (S/R quality with time decay) ===
+                float zone = atr14 * touch_mult
+                float fric = 0.0
+                int flb    = math.min(friction_lb, bar_index)
+                for k = 1 to flb
+                    if low[k] <= (poc + zone) and high[k] >= (poc - zone)
+                        float bounce = math.max(math.abs(close[k] - poc), math.abs(open[k] - poc))
+                        float norm_b = zone > 0 ? bounce / zone : 0.0
+                        fric += norm_b * math.pow(decay_rate, k)
+                array.set(fr_arr, idx, fric)
+
+                // === STEP 3: Kill Check (Marubozu + high vol breakout) ===
+                int klb = math.min(kill_lb, bar_index)
+                for k = 1 to klb
+                    float body = math.abs(close[k] - open[k])
+                    float rng2 = high[k] - low[k]
+                    bool marubozu = rng2 > 0 ? (body / rng2) >= 0.8 : false
+                    float z_vol  = vol_std > 0 ? (volume[k] - vol_sma) / vol_std : 0.0
+                    bool broke   = (open[k] < poc and close[k] > poc) or (open[k] > poc and close[k] < poc)
+                    if broke and marubozu and z_vol > kill_zscore
+                        array.set(kill_arr, idx, true)
+                        break
+
+    // === NORMALIZE & TOTAL SCORE ===
+    float max_sh = array.max(sh_arr)
+    float max_fr = array.max(fr_arr)
+    for idx = 0 to 4
+        if not na(array.get(poc_arr, idx)) and not array.get(kill_arr, idx)
+            float ns = max_sh > 0 ? array.get(sh_arr, idx) / max_sh : 0.0
+            float nf = max_fr > 0 ? array.get(fr_arr, idx) / max_fr : 0.0
+            array.set(tot_arr, idx, w_shape * ns + w_friction * nf)
+        else
+            array.set(tot_arr, idx, 0.0)
+
+    // === FIND WINNER ===
+    float best_score = 0.0
+    int   best_idx   = -1
+    for idx = 0 to 4
+        if array.get(tot_arr, idx) > best_score and not na(array.get(poc_arr, idx))
+            best_score := array.get(tot_arr, idx)
+            best_idx   := idx
+
+    // === DRAW ===
+    if show_all
+        for idx = 0 to 4
+            if not na(array.get(poc_arr, idx))
+                color clr = array.get(kill_arr, idx) ? color.new(color.gray, 70) : color.new(array.get(pclrs, idx), 40)
+                int p = array.get(periods, idx)
+                array.set(all_lines, idx, line.new(bar_index - p, array.get(poc_arr, idx), bar_index + 1, array.get(poc_arr, idx), color=clr, width=1, style=line.style_dotted))
+
+    if best_idx >= 0
+        float bp = array.get(poc_arr, best_idx)
+        int   bp_n = array.get(periods, best_idx)
+        color bc = array.get(pclrs, best_idx)
+        best_poc_plot := bp
+        best_line_obj := line.new(bar_index - bp_n, bp, bar_index + 5, bp, color=bc, width=3, extend=extend.right)
+        label.new(bar_index + 3, bp, "◆ POC " + str.tostring(bp_n) + " | " + str.tostring(bp, format.mintick) + " | Score: " + str.tostring(best_score, "#.##"), color=color.new(bc, 85), textcolor=bc, style=label.style_label_left, size=size.small)
+
+    // === TABLE ===
+    if show_table
+        string[] hdrs = array.from("Period", "POC", "Shape", "Friction", "Total", "Status")
+        for c = 0 to 5
+            table.cell(scoreTable, c, 0, array.get(hdrs, c), bgcolor=color.new(#16213e, 10), text_color=color.white, text_size=size.tiny)
+        for idx = 0 to 4
+            int row     = idx + 1
+            bool is_best = idx == best_idx
+            color rbg   = is_best ? color.new(#0f3460, 10) : color.new(#1a1a2e, 10)
+            color rtc   = is_best ? #e94560 : color.new(color.white, 30)
+            string st   = array.get(kill_arr, idx) ? "☠ KILLED" : (is_best ? "⭐ BEST" : "—")
+            color stc   = array.get(kill_arr, idx) ? color.red : (is_best ? #FFD700 : color.gray)
+
+            table.cell(scoreTable, 0, row, str.tostring(array.get(periods, idx)), bgcolor=rbg, text_color=array.get(pclrs, idx), text_size=size.tiny)
+            table.cell(scoreTable, 1, row, not na(array.get(poc_arr, idx)) ? str.tostring(array.get(poc_arr, idx), format.mintick) : "N/A", bgcolor=rbg, text_color=rtc, text_size=size.tiny)
+            table.cell(scoreTable, 2, row, str.tostring(array.get(sh_arr, idx), "#.##"), bgcolor=rbg, text_color=rtc, text_size=size.tiny)
+            table.cell(scoreTable, 3, row, str.tostring(array.get(fr_arr, idx), "#.##"), bgcolor=rbg, text_color=rtc, text_size=size.tiny)
+            table.cell(scoreTable, 4, row, str.tostring(array.get(tot_arr, idx), "#.###"), bgcolor=rbg, text_color=rtc, text_size=size.tiny)
+            table.cell(scoreTable, 5, row, st, bgcolor=rbg, text_color=stc, text_size=size.tiny)
+
+// ═══════════════════════════════════════════════════
+// PLOT
+// ═══════════════════════════════════════════════════
+plot(best_poc_plot, "Best POC", color.new(#e94560, 0), linewidth=0, trackprice=true)

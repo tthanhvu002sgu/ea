@@ -1,0 +1,244 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © The Valuator - Long-Term Valuation Indicator
+// Based on Z-Score of Log Price Deviation from Exponential Regression
+// Data is LOCKED to a configurable higher timeframe (default: Weekly)
+
+//@version=6
+indicator("The Valuator", shorttitle="Valuator", overlay=false, precision=2)
+
+//=============================================================================
+// INPUT PARAMETERS
+//=============================================================================
+
+// === CORE SETTINGS ===
+inp_tf          = input.timeframe("W", "Valuation Timeframe", options=["D", "W", "M"], group="Core Settings",
+                   tooltip="Locked timeframe for all valuation data.\nD = Daily, W = Weekly (default), M = Monthly.\nChart TF must be ≤ this setting.")
+inp_lookback    = input.int(200, "Regression Lookback (bars)", minval=20, maxval=500, group="Core Settings",
+                   tooltip="Number of bars on the locked timeframe. W with 200 bars ≈ 4 years")
+inp_ema_period  = input.int(52, "EMA Period for Stats", minval=10, maxval=200, group="Core Settings",
+                   tooltip="EMA period for rolling mean and standard deviation")
+
+// === THRESHOLDS (Fat-tail adjusted) ===
+inp_gift_z      = input.float(-1.5, "Gift Zone (Z <)", minval=-3.0, maxval=-1.0, step=0.1, group="Thresholds")
+inp_cheap_z     = input.float(-0.8, "Cheap Zone (Z <)", minval=-2.0, maxval=0.0, step=0.1, group="Thresholds")
+inp_expensive_z = input.float(0.8, "Expensive Zone (Z >)", minval=0.0, maxval=2.0, step=0.1, group="Thresholds")
+inp_bubble_z    = input.float(1.5, "Bubble Zone (Z >)", minval=1.0, maxval=3.0, step=0.1, group="Thresholds")
+
+// === DISPLAY ===
+inp_show_fair   = input.bool(true, "Show Fair Value Line", group="Display")
+inp_show_table  = input.bool(true, "Show Info Table", group="Display")
+
+// === COLORS ===
+color_gift      = input.color(color.new(#00E676, 0), "Gift Zone", group="Colors")
+color_cheap     = input.color(color.new(#81C784, 0), "Cheap Zone", group="Colors")
+color_fair      = input.color(color.new(#90A4AE, 0), "Fair Zone", group="Colors")
+color_expensive = input.color(color.new(#FF9800, 0), "Expensive Zone", group="Colors")
+color_bubble    = input.color(color.new(#F44336, 0), "Bubble Zone", group="Colors")
+
+//=============================================================================
+// HELPERS
+//=============================================================================
+
+get_tf_name(tf) =>
+    switch tf
+        "D"  => "Daily"
+        "W"  => "Weekly"
+        "M"  => "Monthly"
+        => tf
+
+get_tf_bars_label(tf, bars) =>
+    switch tf
+        "D"  => str.tostring(bars) + " bars ≈ " + str.tostring(math.round(bars / 252.0, 1)) + " yr"
+        "W"  => str.tostring(bars) + " bars ≈ " + str.tostring(math.round(bars / 52.0, 1))  + " yr"
+        "M"  => str.tostring(bars) + " bars ≈ " + str.tostring(math.round(bars / 12.0, 1))  + " yr"
+        => str.tostring(bars) + " bars"
+
+//=============================================================================
+// EXPONENTIAL REGRESSION - FAIR VALUE CALCULATION
+//=============================================================================
+// These calculations use chart-TF data here, but will be RE-EVALUATED
+// on the locked timeframe via request.security() below.
+//
+// log(price) = a + b * time  =>  price = exp(a + b * time)
+
+lookback = math.min(inp_lookback, bar_index + 1)
+
+sum_x  = 0.0
+sum_y  = 0.0
+sum_xy = 0.0
+sum_xx = 0.0
+
+for i = 0 to lookback - 1
+    x = float(i)
+    y = math.log(close[i])
+    sum_x  += x
+    sum_y  += y
+    sum_xy += x * y
+    sum_xx += x * x
+
+n = float(lookback)
+b = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x)
+a = (sum_y - b * sum_x) / n
+
+fair_value_log = a
+fair_value     = math.exp(fair_value_log)
+
+//=============================================================================
+// Z-SCORE CALCULATION
+//=============================================================================
+
+log_price     = math.log(close)
+log_deviation = log_price - fair_value_log
+
+mean_dev = ta.ema(log_deviation, inp_ema_period)
+variance = ta.ema(math.pow(log_deviation - mean_dev, 2), inp_ema_period)
+std_dev  = math.sqrt(variance)
+
+z_score = std_dev > 0 ? (log_deviation - mean_dev) / std_dev : 0.0
+
+//=============================================================================
+// LOCK TO HIGHER TIMEFRAME via request.security()
+//=============================================================================
+// request.security re-evaluates the ENTIRE expression tree
+// (including the regression loop) on the locked timeframe's data.
+// This means close, bar_index, ta.ema etc. all use locked-TF candles.
+// gaps_off = carry forward last HTF value on intra-bar chart updates.
+
+[z_htf, fv_htf, close_htf] = request.security(
+     syminfo.tickerid, inp_tf,
+     [z_score, fair_value, close],
+     barmerge.gaps_off)
+
+//=============================================================================
+// ZONE CLASSIFICATION (on locked-TF z-score)
+//=============================================================================
+
+get_zone(z) =>
+    string result = "Fair"
+    if z < inp_gift_z
+        result := "Gift"
+    else if z < inp_cheap_z
+        result := "Cheap"
+    else if z > inp_bubble_z
+        result := "Bubble"
+    else if z > inp_expensive_z
+        result := "Expensive"
+    else
+        result := "Fair"
+    result
+
+get_zone_color(z) =>
+    color result = color_fair
+    if z < inp_gift_z
+        result := color_gift
+    else if z < inp_cheap_z
+        result := color_cheap
+    else if z > inp_bubble_z
+        result := color_bubble
+    else if z > inp_expensive_z
+        result := color_expensive
+    else
+        result := color_fair
+    result
+
+current_zone = get_zone(z_htf)
+bar_color    = get_zone_color(z_htf)
+
+//=============================================================================
+// PLOTTING - Z-SCORE HISTOGRAM (locked-TF values)
+//=============================================================================
+
+plot(z_htf, "Z-Score", bar_color, linewidth=3, style=plot.style_histogram)
+
+// Zero line
+hline(0, "Zero", color.new(color.gray, 50), hline.style_solid)
+
+// Zone threshold lines
+hline(inp_gift_z,      "Gift",      color.new(color_gift, 70),      hline.style_dotted)
+hline(inp_cheap_z,     "Cheap",     color.new(color_cheap, 70),     hline.style_dotted)
+hline(inp_expensive_z, "Expensive", color.new(color_expensive, 70), hline.style_dotted)
+hline(inp_bubble_z,    "Bubble",    color.new(color_bubble, 70),    hline.style_dotted)
+
+// Background fill for zones
+bgcolor(z_htf < inp_gift_z      ? color.new(color_gift, 90)      :
+        z_htf < inp_cheap_z     ? color.new(color_cheap, 95)     :
+        z_htf > inp_bubble_z    ? color.new(color_bubble, 90)    :
+        z_htf > inp_expensive_z ? color.new(color_expensive, 95) : na,
+        title="Zone Background")
+
+//=============================================================================
+// FAIR VALUE LINE (locked-TF value)
+//=============================================================================
+
+plot(inp_show_fair ? fv_htf : na, "Fair Value", color.new(color.blue, 50), linewidth=2)
+
+//=============================================================================
+// INFORMATION TABLE
+//=============================================================================
+
+var table info_table = table.new(position.top_right, 2, 7,
+                                  bgcolor=color.new(color.black, 80),
+                                  border_color=color.new(color.white, 70),
+                                  border_width=1)
+
+if barstate.islast and inp_show_table
+    // Header
+    table.cell(info_table, 0, 0, "THE VALUATOR", text_color=color.white,
+               text_size=size.normal, bgcolor=color.new(#1565C0, 40), text_halign=text.align_center)
+    table.merge_cells(info_table, 0, 0, 1, 0)
+
+    // Locked Timeframe
+    table.cell(info_table, 0, 1, "Data TF", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 1, get_tf_name(inp_tf) + " 🔒",
+               text_color=color.new(#64B5F6, 0), text_size=size.small)
+
+    // Lookback window
+    table.cell(info_table, 0, 2, "Window", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 2, get_tf_bars_label(inp_tf, inp_lookback),
+               text_color=color.new(#B0BEC5, 0), text_size=size.small)
+
+    // Zone
+    table.cell(info_table, 0, 3, "Zone", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 3, current_zone, text_color=bar_color, text_size=size.normal)
+
+    // Z-Score
+    table.cell(info_table, 0, 4, "Z-Score", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 4, str.tostring(z_htf, "#.##"), text_color=bar_color, text_size=size.small)
+
+    // Price vs Fair Value
+    deviation_pct = close_htf > 0 and fv_htf > 0 ? (close_htf / fv_htf - 1) * 100 : 0.0
+    table.cell(info_table, 0, 5, "vs Fair Value", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 5, str.tostring(deviation_pct, "+#.#") + "%",
+               text_color=deviation_pct > 0 ? color.red : color.green, text_size=size.small)
+
+    // Fair Value
+    table.cell(info_table, 0, 6, "Fair Value", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 6, str.tostring(fv_htf, format.mintick), text_color=color.white, text_size=size.small)
+
+//=============================================================================
+// ALERTS (using locked-TF z-score)
+//=============================================================================
+
+is_gift_new      = z_htf < inp_gift_z      and z_htf[1] >= inp_gift_z
+is_bubble_new    = z_htf > inp_bubble_z    and z_htf[1] <= inp_bubble_z
+is_cheap_new     = z_htf < inp_cheap_z     and z_htf[1] >= inp_cheap_z
+is_expensive_new = z_htf > inp_expensive_z and z_htf[1] <= inp_expensive_z
+
+alertcondition(is_gift_new,      "GIFT Zone",      "THE VALUATOR: GIFT Zone! Extreme undervaluation. Z = {{plot_0}}")
+alertcondition(is_bubble_new,    "BUBBLE Zone",    "THE VALUATOR: BUBBLE Zone! Extreme overvaluation. Z = {{plot_0}}")
+alertcondition(is_cheap_new,     "Cheap Zone",     "THE VALUATOR: Entered Cheap Zone. Z = {{plot_0}}")
+alertcondition(is_expensive_new, "Expensive Zone", "THE VALUATOR: Entered Expensive Zone. Z = {{plot_0}}")
+
+// Recovery alert
+is_fair_new = math.abs(z_htf) < inp_cheap_z and (math.abs(z_htf[1]) >= inp_cheap_z)
+alertcondition(is_fair_new, "Fair Zone", "THE VALUATOR: Returned to Fair Zone. Z = {{plot_0}}")
+
+//=============================================================================
+// SIGNAL MARKERS
+//=============================================================================
+
+plotshape(is_gift_new,   "Gift Signal",   shape.labelup,   location.bottom, color_gift,
+          text="GIFT",   textcolor=color.white, size=size.small)
+plotshape(is_bubble_new, "Bubble Signal", shape.labeldown, location.top,    color_bubble,
+          text="BUBBLE", textcolor=color.white, size=size.small)

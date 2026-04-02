@@ -1,0 +1,356 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © Fractal Cone Probability - Adaptive Version
+
+//@version=5
+indicator("The Fractal Cone [Adaptive Probability]", overlay=true, max_lines_count=500, max_labels_count=10)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📊 THÔNG SỐ ĐẦU VÀO
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_adaptive = "=== ADAPTIVE DNA ==="
+fast_len        = input.int(20,  "Fast Length (Growth ~1 tháng)",     minval=10, group=group_adaptive)
+slow_len        = input.int(60,  "Slow Length (Value ~1 quý)",        minval=20, group=group_adaptive)
+kurt_threshold  = input.float(5.0, "Kurtosis Threshold (Growth/Value)", step=0.5, group=group_adaptive)
+
+group_proj = "=== DỰ PHÓNG TƯƠNG LAI ==="
+proj_bars = input.int(20, "Số nến tương lai", minval=5, maxval=100, group=group_proj)
+z_base    = input.float(2.0, "Z-Score Cơ bản (95%)", group=group_proj)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🧮 HÀM TÍNH TOÁN (CUSTOM FUNCTIONS)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// 1. Tính Kurtosis -> Đo đuôi béo
+f_kurtosis(src, len) =>
+    mean = ta.sma(src, len)
+    dev = src - mean
+    m4 = ta.sma(math.pow(dev, 4), len)
+    m2 = ta.sma(math.pow(dev, 2), len)
+    m2 != 0 ? (m4 / math.pow(m2, 2)) : 3.0
+
+// 2. Tính Hurst Exponent qua Fractal Dimension
+f_hurst(len) =>
+    sum_atr = math.sum(ta.atr(1), len)
+    hh = ta.highest(high, len)
+    ll = ta.lowest(low, len)
+    range_hl = hh - ll
+    d = range_hl > 0 ? math.log10(sum_atr / range_hl) / math.log10(len) : 1.0
+    h = 1.0 - d
+    math.max(0.1, math.min(0.9, h))
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🧬 BƯỚC 1: ĐO LƯỜNG "DNA" CỔ PHIẾU
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Kurtosis Macro trên khung 1 Quý (slow_len = 60)
+// -> Xác định cổ phiếu hành xử như Growth hay Value
+macro_kurt = f_kurtosis(close - close[1], slow_len)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔀 BƯỚC 2: ADAPTIVE SWITCH (Tự động gán tham số)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Nếu Kurtosis > threshold -> Đuôi béo / Động lượng cao / Growth Stock
+// Nếu Kurtosis <= threshold -> Ổn định / Ít đột biến / Value Stock
+is_growth_regime = macro_kurt > kurt_threshold
+
+// ⚠️ FIX: PineScript yêu cầu 'simple int' cho tham số length của built-in.
+// Giải pháp: Tính SONG SONG cả hai bộ (fast + slow) với hằng số,
+// rồi dùng is_growth_regime (series bool) để CHỌN KẾT QUẢ.
+// Không thể truyền series int vào ta.ema(), ta.sma(), f_hurst()...
+
+// Tự động điều chỉnh ngưỡng phân loại Trending / Mean-Revert
+// Growth Stock dễ tạo Trend hơn -> hạ chuẩn Trending
+// Value Stock khó tạo Trend hơn -> nâng chuẩn Trending khắt khe hơn
+trend_threshold       = is_growth_regime ? 0.55 : 0.60
+mean_revert_threshold = is_growth_regime ? 0.40 : 0.45
+
+// Tên active params để hiện dashboard
+int active_hurst_len = is_growth_regime ? fast_len       : slow_len
+int active_vol_len   = is_growth_regime ? fast_len / 2   : slow_len / 2
+int active_ema_len   = is_growth_regime ? fast_len       : slow_len
+
+// Label cho regime hiện tại
+string regime_name = is_growth_regime ? "GROWTH" : "VALUE"
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔬 BƯỚC 3: TÍNH TOÁN CÁC THÀNH PHẦN (SONG SONG FAST & SLOW)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// A. EWMA Volatility - tính cả 2 rồi chọn
+evma_vol_fast = ta.ema(ta.tr, fast_len / 2)   // vol_len = 10
+evma_vol_slow = ta.ema(ta.tr, slow_len / 2)   // vol_len = 30
+ewma_vol      = is_growth_regime ? evma_vol_fast : evma_vol_slow
+
+// B. Kurtosis + Z-Score Adjustment (luôn dùng macro_kurt trên slow_len)
+kurt = macro_kurt
+excess_kurt = math.max(0, kurt - 3.0)
+z_adj = z_base * (1.0 + (excess_kurt * 0.1))
+
+// C. Hurst Exponent - tính cả 2 rồi chọn
+hurst_fast = f_hurst(fast_len)   // hurst_len = 20
+hurst_slow = f_hurst(slow_len)   // hurst_len = 60
+hurst_exp  = is_growth_regime ? hurst_fast : hurst_slow
+
+// D. EMA Target - tính cả 2 rồi chọn
+ema_fast   = ta.ema(close, fast_len)   // ema_len = 20
+ema_slow   = ta.ema(close, slow_len)   // ema_len = 60
+ema_target = is_growth_regime ? ema_fast : ema_slow
+
+// E. Drift Rate - tính cả 2 rồi chọn (tránh dùng series int làm index)
+drift_fast = (close - close[fast_len / 2]) / (fast_len / 2)   // vol_len = 10
+drift_slow = (close - close[slow_len / 2]) / (slow_len / 2)   // vol_len = 30
+drift_rate = is_growth_regime ? drift_fast : drift_slow
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🖌️ BƯỚC 4: VẼ NÓN TƯƠNG LAI (PROJECTION)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var line[] lines_upper = array.new_line()
+var line[] lines_lower = array.new_line()
+var line[] lines_mean  = array.new_line()
+
+if barstate.islast
+    // Xóa nón cũ
+    for l in lines_upper
+        line.delete(l)
+    for l in lines_lower
+        line.delete(l)
+    for l in lines_mean
+        line.delete(l)
+    array.clear(lines_upper)
+    array.clear(lines_lower)
+    array.clear(lines_mean)
+
+    // Điểm neo hiện tại
+    float p_mean = close
+    float p_up = close
+    float p_dn = close
+
+    // Vẽ từng bước vào tương lai
+    for t = 1 to proj_bars
+        // 1. Uốn cong thời gian: t^H
+        time_scaled = math.pow(t, hurst_exp)
+        
+        // 2. Độ mở rộng của nón (Cone Width)
+        cone_width = z_adj * ewma_vol * time_scaled
+        
+        // 3. Đường trung tâm (Mean Path) - SỬ DỤNG ADAPTIVE THRESHOLD
+        float next_mean = na
+        if hurst_exp > trend_threshold
+            // Kịch bản Trending: Nội suy tiếp tục theo Drift
+            next_mean := close + (drift_rate * t)
+        else if hurst_exp < mean_revert_threshold
+            // Kịch bản Mean Reverting: Lực hút Ornstein-Uhlenbeck về EMA
+            kappa = 0.1
+            decay = math.exp(-kappa * t)
+            next_mean := ema_target + (close - ema_target) * decay
+        else
+            // Kịch bản Random Walk: Giá trị kỳ vọng tĩnh (Đường ngang)
+            next_mean := close
+            
+        // 4. Biên trên & dưới
+        next_up = next_mean + cone_width
+        next_dn = next_mean - cone_width
+        
+        // 5. Vẽ đoạn thẳng nối tiếp
+        idx_prev = bar_index + t - 1
+        idx_next = bar_index + t
+        
+        l_m = line.new(idx_prev, p_mean, idx_next, next_mean, color=color.gray, style=line.style_dashed, width=1)
+        l_u = line.new(idx_prev, p_up,   idx_next, next_up,   color=color.red,  style=line.style_solid,  width=2)
+        l_d = line.new(idx_prev, p_dn,   idx_next, next_dn,   color=color.lime, style=line.style_solid,  width=2)
+        
+        array.push(lines_mean, l_m)
+        array.push(lines_upper, l_u)
+        array.push(lines_lower, l_d)
+        
+        // Cập nhật điểm neo
+        p_mean := next_mean
+        p_up := next_up
+        p_dn := next_dn
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📊 DASHBOARD TABLE - ADAPTIVE VERSION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_table = "=== BẢNG THÔNG TIN ==="
+show_table = input.bool(true, "Hiện Dashboard", group=group_table)
+tbl_pos = input.string("Trên-Phải", "Vị trí bảng", options=["Trên-Phải", "Trên-Trái", "Dưới-Phải", "Dưới-Trái"], group=group_table)
+
+// Map position
+f_tbl_pos(pos) =>
+    switch pos
+        "Trên-Phải"  => position.top_right
+        "Trên-Trái"  => position.top_left
+        "Dưới-Phải"  => position.bottom_right
+        "Dưới-Trái"  => position.bottom_left
+        => position.top_right
+
+if barstate.islast and show_table
+    // === PHÂN LOẠI KỊCH BẢN (dùng adaptive threshold) ===
+    final_time_scaled = math.pow(proj_bars, hurst_exp)
+    final_cone_width  = z_adj * ewma_vol * final_time_scaled
+    
+    // Tính Mean path cuối (sử dụng adaptive threshold)
+    float final_mean = na
+    if hurst_exp > trend_threshold
+        final_mean := close + (drift_rate * proj_bars)
+    else if hurst_exp < mean_revert_threshold
+        kappa_tbl = 0.1
+        decay_tbl = math.exp(-kappa_tbl * proj_bars)
+        final_mean := ema_target + (close - ema_target) * decay_tbl
+    else
+        final_mean := close
+
+    final_upper = final_mean + final_cone_width
+    final_lower = final_mean - final_cone_width
+    
+    // Phân loại kịch bản (dùng adaptive threshold)
+    string scenario_name = ""
+    string scenario_icon = ""
+    color  scenario_color = color.gray
+    string scenario_action = ""
+
+    if ewma_vol > ta.sma(ewma_vol, 50) * 1.8 or kurt > 8.0
+        scenario_name   := "④ NÓN CỰC RỘNG"
+        scenario_icon   := "🔴"
+        scenario_color  := color.new(color.red, 0)
+        scenario_action := "GIẢM SIZE / KHÔNG TRADE"
+    else if hurst_exp > trend_threshold
+        scenario_name   := "② TRENDING MẠNH"
+        scenario_icon   := "🟢"
+        scenario_color  := color.new(color.green, 0)
+        scenario_action := "TP xa, Trailing Stop"
+    else if hurst_exp < mean_revert_threshold
+        scenario_name   := "③ MEAN REVERT"
+        scenario_icon   := "🟡"
+        scenario_color  := color.new(color.yellow, 0)
+        scenario_action := "TP gần EMA, SL chặt"
+    else
+        scenario_name   := "① RANDOM WALK"
+        scenario_icon   := "⚪"
+        scenario_color  := color.new(color.gray, 0)
+        scenario_action := "TP/SL chuẩn"
+    
+    // Màu cho từng chỉ số
+    hurst_color  = hurst_exp > trend_threshold ? color.green : hurst_exp < mean_revert_threshold ? color.orange : color.gray
+    kurt_color   = kurt > 8 ? color.red : kurt > kurt_threshold ? color.orange : color.gray
+    vol_color    = ewma_vol > ta.sma(ewma_vol, 50) * 1.5 ? color.red : color.gray
+    regime_color = is_growth_regime ? color.new(#FF6B00, 0) : color.new(#00BFFF, 0)
+
+    // === TẠO BẢNG ===
+    var table tbl = table.new(f_tbl_pos(tbl_pos), 3, 14, 
+         bgcolor=color.new(color.black, 30), 
+         border_width=1, 
+         border_color=color.new(color.gray, 60),
+         frame_width=2, 
+         frame_color=color.new(color.white, 70))
+    
+    // Header
+    table.cell(tbl, 0, 0, "📐 ADAPTIVE CONE", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 40), text_halign=text.align_center)
+    table.merge_cells(tbl, 0, 0, 2, 0)
+
+    // ★ Row mới: Regime hiện tại (Growth / Value)
+    regime_icon  = is_growth_regime ? "🚀" : "🏛️"
+    regime_label = regime_icon + " REGIME: " + regime_name
+    table.cell(tbl, 0, 1, regime_label, text_color=regime_color, text_size=size.small, bgcolor=color.new(regime_color, 80), text_halign=text.align_center)
+    table.merge_cells(tbl, 0, 1, 2, 1)
+
+    // ★ Row: Adaptive Parameters
+    param_text = "H:" + str.tostring(active_hurst_len) + " V:" + str.tostring(active_vol_len) + " E:" + str.tostring(active_ema_len)
+    table.cell(tbl, 0, 2, "⚙️ PARAMS", text_color=color.silver, text_size=size.tiny, bgcolor=color.new(color.black, 50))
+    table.cell(tbl, 1, 2, param_text, text_color=regime_color, text_size=size.tiny, bgcolor=color.new(color.black, 50), text_halign=text.align_center)
+    table.merge_cells(tbl, 1, 2, 2, 2)
+
+    // Kịch bản hiện tại
+    table.cell(tbl, 0, 3, scenario_icon + " KỊCH BẢN", text_color=color.white, text_size=size.small, bgcolor=color.new(scenario_color, 60))
+    table.cell(tbl, 1, 3, scenario_name, text_color=scenario_color, text_size=size.small, bgcolor=color.new(color.black, 50), text_halign=text.align_center)
+    table.merge_cells(tbl, 1, 3, 2, 3)
+
+    // Hành động
+    table.cell(tbl, 0, 4, "🎯 HÀNH ĐỘNG", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.black, 50))
+    table.cell(tbl, 1, 4, scenario_action, text_color=scenario_color, text_size=size.tiny, bgcolor=color.new(color.black, 50), text_halign=text.align_center)
+    table.merge_cells(tbl, 1, 4, 2, 4)
+    
+    // Separator
+    table.cell(tbl, 0, 5, "", bgcolor=color.new(color.gray, 70))
+    table.merge_cells(tbl, 0, 5, 2, 5)
+
+    // Metrics header
+    table.cell(tbl, 0, 6, "CHỈ SỐ", text_color=color.silver, text_size=size.tiny, bgcolor=color.new(color.black, 50))
+    table.cell(tbl, 1, 6, "GIÁ TRỊ", text_color=color.silver, text_size=size.tiny, bgcolor=color.new(color.black, 50), text_halign=text.align_center)
+    table.cell(tbl, 2, 6, "TRẠNG THÁI", text_color=color.silver, text_size=size.tiny, bgcolor=color.new(color.black, 50), text_halign=text.align_center)
+
+    // Row: Macro Kurtosis (DNA)
+    kurt_dna_state = macro_kurt > kurt_threshold ? "🧬 Growth" : "🧬 Value"
+    table.cell(tbl, 0, 7, "Macro Kurt", text_color=color.white, text_size=size.tiny)
+    table.cell(tbl, 1, 7, str.tostring(macro_kurt, "#.##"), text_color=regime_color, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl, 2, 7, kurt_dna_state, text_color=regime_color, text_size=size.tiny, text_halign=text.align_center)
+
+    // Row: Hurst
+    hurst_state = hurst_exp > trend_threshold ? "Trending" : hurst_exp < mean_revert_threshold ? "Mean-Rev" : "Neutral"
+    table.cell(tbl, 0, 8, "Hurst (H)", text_color=color.white, text_size=size.tiny)
+    table.cell(tbl, 1, 8, str.tostring(hurst_exp, "#.###"), text_color=hurst_color, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl, 2, 8, hurst_state, text_color=hurst_color, text_size=size.tiny, text_halign=text.align_center)
+
+    // Row: Thresholds (hiện ngưỡng adaptive đang dùng)
+    thresh_text = "T>" + str.tostring(trend_threshold, "#.##") + " M<" + str.tostring(mean_revert_threshold, "#.##")
+    table.cell(tbl, 0, 9, "Thresholds", text_color=color.white, text_size=size.tiny)
+    table.cell(tbl, 1, 9, thresh_text, text_color=regime_color, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl, 2, 9, regime_name, text_color=regime_color, text_size=size.tiny, text_halign=text.align_center)
+
+    // Row: Volatility
+    vol_ratio = ewma_vol / ta.sma(ewma_vol, 50)
+    vol_state = vol_ratio > 1.5 ? "⚠ RẤT CAO" : vol_ratio > 1.0 ? "Trên TB" : "Dưới TB"
+    table.cell(tbl, 0, 10, "Volatility", text_color=color.white, text_size=size.tiny)
+    table.cell(tbl, 1, 10, str.tostring(ewma_vol, "#.##"), text_color=vol_color, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl, 2, 10, vol_state, text_color=vol_color, text_size=size.tiny, text_halign=text.align_center)
+
+    // Row: Z-Score adjusted
+    z_state = z_adj > z_base * 1.3 ? "Mở rộng" : "Chuẩn"
+    z_color = z_adj > z_base * 1.3 ? color.orange : color.gray
+    table.cell(tbl, 0, 11, "Z-Score Adj", text_color=color.white, text_size=size.tiny)
+    table.cell(tbl, 1, 11, str.tostring(z_adj, "#.###"), text_color=z_color, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl, 2, 11, z_state, text_color=z_color, text_size=size.tiny, text_halign=text.align_center)
+
+    // Row: Drift
+    drift_dir = drift_rate > 0 ? "↑ Tăng" : drift_rate < 0 ? "↓ Giảm" : "→ Ngang"
+    drift_color = drift_rate > 0 ? color.green : drift_rate < 0 ? color.red : color.gray
+    table.cell(tbl, 0, 12, "Drift", text_color=color.white, text_size=size.tiny)
+    table.cell(tbl, 1, 12, str.tostring(drift_rate, "#.####"), text_color=drift_color, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl, 2, 12, drift_dir, text_color=drift_color, text_size=size.tiny, text_halign=text.align_center)
+
+    // Separator
+    table.cell(tbl, 0, 13, "", bgcolor=color.new(color.gray, 70))
+    table.merge_cells(tbl, 0, 13, 2, 13)
+
+    // Không thể thêm quá 14 row (0-13), nên bỏ row cone cuối vào label thay thế
+    // Hoặc hiển thị inline
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🏷️ LABEL: CONE TARGET (Biên trên/dưới sau N nến)  
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if barstate.islast
+    final_ts = math.pow(proj_bars, hurst_exp)
+    final_cw = z_adj * ewma_vol * final_ts
+    
+    float fm = na
+    if hurst_exp > trend_threshold
+        fm := close + (drift_rate * proj_bars)
+    else if hurst_exp < mean_revert_threshold
+        kappa_lbl = 0.1
+        decay_lbl = math.exp(-kappa_lbl * proj_bars)
+        fm := ema_target + (close - ema_target) * decay_lbl
+    else
+        fm := close
+
+    fu = fm + final_cw
+    fl = fm - final_cw
+
+    label.new(bar_index + proj_bars, fu, "▲ " + str.tostring(fu, "#.##"), 
+         color=color.new(color.red, 70), textcolor=color.red, style=label.style_label_down, size=size.small)
+    label.new(bar_index + proj_bars, fl, "▼ " + str.tostring(fl, "#.##"), 
+         color=color.new(color.lime, 70), textcolor=color.lime, style=label.style_label_up, size=size.small)

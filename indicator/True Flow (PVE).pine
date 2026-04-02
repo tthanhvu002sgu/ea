@@ -1,0 +1,151 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © True Flow Indicator
+
+//@version=5
+indicator("True Flow (PVE)", shorttitle="TrueFlow", overlay=false, format=format.volume)
+
+//=============================================================================
+// THEORY: "The Quality Vector"
+//=============================================================================
+// Imagine a candle as a moving car:
+// - Velocity (V): Body size = |Close - Open| / ATR → Normalized distance
+// - Air Drag (D): Wick size = Range - Body → Resistance from opposing force
+// - Fuel (F): Volume (relative) → Energy powering the move
+//
+// Purity Coefficient (k) = Body / Range
+// - Marubozu (solid): k → 1 (pure momentum)
+// - Doji (hollow): k → 0 (noise/indecision)
+//
+// True Flow = RelVolume × NormBody × k² × Direction
+// - NormBody = Body / ATR (so scale is consistent across instruments)
+// - k² heavily penalizes "hollow" candles
+// - Doji uses close vs close[1] for direction fallback
+//=============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+group_main = "Main Settings"
+i_signalPeriod   = input.int(14, "Signal Line Period (SMA)", minval=1, group=group_main)
+i_smoothPeriod   = input.int(1, "Smooth Period (1 = off)", minval=1, maxval=50, group=group_main, tooltip="Smooths the histogram. Use 3-5 for lower timeframes (M1-M15) to reduce noise.")
+i_minPurity      = input.float(0.0, "Minimum Purity Threshold", minval=0.0, maxval=1.0, step=0.05, group=group_main)
+
+group_vol = "Volume Settings"
+i_normalizeVol   = input.bool(true, "Normalize Volume", group=group_vol, tooltip="Use relative volume (compared to average). Recommended ON for stable readings.")
+i_volNormPeriod  = input.int(20, "Volume Normalization Period", minval=1, group=group_vol)
+
+group_visual = "Visual Settings"
+i_bullColor      = input.color(color.new(#00BFFF, 0), "Bullish Color", group=group_visual)
+i_bearColor      = input.color(color.new(#FF6347, 0), "Bearish Color", group=group_visual)
+i_neutralColor   = input.color(color.new(#808080, 50), "Neutral Color", group=group_visual)
+i_signalColor    = input.color(color.new(#FFD700, 0), "Signal Line Color", group=group_visual)
+i_histWidth      = input.int(3, "Histogram Width", minval=1, maxval=10, group=group_visual)
+i_signalWidth    = input.int(2, "Signal Line Width", minval=1, maxval=5, group=group_visual)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Calculate candle components
+candleRange = high - low
+body = math.abs(close - open)
+atrVal = ta.atr(14)
+
+// Avoid division by zero
+safeRange = candleRange > 0 ? candleRange : atrVal * 0.001
+
+// Calculate Purity Coefficient (k)
+k = body / safeRange
+
+// FIX #1: Normalize body by ATR → scale-independent across instruments
+bodyNorm = atrVal > 0 ? body / atrVal : body
+
+// FIX #4: Doji fallback — use close vs previous close for direction
+direction = close > open ? 1 : close < open ? -1 : (close > nz(close[1]) ? 1 : -1)
+
+// FIX #2: Volume normalized by default (input default = true)
+vol = volume
+if i_normalizeVol
+    avgVol = ta.sma(volume, i_volNormPeriod)
+    vol := avgVol > 0 ? volume / avgVol : volume
+
+// Calculate True Flow: RelVolume × NormBody × k² × Direction
+// Apply minimum purity threshold
+rawFlow = k >= i_minPurity ? vol * bodyNorm * k * k * direction : 0.0
+
+// FIX #3: Optional smoothing to reduce noise on lower TFs
+trueFlow = i_smoothPeriod > 1 ? ta.sma(rawFlow, i_smoothPeriod) : rawFlow
+
+// Calculate Signal Line (SMA of True Flow)
+signalLine = ta.sma(trueFlow, i_signalPeriod)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS
+// ─────────────────────────────────────────────────────────────────────────────
+histColor = trueFlow > 0 ? i_bullColor : trueFlow < 0 ? i_bearColor : i_neutralColor
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Zero line reference
+hline(0, "Zero Line", color=color.new(color.gray, 70), linestyle=hline.style_dotted)
+
+// Main Histogram
+plot(trueFlow, "True Flow", color=histColor, style=plot.style_columns, linewidth=i_histWidth)
+
+// Signal Line
+plot(signalLine, "Signal", color=i_signalColor, linewidth=i_signalWidth)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INFO TABLE
+// ─────────────────────────────────────────────────────────────────────────────
+var table infoTable = table.new(position.top_right, 2, 7, bgcolor=color.new(#1a1a2e, 85), border_width=1, border_color=color.new(#4a4a6a, 50))
+
+// Update table
+if barstate.islast
+    // Purity description
+    purityDesc = k >= 0.9 ? "Marubozu ✦" : k >= 0.7 ? "Strong ●" : k >= 0.5 ? "Moderate ◐" : k >= 0.3 ? "Weak ○" : "Hollow ◌"
+    purityColor = k >= 0.7 ? color.lime : k >= 0.5 ? color.yellow : k >= 0.3 ? color.orange : color.red
+    
+    // Flow direction
+    flowDir = trueFlow > 0 ? "▲ BULLISH" : trueFlow < 0 ? "▼ BEARISH" : "◆ NEUTRAL"
+    flowColor = trueFlow > 0 ? i_bullColor : trueFlow < 0 ? i_bearColor : i_neutralColor
+    
+    // Crossover signal
+    crossUp = ta.crossover(trueFlow, signalLine)
+    crossDown = ta.crossunder(trueFlow, signalLine)
+    crossSignal = crossUp ? "⬆ BUY Signal" : crossDown ? "⬇ SELL Signal" : "— Hold"
+    crossColor = crossUp ? color.lime : crossDown ? color.red : color.gray
+    
+    // Header
+    table.cell(infoTable, 0, 0, "TRUE FLOW", text_color=color.white, text_size=size.small, bgcolor=color.new(#2a2a4a, 70))
+    table.cell(infoTable, 1, 0, "VALUES", text_color=color.white, text_size=size.small, bgcolor=color.new(#2a2a4a, 70))
+    
+    // Data rows
+    table.cell(infoTable, 0, 1, "Body", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, str.tostring(body, format.mintick), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 2, "Range", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 2, str.tostring(candleRange, format.mintick), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 3, "Purity (k)", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, str.tostring(k * 100, "#.0") + "% " + purityDesc, text_color=purityColor, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 4, "True Flow", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 4, str.tostring(trueFlow, "#.0"), text_color=flowColor, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 5, "Signal", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 5, str.tostring(signalLine, "#.0"), text_color=i_signalColor, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 6, "Status", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 6, crossSignal, text_color=crossColor, text_size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(ta.crossover(trueFlow, signalLine), "True Flow Bullish Cross", "True Flow crossed above Signal Line - Potential BUY")
+alertcondition(ta.crossunder(trueFlow, signalLine), "True Flow Bearish Cross", "True Flow crossed below Signal Line - Potential SELL")
+alertcondition(ta.crossover(trueFlow, 0), "True Flow Turned Positive", "True Flow turned positive - Bullish momentum")
+alertcondition(ta.crossunder(trueFlow, 0), "True Flow Turned Negative", "True Flow turned negative - Bearish momentum")
+alertcondition(k >= 0.8 and math.abs(trueFlow) > ta.sma(math.abs(trueFlow), 20), "High Quality Move", "High purity candle with strong True Flow detected")

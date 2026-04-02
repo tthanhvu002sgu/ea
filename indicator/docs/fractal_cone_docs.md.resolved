@@ -1,0 +1,438 @@
+# 📐 The Fractal Cone [Advanced Probability] — Hướng Dẫn Sử Dụng Chi Tiết
+
+> [!NOTE]
+> Tài liệu này bao gồm: giải thích nguyên lý, hướng dẫn cài đặt thông số, cách đọc tín hiệu, và chiến lược áp dụng cho **Day Trading** & **Đầu tư dài hạn (Investing)**.
+
+---
+
+## 1. Tổng Quan Chỉ Báo
+
+**Fractal Cone** là một chỉ báo xác suất dự phóng tương lai (Probability Projection), được vẽ trực tiếp trên chart giá (overlay). Nó tạo ra một **"nón xác suất"** (Probability Cone) mở rộng từ giá hiện tại về phía bên phải, giúp trader hình dung:
+
+- **Phạm vi giá có thể đạt được** trong N nến tới với xác suất ~95%
+- **Xu hướng trung tâm dự kiến** (đường Mean Path)
+- **Chế độ thị trường** hiện tại (Trending, Mean-Reverting, Random Walk, hoặc Volatility cực đoan)
+
+### Triết lý cốt lõi
+
+Thay vì dự đoán giá sẽ đi đâu, Fractal Cone **phân loại trạng thái thị trường** và đưa ra **vùng giá xác suất cao nhất**. Đây là tư duy xác suất (probabilistic thinking) — nền tảng của quản lý rủi ro chuyên nghiệp.
+
+---
+
+## 2. Các Thành Phần Hiển Thị Trên Chart
+
+### 2.1. Nón Xác Suất (Probability Cone)
+
+| Thành phần | Màu sắc | Ý nghĩa |
+|:---|:---|:---|
+| **Đường biên trên** | 🔴 Đỏ (solid, width=2) | Giới hạn trên ~95% — Giá **rất khó** vượt qua |
+| **Đường biên dưới** | 🟢 Xanh lá (solid, width=2) | Giới hạn dưới ~95% — Giá **rất khó** rơi xuống dưới |
+| **Đường trung tâm** | ⚪ Xám (dashed, width=1) | Đường kỳ vọng trung bình (Mean Path) — Giá **có khả năng cao nhất** đi theo đường này |
+
+```
+         🔴 ────────────────  Biên trên (Red)
+        /
+       /    Vùng xác suất
+      /     giá sẽ nằm ~95%
+     / ⚪ - - - - - - - - -   Đường Mean (Gray dashed)
+    /      
+   /
+  🟢 ────────────────────── Biên dưới (Lime)
+  │
+  │ Giá hiện tại (Close)
+```
+
+### 2.2. Dashboard Table (Bảng Thông Tin)
+
+Dashboard hiển thị ở góc chart (mặc định Trên-Phải) với các thông tin:
+
+| Hàng | Nội dung | Giải thích |
+|:---|:---|:---|
+| **Kịch bản** | ①②③④ | Chế độ thị trường hiện tại |
+| **Hành động** | Gợi ý TP/SL | Chiến thuật phù hợp |
+| **Hurst (H)** | 0.1 → 0.9 | Chỉ số fractal — xác định trend hay mean-revert |
+| **Kurtosis (K)** | ≥ 3.0 | Mức độ "đuôi béo" — rủi ro black swan |
+| **Volatility** | EWMA Vol | Biến động hiện tại so với trung bình |
+| **Z-Score Adj** | ≥ Z-base | Z-score đã điều chỉnh theo kurtosis |
+| **Drift** | + / - / 0 | Hướng drift ngắn hạn |
+| **Sau N nến** | ▲ Biên trên / ▼ Biên dưới | Mức giá dự phóng cuối nón |
+
+---
+
+## 3. Giải Thích 4 Công Cụ Toán Học Cốt Lõi
+
+### 3.1. EWMA Volatility (Biến động đóng băng)
+
+```
+ewma_vol = EMA(TrueRange, len_vol)
+```
+
+- **Là gì:** Trung bình biến động theo phương pháp EMA trên True Range
+- **Mục đích:** Đo **mức biến động hiện tại** — nón rộng hay hẹp phụ thuộc vào giá trị này
+- **Khi nào quan trọng:** Khi `ewma_vol` vượt quá 1.5x trung bình 50 kỳ → Cảnh báo volatility cao
+
+### 3.2. Kurtosis (Độ nhọn phân phối)
+
+```
+K = M4 / (M2)²    // M4 = moment bậc 4, M2 = moment bậc 2
+```
+
+- **Phân phối chuẩn:** K = 3.0
+- **K > 3.0 (Leptokurtic):** Phân phối có "đuôi béo" → Xác suất xuất hiện giá cực đoan **cao hơn** bình thường
+- **Tác động thực tế:** Khi K cao, chỉ báo **tự động mở rộng Z-score**, làm nón rộng hơn để phản ánh rủi ro thực sự
+
+| Kurtosis | Trạng thái | Ý nghĩa |
+|:---|:---|:---|
+| K ≤ 5.0 | ✅ Normal | Phân phối gần chuẩn, nón tin cậy |
+| 5.0 < K ≤ 8.0 | ⚠️ Leptokurtic | Đuôi béo vừa phải, cẩn trọng |
+| K > 8.0 | 🔴 Fat Tail | Cực kỳ nguy hiểm, giá có thể "bay" bất thường |
+
+### 3.3. Hurst Exponent (Chỉ số Fractal)
+
+```
+H = log(Std_n / Std_1) / log(n)    // Giới hạn: 0.1 ≤ H ≤ 0.9
+```
+
+Đây là **trái tim** của chỉ báo. Hurst cho biết **bản chất chuyển động giá**:
+
+| Hurst | Chế độ | Ý nghĩa | Hình dạng nón |
+|:---|:---|:---|:---|
+| H > 0.6 | 🟢 **Trending** | Giá có xu hướng tiếp tục theo đà | Nón mở rộng nhanh, nghiêng theo drift |
+| 0.45 ≤ H ≤ 0.6 | ⚪ **Random Walk** | Giá đi ngẫu nhiên, không có xu hướng rõ | Nón đối xứng, mở đều |
+| H < 0.45 | 🟡 **Mean-Reverting** | Giá có xu hướng quay về trung bình (EMA) | Nón hẹp hơn, mean path hút về EMA |
+
+> [!IMPORTANT]
+> Hurst Exponent quyết định **đường trung tâm (Mean Path)** đi như thế nào:
+> - **Trending (H > 0.55):** Dùng Drift tuyến tính → `Mean = Close + (drift_rate × t)`
+> - **Mean-Revert (H ≤ 0.55):** Dùng Ornstein-Uhlenbeck → `Mean = EMA + (Close - EMA) × e^(-κt)` → Đường mean cong dần về EMA
+
+### 3.4. Z-Score Adjusted (Điều chỉnh xác suất)
+
+```
+z_adj = z_base × (1 + excess_kurtosis × 0.1)
+```
+
+- **Z-base = 2.0** → Tương đương khoảng tin cậy **~95%**
+- Khi kurtosis cao (đuôi béo), Z-score **tự động tăng** → Nón mở rộng để bảo vệ khỏi **sự kiện cực đoan**
+
+---
+
+## 4. Bốn Kịch Bản Thị Trường
+
+Đây là phần **quan trọng nhất** để ra quyết định giao dịch:
+
+### ① Random Walk ⚪
+- **Điều kiện:** 0.45 ≤ Hurst ≤ 0.6, Vol bình thường, Kurtosis bình thường
+- **Đặc điểm:** Thị trường không có xu hướng rõ ràng
+- **Hành động:** TP/SL chuẩn (theo ratio 1:1.5 hoặc 1:2)
+- **Nón:** Hình dạng đối xứng, mở đều
+
+### ② Trending Mạnh 🟢
+- **Điều kiện:** Hurst > 0.6
+- **Đặc điểm:** Giá có momentum rõ ràng, xu hướng sẽ tiếp tục
+- **Hành động:** **TP xa**, dùng **Trailing Stop** thay vì SL cố định
+- **Nón:** Nghiêng theo hướng drift, mở rộng nhanh
+
+### ③ Mean Revert 🟡
+- **Điều kiện:** Hurst < 0.45
+- **Đặc điểm:** Giá có xu hướng quay về trung bình (EMA Target)
+- **Hành động:** **TP gần EMA**, **SL chặt**
+- **Nón:** Mean path cong dần về EMA target
+
+### ④ Nón Cực Rộng 🔴
+- **Điều kiện:** Vol > 1.8× trung bình 50 kỳ HOẶC Kurtosis > 8.0
+- **Đặc điểm:** Thị trường cực kỳ bất ổn, rủi ro không thể kiểm soát
+- **Hành động:** **GIẢM SIZE hoặc KHÔNG TRADE**
+- **Nón:** Cực rộng, không đáng tin cậy
+
+> [!CAUTION]
+> Khi Dashboard hiện **④ NÓN CỰC RỘNG (🔴)**, đây là tín hiệu **mạnh nhất** để **đứng ngoài thị trường**. Đừng cố gắng giao dịch trong môi trường này.
+
+---
+
+## 5. Cài Đặt Thông Số (Input Parameters)
+
+### 5.1. Nhóm Core
+
+| Thông số | Mặc định | Phạm vi đề xuất | Giải thích |
+|:---|:---|:---|:---|
+| **Kurtosis Length** | 30 | 20–50 | Số nến tính Kurtosis. Nhỏ hơn → nhạy hơn với biến động gần |
+| **Hurst Length** | 50 | 30–100 | Số nến tính Hurst. Lớn hơn → phản ánh xu hướng dài hạn hơn |
+| **EMA Target Length** | 50 | 20–200 | Chu kỳ EMA mục tiêu cho Mean-Reversion. Tùy timeframe |
+| **EWMA Volatility Length** | 10 | 5–20 | Chu kỳ EMA cho True Range. Nhỏ → nhạy với Vol ngắn hạn |
+
+### 5.2. Nhóm Projection
+
+| Thông số | Mặc định | Phạm vi đề xuất | Giải thích |
+|:---|:---|:---|:---|
+| **Số nến tương lai** | 20 | 5–100 | Nón dự phóng xa bao nhiêu nến về phía trước |
+| **Z-Score Cơ bản** | 2.0 | 1.0–3.0 | Xác suất cơ bản. 1.0 ≈ 68%, 2.0 ≈ 95%, 3.0 ≈ 99.7% |
+
+### 5.3. Nhóm Dashboard
+
+| Thông số | Mặc định | Giải thích |
+|:---|:---|:---|
+| **Hiện Dashboard** | true | Bật/tắt bảng thông tin |
+| **Vị trí bảng** | Trên-Phải | 4 vị trí: Trên-Phải, Trên-Trái, Dưới-Phải, Dưới-Trái |
+
+---
+
+## 6. Áp Dụng Cho Day Trading
+
+### 6.1. Cài đặt thông số cho Day Trading
+
+| Thông số | Giá trị đề xuất | Lý do |
+|:---|:---|:---|
+| Kurtosis Length | **20** | Nhạy hơn với biến động trong phiên |
+| Hurst Length | **30** | Phản ánh xu hướng ngắn hạn |
+| EMA Target | **20–30** | Mean-reversion trong phiên |
+| EWMA Vol Length | **5–10** | Bắt volatility ngay lập tức |
+| Số nến tương lai | **10–20** | Dự phóng vài giờ tới (tùy TF) |
+| Z-Score Cơ bản | **2.0** | 95% confidence |
+
+**Timeframe phù hợp:** 5m, 15m, 1H
+
+### 6.2. Chiến Lược Day Trading Theo Kịch Bản
+
+#### 🟢 Kịch bản ② Trending → Breakout / Momentum Trade
+
+```
+Điều kiện vào lệnh:
+├── Dashboard hiện "② TRENDING MẠNH" (Hurst > 0.6)
+├── Drift > 0 (Buy) hoặc Drift < 0 (Sell)
+├── Giá phá qua vùng consolidation trước đó
+└── Vol ≤ 1.5× TB (không quá bất ổn)
+
+Quản lý lệnh:
+├── Entry: Breakout hoặc Pullback vào Mean Path (đường xám)
+├── TP: Đặt gần biên nón (đỏ cho Long, xanh cho Short)
+│   └── Hoặc dùng Trailing Stop theo Mean Path
+├── SL: Phía đối diện của Mean Path
+└── R:R mục tiêu ≥ 1:2
+```
+
+> [!TIP]
+> Khi Hurst > 0.6, **đừng chốt lời quá sớm**. Nón mở rộng nhanh → Giá có momentum mạnh, hãy để Trailing Stop bảo vệ lợi nhuận.
+
+#### 🟡 Kịch bản ③ Mean Revert → Reversal / Fade Trade
+
+```
+Điều kiện vào lệnh:
+├── Dashboard hiện "③ MEAN REVERT" (Hurst < 0.45)
+├── Giá chạm hoặc vượt biên nón (đỏ/xanh)
+├── Xuất hiện rejection candle (pin bar, engulfing, etc.)
+└── Drift đang yếu hoặc đổi dấu
+
+Quản lý lệnh:
+├── Entry: Giá chạm biên nón + xác nhận đảo chiều
+├── TP: Đặt tại Mean Path (đường xám) hoặc EMA Target
+├── SL: Vượt biên nón 1 ATR
+└── R:R mục tiêu ≥ 1:1.5
+```
+
+> [!TIP]
+> Mean-reversion trade có tỷ lệ thắng cao hơn nhưng profit/trade nhỏ hơn. Phù hợp khi thị trường đi ngang trong session Asia hoặc pre-market.
+
+#### ⚪ Kịch bản ① Random Walk → Scalping hoặc Chờ
+
+```
+Điều kiện:
+├── Dashboard hiện "① RANDOM WALK"
+├── Thị trường không có xu hướng rõ ràng
+└── Nón đối xứng
+
+Chiến lược:
+├── Option A: Scalp nhỏ giữa Mean Path và Biên nón
+├── Option B: Chờ kịch bản thay đổi sang ② hoặc ③
+└── Luôn dùng TP/SL chuẩn (1:1.5)
+```
+
+#### 🔴 Kịch bản ④ Nón Cực Rộng → KHÔNG TRADE
+
+```
+Điều kiện:
+├── Dashboard hiện "④ NÓN CỰC RỘNG"
+├── Vol > 1.8× TB HOẶC Kurtosis > 8.0
+└── Nón mở quá rộng → Không thể đặt TP/SL hợp lý
+
+Hành động:
+├── KHÔNG vào lệnh mới
+├── Đóng hoặc giảm size lệnh đang mở
+├── Chờ volatility giảm về mức bình thường
+└── Thường xảy ra quanh tin tức lớn (CPI, FOMC, NFP...)
+```
+
+### 6.3. Workflow Day Trading Mẫu
+
+```mermaid
+flowchart TD
+    A["Mở chart, kiểm tra Dashboard"] --> B{"Kịch bản nào?"}
+    B -->|"④ Nón cực rộng"| C["KHÔNG TRADE - Chờ Vol giảm"]
+    B -->|"② Trending"| D["Xác định Drift"]
+    B -->|"③ Mean Revert"| E["Chờ giá chạm biên nón"]
+    B -->|"① Random Walk"| F["Scalp nhỏ hoặc chờ"]
+    
+    D --> G["Entry: Breakout/Pullback\nTP: Gần biên nón\nSL: Qua Mean Path"]
+    E --> H["Entry: Fade tại biên\nTP: Mean Path / EMA\nSL: Vượt biên 1 ATR"]
+    F --> I["TP/SL chuẩn 1:1.5\nSize nhỏ"]
+    
+    G --> J["Trailing Stop theo Mean Path"]
+    H --> J
+    I --> J
+```
+
+---
+
+## 7. Áp Dụng Cho Đầu Tư Dài Hạn (Investing)
+
+### 7.1. Cài đặt thông số cho Investing
+
+| Thông số | Giá trị đề xuất | Lý do |
+|:---|:---|:---|
+| Kurtosis Length | **50** | Lọc noise ngắn hạn |
+| Hurst Length | **100** | Xu hướng macro dài hạn |
+| EMA Target | **100–200** | Mean-reversion dài hạn (EMA200 kinh điển) |
+| EWMA Vol Length | **20** | Vol trung hạn, không quá nhạy |
+| Số nến tương lai | **50–100** | Dự phóng nhiều tuần/tháng tới |
+| Z-Score Cơ bản | **2.0–2.5** | 95–99% confidence |
+
+**Timeframe phù hợp:** Daily (1D), Weekly (1W)
+
+### 7.2. Chiến Lược Investing Theo Kịch Bản
+
+#### 🟢 Kịch bản ② Trending → Tích Lũy Theo Trend
+
+```
+Ứng dụng:
+├── Xác nhận xu hướng tăng dài hạn
+├── Thêm vị thế khi giá pullback về Mean Path
+├── KHÔNG bán khi giá vẫn trong nón + Hurst > 0.6
+└── Biên trên của nón = Vùng overextended (có thể chốt 1 phần)
+
+Quản lý vốn:
+├── DCA (Dollar-Cost Average) theo Mean Path
+├── Tăng allocation khi Hurst ổn định > 0.6
+└── Trailing Stop ở biên dưới nón
+```
+
+#### 🟡 Kịch bản ③ Mean Revert → Mua Vùng Hỗ Trợ
+
+```
+Ứng dụng:
+├── Giá có xu hướng quay về EMA (100/200)
+├── Mua khi giá rơi gần biên dưới nón (oversold)
+├── Bán/chốt lời khi giá vượt Mean Path hoặc gần biên trên
+└── Đặc biệt hữu dụng khi thị trường đi ngang (accumulation)
+
+Quản lý vốn:
+├── Mua dần khi giá ở nửa dưới nón
+├── Không mua thêm khi giá trên Mean Path
+└── SL toàn bộ nếu giá phá biên dưới nón + Hurst chuyển > 0.6 (trending giảm)
+```
+
+#### 🔴 Kịch bản ④ Nón Cực Rộng → Phòng Thủ
+
+```
+Ứng dụng:
+├── Thời kỳ bất ổn macro (khủng hoảng, sự kiện lớn)
+├── Tăng tỷ trọng tiền mặt (cash allocation)
+├── Giảm leverage
+├── Không mua thêm cho đến khi vol giảm
+└── Dùng hedge (options, inverse ETF) nếu có lệnh đang mở
+```
+
+#### ⚪ Kịch bản ① Random Walk → Accumulation Ổn Định
+
+```
+Ứng dụng:
+├── Thị trường không rõ xu hướng → DCA đều đặn
+├── Mua theo lịch cố định (weekly/monthly)
+├── Không cần timing, giá sẽ dao động ngẫu nhiên
+└── Đợi kịch bản chuyển sang ② để tăng niềm tin
+```
+
+### 7.3. Bảng So Sánh Day Trading vs Investing
+
+| Tiêu chí | Day Trading | Investing |
+|:---|:---|:---|
+| **Timeframe** | 5m, 15m, 1H | 1D, 1W |
+| **Hurst Length** | 30 | 100 |
+| **EMA Target** | 20–30 | 100–200 |
+| **Số nến dự phóng** | 10–20 | 50–100 |
+| **Kịch bản ②: TP** | Biên nón + Trailing | Trailing dài hạn |
+| **Kịch bản ③: Entry** | Fade tại biên | DCA vùng biên dưới |
+| **Kịch bản ④: Hành động** | KHÔNG TRADE | Tăng cash, giảm leverage |
+| **Quan trọng nhất** | Kịch bản + Drift | Kịch bản + Hurst dài hạn |
+
+---
+
+## 8. Mẹo Nâng Cao & Lưu Ý
+
+### 8.1. Kết hợp với Volume/Delta
+
+- Dùng Fractal Cone để xác định **kịch bản** → Dùng Volume Delta / CVD để xác nhận **entry**
+- Nếu Cone nói Trending nhưng Delta đang divergence → **Cẩn trọng**, momentum có thể cạn
+
+### 8.2. Multi-Timeframe Confirmation
+
+```
+Ví dụ Day Trading:
+├── Chart 1D: Kiểm tra Hurst trên D → Xác định xu hướng chính
+├── Chart 1H: Kiểm tra kịch bản hiện tại → Quyết định trade hay không
+└── Chart 15m: Entry chính xác → Dùng biên nón làm TP/SL
+```
+
+### 8.3. Đọc sự thay đổi kịch bản
+
+- **Chuyển từ ① → ②**: Momentum mới bắt đầu → Entry tốt nhất
+- **Chuyển từ ② → ③**: Trend yếu dần → Chuẩn bị chốt lời
+- **Chuyển từ bất kỳ → ④**: Volatility bùng nổ → Rút khỏi thị trường
+- **Chuyển từ ④ → ①**: Vol giảm → Sẵn sàng quay lại
+
+### 8.4. Lưu ý quan trọng
+
+> [!WARNING]
+> - Fractal Cone **KHÔNG phải** tín hiệu mua/bán trực tiếp. Nó là **công cụ phân loại thị trường** và **quản lý kỳ vọng**.
+> - Giá **CÓ THỂ** vượt biên nón trong ~5% trường hợp (với Z = 2.0). Đó là bản chất xác suất.
+> - Khi Kurtosis cao (K > 8), xác suất vượt biên **tăng đáng kể** — đây là lý do chỉ báo tự điều chỉnh Z-score.
+> - Luôn kết hợp với **price action** và **volume** để có quyết định tốt nhất.
+
+---
+
+## 9. Checklist Nhanh Trước Mỗi Lệnh
+
+```
+✅ TRƯỚC KHI VÀO LỆNH:
+┌─────────────────────────────────────────────────┐
+│ 1. Dashboard hiện kịch bản nào?                 │
+│    → ④ = KHÔNG TRADE                            │
+│    → ②③① = Tiếp tục kiểm tra                   │
+│                                                 │
+│ 2. Hurst đang ở mức nào?                        │
+│    → > 0.6 = Trade theo trend                   │
+│    → < 0.45 = Trade mean-reversion              │
+│    → 0.45-0.6 = Cẩn trọng, size nhỏ            │
+│                                                 │
+│ 3. Kurtosis có an toàn không?                   │
+│    → < 5.0 = OK                                 │
+│    → > 8.0 = Rủi ro cao, giảm size              │
+│                                                 │
+│ 4. Volatility có bất thường không?              │
+│    → < 1.5× TB = OK                             │
+│    → > 1.5× TB = Cẩn trọng                     │
+│    → > 1.8× TB = KHÔNG TRADE                    │
+│                                                 │
+│ 5. TP/SL đặt ở đâu?                            │
+│    → Trending: TP = biên nón, SL = Mean Path    │
+│    → Mean-Rev: TP = Mean Path, SL = biên + 1ATR │
+│                                                 │
+│ 6. Size phù hợp chưa?                           │
+│    → Nón rộng = size nhỏ hơn                    │
+│    → Nón hẹp = size có thể lớn hơn              │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+> [!TIP]
+> **Nguyên tắc vàng:** Fractal Cone cho bạn biết **thị trường đang ở trạng thái nào** → Từ đó bạn chọn **chiến thuật phù hợp**. Đừng dùng cùng một chiến thuật cho mọi kịch bản — đó là sai lầm phổ biến nhất!

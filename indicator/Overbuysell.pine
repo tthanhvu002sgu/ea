@@ -1,0 +1,160 @@
+//@version=5
+strategy("over buy sell strategy", overlay = true, initial_capital = 1000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100)
+import TradingView/ta/8
+
+// over buy - sell momentum detect
+
+// Input parameters
+rsi = ta.rsi(close,14)
+rsi_length = input.int(14, "RSI Length")
+rsi_threshold = input.int(50, "RSI Threshold")
+macd_fast_length = input.int(12, "MACD Fast Length")
+macd_slow_length = input.int(26, "MACD Slow Length")
+macd_signal_length = input.int(9, "MACD Signal Length")
+adx_length = input.int(14, "ADX Length")
+adx_threshold = input.int(20, "ADX Threshold")
+overbought_level = input.int(80, "Overbought Level")
+oversold_level = input.int(25, "Oversold Level")
+
+// RSI
+is_rsi_bullish = rsi > rsi_threshold
+is_rsi_bearish = rsi < rsi_threshold
+is_overbought = rsi > overbought_level
+is_oversold = rsi < oversold_level
+
+// MACD
+[macd_line, signal_line, macd_hist] = ta.macd(close, macd_fast_length, macd_slow_length, macd_signal_length)
+is_macd_bullish = macd_hist > 0
+is_macd_bearish = macd_hist < 0
+
+// ADX
+[di_plus, di_minus, adx] = ta.dmi(adx_length, 14)
+is_adx_trending = adx > adx_threshold
+is_trend_bullish = di_plus > di_minus
+is_trend_bearish = di_minus > di_plus
+
+// Candle momentum
+candle_range = math.abs(close - open)
+is_candle_bullish = candle_range > ta.atr(14) and close > open
+is_candle_bearish = candle_range > ta.atr(14) and close < open
+
+// Combined momentum check with overbought/oversold filter
+is_momentum_bullish = is_rsi_bullish and is_macd_bullish and is_adx_trending and is_trend_bullish and is_candle_bullish and not is_overbought
+is_momentum_bearish = is_rsi_bearish and is_macd_bearish and is_adx_trending and is_trend_bearish and is_candle_bearish and not is_oversold
+
+// --- Cài đặt Stochastic ---
+stoch_k = ta.sma(ta.stoch(close, high, low, 14), 3)  // %K
+stoch_d = ta.sma(stoch_k, 3)                         // %D
+stoch_bullish = stoch_k > stoch_d                    // Stochastic Bullish
+stoch_bearish = stoch_k < stoch_d                    // Stochastic Bearish
+stoch_overbought = stoch_k > 80                      // Stochastic Overbought
+stoch_oversold = stoch_k < 20                        // Stochastic Oversold
+
+// --- Cài đặt MACD ---
+macd_bullish = macd_line > signal_line               // MACD Bullish
+macd_bearish = macd_line < signal_line               // MACD Bearish
+
+// --- Cài đặt RSI ---
+rsi_bullish = rsi > 50                               // RSI Bullish
+rsi_bearish = rsi < 50                               // RSI Bearish
+rsi_overbought = rsi > 70                            // RSI Overbought
+rsi_oversold = rsi < 30                              // RSI Oversold
+
+// --- Xác định xu hướng trên khung D1 ---
+d1_stoch_k = request.security(syminfo.tickerid, "D", stoch_k)
+d1_stoch_d = request.security(syminfo.tickerid, "D", stoch_d)
+d1_stoch_bullish = d1_stoch_k > d1_stoch_d           // Stochastic Bullish
+d1_stoch_bearish = d1_stoch_k < d1_stoch_d           // Stochastic Bearish
+d1_stoch_overbought = d1_stoch_k > 80                // Stochastic Overbought
+d1_stoch_oversold = d1_stoch_k < 20                  // Stochastic Oversold
+
+d1_macd_line = request.security(syminfo.tickerid, "D", macd_line)
+d1_signal_line = request.security(syminfo.tickerid, "D", signal_line)
+d1_macd_bullish = d1_macd_line > d1_signal_line      // MACD Bullish
+d1_macd_bearish = d1_macd_line < d1_signal_line      // MACD Bearish
+
+d1_rsi = request.security(syminfo.tickerid, "D", rsi)
+d1_rsi_bullish = d1_rsi > 50                         // RSI Bullish
+d1_rsi_bearish = d1_rsi < 50                         // RSI Bearish
+d1_rsi_overbought = d1_rsi > 70                      // RSI Overbought
+d1_rsi_oversold = d1_rsi < 30                        // RSI Oversold
+
+// --- Điều kiện vào lệnh ---
+buy_signal = d1_stoch_bullish and d1_macd_bullish and d1_rsi_bullish
+sell_signal = d1_stoch_bearish and d1_macd_bearish and d1_rsi_bearish
+
+// --- Bảng thông tin ---
+var table trend_table = table.new(position.top_right, 4, 4, bgcolor=color.new(color.gray, 90))
+
+bb_length = input.int(20, title="Bollinger Bands Length", minval=1)
+bb_dev = input.float(2.0, title="Bollinger Bands Deviation", minval=0.1, step=0.1)
+atr_length = input.int(14, title="ATR Length", minval=1)
+atr_multiplier = input.float(0.9, title="ATR Multiplier", minval=0.1, step=0.1)
+lookback = input.int(20, title="Lookback Period", minval=1)
+
+// === INDICATORS ===
+// Bollinger Bands
+bb_basis = ta.sma(close, bb_length)
+dev = bb_dev * ta.stdev(close, bb_length)
+upper_band = bb_basis + dev
+lower_band = bb_basis - dev
+// ATR
+atr = ta.atr(atr_length)
+
+// RSI
+bb_rsi = ta.rsi(close, 22)
+bb_rsi_oversold = rsi < 33
+bb_rsi_overbought = rsi > 67
+
+body_size = math.abs(close - open)
+avg_body_size = ta.sma(body_size, 10)
+body_confirmation = body_size > avg_body_size * 1.5
+
+// === MODIFIED SIGNALS ===
+bb_low_break_filtered = close < lower_band and bb_rsi_oversold  and body_confirmation
+bb_high_break_filtered = close > upper_band and bb_rsi_overbought  and body_confirmation
+
+// === STRATEGY TP/SL ===
+// Handle bb_low_break (Buy Signal)
+if bb_low_break_filtered
+    atr_limit = close - (atr_multiplier * atr)  // Red Line -> SL
+    atr_target = close + (atr_multiplier * atr) // Green Line -> TP
+    
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit Long", "Long", limit=atr_target, stop=atr_limit)
+
+// Handle bb_high_break (Sell Signal)
+if bb_high_break_filtered
+    atr_limit = close + (atr_multiplier * atr)  // Red Line -> SL
+    atr_target = close - (atr_multiplier * atr) // Green Line -> TP
+    
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Exit Short", "Short", limit=atr_target, stop=atr_limit)
+
+// === VISUALIZATION ===
+plotshape(bb_low_break_filtered, title="Buy Signal", location=location.belowbar, color=color.green, style=shape.xcross, size=size.tiny)
+plotshape(bb_high_break_filtered, title="Sell Signal", location=location.abovebar, color=color.red, style=shape.xcross, size=size.tiny)
+
+// 1. XÁC ĐỊNH NẾN ENGULFING
+isBullishEngulfing = (low < low[1] and close > open[1])and (close > open)and (open[1] > close[1]) and (close - open > open[1] - close[1])
+isBearishEngulfing = (high > high[1] and close < open[1])and (close < open)and (open[1] < close[1])and (open - close > close[1] - open[1])           
+
+// 2. TÍNH TOÁN CÁC MỨC CỦA NẾN ENGULFING
+// Chỉ tính khi có nến Engulfing
+engulfingLow = isBullishEngulfing or isBearishEngulfing ? low : na
+engulfingHigh = isBullishEngulfing or isBearishEngulfing ? high : na
+engulfingBodyRange = engulfingHigh - engulfingLow
+engulfing25 = engulfingLow + (engulfingBodyRange * 0.35)
+engulfing50 = engulfingLow + (engulfingBodyRange * 0.50)
+engulfing75 = engulfingLow + (engulfingBodyRange * 0.65)
+
+// 3. VẼ ĐƯỜNG NGANG QUA 1 NẾN
+if isBullishEngulfing or isBearishEngulfing
+    lineColor = color.gray
+    box.new(left=bar_index, top=engulfing25, right=bar_index + 1, bottom=engulfing25, bgcolor=color.new(color.gray, 100), border_color=color.red, border_width=1)
+    box.new(left=bar_index, top=engulfing25, right=bar_index + 1, bottom=engulfingLow, bgcolor=color.new(color.gray, 90), border_width=0)
+    box.new(left=bar_index, top=engulfing50, right=bar_index + 1, bottom=engulfing50, bgcolor=color.new(color.gray, 100), border_color=lineColor, border_width=1)
+    box.new(left=bar_index, top=engulfing50, right=bar_index + 1, bottom=engulfing25, bgcolor=color.new(color.gray, 90), border_width=0)
+    box.new(left=bar_index, top=engulfing75, right=bar_index + 1, bottom=engulfing75, bgcolor=color.new(color.gray, 100), border_color=color.green, border_width=1)
+    box.new(left=bar_index, top=engulfing75, right=bar_index + 1, bottom=engulfing50, bgcolor=color.new(color.gray, 90), border_width=0)
+    box.new(left=bar_index, top=engulfingHigh, right=bar_index + 1, bottom=engulfing75, bgcolor=color.new(color.gray, 90), border_width=0)

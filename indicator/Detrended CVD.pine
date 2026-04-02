@@ -1,0 +1,192 @@
+// This Pine Script™ v6 indicator is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Vu
+// Converted from MQ5: Detrended CVD (Z-Score Oscillator) + Divergence Detection
+
+//@version=6
+indicator("Detrended CVD Z-Score", shorttitle="DCVD Z", overlay=false, precision=2, max_lines_count=500, max_labels_count=500)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// === INPUTS ===
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+length      = input.int(100, "Window Size", minval=2, group="Z-SCORE CONFIG")
+limitStd    = input.float(2.0, "Standard Deviation Limit", step=0.1, group="Z-SCORE CONFIG")
+signalEma   = input.int(9, "Signal Line EMA Period", minval=1, group="Z-SCORE CONFIG")
+useRealVol  = input.bool(false, "Use Real Volume (False = Tick Volume)", group="Z-SCORE CONFIG")
+
+// Divergence inputs
+group_div    = "=== DIVERGENCE ==="
+pivotLen     = input.int(5, "Pivot Lookback", minval=1, maxval=20, group=group_div)
+showBullDiv  = input.bool(true, "Show Bullish Divergence", group=group_div)
+showBearDiv  = input.bool(true, "Show Bearish Divergence", group=group_div)
+showHiddenDiv = input.bool(false, "Show Hidden Divergence", group=group_div)
+divLookback  = input.int(60, "Max Bars Between Pivots", minval=10, maxval=200, group=group_div)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// === 1. Raw Delta ===
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+vol = useRealVol ? volume : volume
+tick_delta = close > open ? vol : close < open ? -vol : 0.0
+
+// === 2. Cumulative CVD (continuous, never resets) ===
+rawCVD = ta.cum(tick_delta)
+
+// === 3. Z-Score (Sliding Window SMA + Population StDev) ===
+meanCVD = ta.sma(rawCVD, length)
+variance = ta.sma(math.pow(rawCVD - meanCVD, 2), length)
+stdCVD   = math.sqrt(variance)
+zScore = stdCVD > 0 ? (rawCVD - meanCVD) / stdCVD : 0.0
+
+// === 4. Signal Line (EMA of Z-Score) ===
+signalLine = ta.ema(zScore, signalEma)
+
+// === 5. Color Mapping ===
+zColor = zScore > limitStd  ? color.lime   :
+         zScore < -limitStd ? color.red    :
+         zScore > 0         ? color.teal   :
+                              color.maroon
+
+// === PLOTS ===
+plot(zScore, "Z-Score CVD", color=zColor, style=plot.style_histogram, linewidth=2)
+plot(signalLine, "Signal Line", color=color.new(#FF8C00, 0), linewidth=1)
+
+// === LEVELS ===
+hline(0.0,       "Zero",       color=color.gray, linestyle=hline.style_dotted)
+hline(limitStd,  "Upper Std",  color=color.gray, linestyle=hline.style_dotted)
+hline(-limitStd, "Lower Std",  color=color.gray, linestyle=hline.style_dotted)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// === 6. DIVERGENCE DETECTION ===
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// --- Detect Pivot Highs & Lows ---
+// Trên giá (close) và trên chỉ báo (zScore)
+// ta.pivothigh/low trả về giá trị tại pivot, hoặc na nếu không phải pivot
+// Pivot xác nhận sau pivotLen bars (có offset)
+
+osc = zScore  // Alias cho dễ đọc
+
+// Pivot trên chỉ báo
+osc_ph = ta.pivothigh(osc, pivotLen, pivotLen)
+osc_pl = ta.pivotlow(osc, pivotLen, pivotLen)
+
+// Pivot trên giá close
+price_ph = ta.pivothigh(close, pivotLen, pivotLen)
+price_pl = ta.pivotlow(close, pivotLen, pivotLen)
+
+// --- Lưu vị trí và giá trị pivot gần nhất ---
+// Khi phát hiện pivot mới, lưu lại pivot trước đó để so sánh
+
+// == PIVOT LOW (cho Bullish Divergence) ==
+var int   prev_pl_bar   = na    // Bar index pivot low trước
+var float prev_pl_price = na    // Giá tại pivot low trước
+var float prev_pl_osc   = na    // Oscillator tại pivot low trước
+
+var int   curr_pl_bar   = na    // Bar index pivot low hiện tại
+var float curr_pl_price = na
+var float curr_pl_osc   = na
+
+// == PIVOT HIGH (cho Bearish Divergence) ==
+var int   prev_ph_bar   = na
+var float prev_ph_price = na
+var float prev_ph_osc   = na
+
+var int   curr_ph_bar   = na
+var float curr_ph_price = na
+var float curr_ph_osc   = na
+
+// --- Cập nhật Pivot Low ---
+if not na(osc_pl)
+    // Dịch pivot hiện tại thành pivot trước
+    prev_pl_bar   := curr_pl_bar
+    prev_pl_price := curr_pl_price
+    prev_pl_osc   := curr_pl_osc
+    // Ghi nhận pivot mới (offset pivotLen bars về trước)
+    curr_pl_bar   := bar_index - pivotLen
+    curr_pl_price := close[pivotLen]
+    curr_pl_osc   := osc[pivotLen]
+
+// --- Cập nhật Pivot High ---
+if not na(osc_ph)
+    prev_ph_bar   := curr_ph_bar
+    prev_ph_price := curr_ph_price
+    prev_ph_osc   := curr_ph_osc
+    curr_ph_bar   := bar_index - pivotLen
+    curr_ph_price := close[pivotLen]
+    curr_ph_osc   := osc[pivotLen]
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// === 7. KIỂM TRA VÀ VẼ DIVERGENCE ===
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Bullish Divergence (Regular):
+//   Giá tạo đáy THẤP HƠN, chỉ báo tạo đáy CAO HƠN → tín hiệu đảo chiều tăng
+//
+// Bearish Divergence (Regular):
+//   Giá tạo đỉnh CAO HƠN, chỉ báo tạo đỉnh THẤP HƠN → tín hiệu đảo chiều giảm
+//
+// Hidden Bullish:
+//   Giá tạo đáy CAO HƠN, chỉ báo tạo đáy THẤP HƠN → continuation tăng
+//
+// Hidden Bearish:
+//   Giá tạo đỉnh THẤP HƠN, chỉ báo tạo đỉnh CAO HƠN → continuation giảm
+
+// Màu sắc
+color bullColor     = color.new(#00E676, 0)    // Xanh lá sáng
+color bearColor     = color.new(#FF1744, 0)    // Đỏ sáng
+color hidBullColor  = color.new(#00E676, 50)   // Xanh lá nhạt
+color hidBearColor  = color.new(#FF1744, 50)   // Đỏ nhạt
+
+// --- Regular Bullish Divergence (tại Pivot Low) ---
+if not na(osc_pl) and showBullDiv
+    if not na(prev_pl_bar) and not na(curr_pl_bar)
+        barsBack = curr_pl_bar - prev_pl_bar
+        if barsBack > 0 and barsBack <= divLookback
+            // Regular Bullish: Giá lower low + Osc higher low
+            if curr_pl_price < prev_pl_price and curr_pl_osc > prev_pl_osc
+                // Vẽ đường nối 2 đáy trên cửa sổ indicator
+                line.new(prev_pl_bar, prev_pl_osc, curr_pl_bar, curr_pl_osc,
+                     color=bullColor, width=2, style=line.style_solid)
+                // Label tại pivot hiện tại
+                label.new(curr_pl_bar, curr_pl_osc, "Bull",
+                     color=color.new(bullColor, 80), textcolor=bullColor,
+                     style=label.style_label_up, size=size.tiny)
+
+// --- Regular Bearish Divergence (tại Pivot High) ---
+if not na(osc_ph) and showBearDiv
+    if not na(prev_ph_bar) and not na(curr_ph_bar)
+        barsBack = curr_ph_bar - prev_ph_bar
+        if barsBack > 0 and barsBack <= divLookback
+            // Regular Bearish: Giá higher high + Osc lower high
+            if curr_ph_price > prev_ph_price and curr_ph_osc < prev_ph_osc
+                line.new(prev_ph_bar, prev_ph_osc, curr_ph_bar, curr_ph_osc,
+                     color=bearColor, width=2, style=line.style_solid)
+                label.new(curr_ph_bar, curr_ph_osc, "Bear",
+                     color=color.new(bearColor, 80), textcolor=bearColor,
+                     style=label.style_label_down, size=size.tiny)
+
+// --- Hidden Bullish Divergence (tại Pivot Low) ---
+if not na(osc_pl) and showHiddenDiv
+    if not na(prev_pl_bar) and not na(curr_pl_bar)
+        barsBack = curr_pl_bar - prev_pl_bar
+        if barsBack > 0 and barsBack <= divLookback
+            // Hidden Bullish: Giá higher low + Osc lower low
+            if curr_pl_price > prev_pl_price and curr_pl_osc < prev_pl_osc
+                line.new(prev_pl_bar, prev_pl_osc, curr_pl_bar, curr_pl_osc,
+                     color=hidBullColor, width=2, style=line.style_dashed)
+                label.new(curr_pl_bar, curr_pl_osc, "H.Bull",
+                     color=color.new(hidBullColor, 80), textcolor=hidBullColor,
+                     style=label.style_label_up, size=size.tiny)
+
+// --- Hidden Bearish Divergence (tại Pivot High) ---
+if not na(osc_ph) and showHiddenDiv
+    if not na(prev_ph_bar) and not na(curr_ph_bar)
+        barsBack = curr_ph_bar - prev_ph_bar
+        if barsBack > 0 and barsBack <= divLookback
+            // Hidden Bearish: Giá lower high + Osc higher high
+            if curr_ph_price < prev_ph_price and curr_ph_osc > prev_ph_osc
+                line.new(prev_ph_bar, prev_ph_osc, curr_ph_bar, curr_ph_osc,
+                     color=hidBearColor, width=2, style=line.style_dashed)
+                label.new(curr_ph_bar, curr_ph_osc, "H.Bear",
+                     color=color.new(hidBearColor, 80), textcolor=hidBearColor,
+                     style=label.style_label_down, size=size.tiny)

@@ -1,0 +1,220 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © Investor PnL Matrix - "Who is Hurting?" Indicator
+// Always uses WEEKLY data for consistency across all timeframes
+
+//@version=6
+indicator("Investor PnL Matrix", shorttitle="PnL Matrix", overlay=false)
+
+//=============================================================================
+// INPUT PARAMETERS
+//=============================================================================
+
+// === PERIODS (in Weeks - always uses Weekly data) ===
+inp_years_1 = input.int(1, "Period 1 (Years)", minval=1, maxval=10, group="Periods")
+inp_years_2 = input.int(2, "Period 2 (Years)", minval=1, maxval=10, group="Periods")
+inp_years_3 = input.int(3, "Period 3 (Years)", minval=1, maxval=10, group="Periods")
+inp_years_4 = input.int(4, "Period 4 (Years)", minval=1, maxval=10, group="Periods")
+
+// Convert years to weeks
+p1 = inp_years_1 * 52
+p2 = inp_years_2 * 52
+p3 = inp_years_3 * 52
+p4 = inp_years_4 * 52
+
+// === COST BASIS METHOD ===
+cost_method = input.string("SMA", "Cost Basis Method", 
+              options=["SMA", "VWAP", "Median HL"], 
+              group="Method",
+              tooltip="SMA: Average close price\nVWAP: Volume-weighted average\nMedian HL: Average of high/low range")
+
+// === ZONE DETECTION METHOD ===
+zone_method = input.string("Percentile", "Zone Detection Method",
+              options=["Percentile", "Convergence"],
+              group="Zone Detection",
+              tooltip="Percentile: Based on historical ROI distribution\nConvergence: All lines converging in same direction")
+
+// Percentile settings
+inp_percentile_lookback = input.int(208, "Percentile Lookback (weeks)", minval=52, maxval=520, group="Zone Detection")
+inp_gift_percentile = input.float(10.0, "Gift Zone: Below Percentile (%)", minval=1, maxval=30, group="Zone Detection")
+inp_bubble_percentile = input.float(90.0, "Bubble Zone: Above Percentile (%)", minval=70, maxval=99, group="Zone Detection")
+
+// Convergence settings
+inp_convergence_spread = input.float(30.0, "Convergence: Max Spread (%)", minval=10, maxval=100, group="Zone Detection",
+                         tooltip="Maximum difference between highest and lowest ROI for convergence")
+inp_convergence_gift = input.float(0.0, "Convergence Gift: All ROI below (%)", group="Zone Detection")
+inp_convergence_bubble = input.float(50.0, "Convergence Bubble: All ROI above (%)", group="Zone Detection")
+
+//=============================================================================
+// FETCH WEEKLY DATA (Consistency across all timeframes)
+//=============================================================================
+
+// Always use Weekly data regardless of chart timeframe
+weekly_close = request.security(syminfo.tickerid, "W", close)
+weekly_high = request.security(syminfo.tickerid, "W", high)
+weekly_low = request.security(syminfo.tickerid, "W", low)
+weekly_volume = request.security(syminfo.tickerid, "W", volume)
+
+//=============================================================================
+// COST BASIS CALCULATION (on Weekly data)
+//=============================================================================
+
+// SMA on weekly data
+get_sma(src, len) =>
+    request.security(syminfo.tickerid, "W", ta.sma(src, len))
+
+// VWAP on weekly data
+get_vwap(len) =>
+    sum_pv = request.security(syminfo.tickerid, "W", ta.sma(close * volume, len) * len)
+    sum_v = request.security(syminfo.tickerid, "W", ta.sma(volume, len) * len)
+    sum_v > 0 ? sum_pv / sum_v : get_sma(close, len)
+
+// Median HL on weekly data
+get_median_hl(len) =>
+    avg_high = request.security(syminfo.tickerid, "W", ta.sma(high, len))
+    avg_low = request.security(syminfo.tickerid, "W", ta.sma(low, len))
+    (avg_high + avg_low) / 2
+
+// Calculate cost basis based on method
+get_cost_basis(int period) =>
+    float result = 0.0
+    switch cost_method
+        "SMA" =>
+            result := get_sma(close, period)
+        "VWAP" =>
+            result := get_vwap(period)
+        "Median HL" =>
+            result := get_median_hl(period)
+    result
+
+// Calculate cost basis for each cohort
+cost_1y = get_cost_basis(p1)
+cost_2y = get_cost_basis(p2)
+cost_3y = get_cost_basis(p3)
+cost_4y = get_cost_basis(p4)
+
+//=============================================================================
+// ROI CALCULATION
+//=============================================================================
+
+// ROI = (Current Weekly Close - Cost Basis) / Cost Basis × 100
+roi1 = cost_1y > 0 ? (weekly_close - cost_1y) / cost_1y * 100 : 0
+roi2 = cost_2y > 0 ? (weekly_close - cost_2y) / cost_2y * 100 : 0
+roi3 = cost_3y > 0 ? (weekly_close - cost_3y) / cost_3y * 100 : 0
+roi4 = cost_4y > 0 ? (weekly_close - cost_4y) / cost_4y * 100 : 0
+
+//=============================================================================
+// PLOTTING
+//=============================================================================
+
+// Breakeven line
+hline(0, "Breakeven Line", color=color.white, linewidth=2, linestyle=hline.style_solid)
+
+// ROI lines for each investor cohort
+plot(roi1, "1-Year ROI", color=color.new(#2962FF, 0), linewidth=2)   // Blue (Short)
+plot(roi2, "2-Year ROI", color=color.new(#00E676, 20), linewidth=1)  // Green
+plot(roi3, "3-Year ROI", color=color.new(#FF9800, 20), linewidth=1)  // Orange
+plot(roi4, "4-Year ROI", color=color.new(#F50057, 0), linewidth=2)   // Red (Long)
+
+//=============================================================================
+// ZONE DETECTION
+//=============================================================================
+
+// === PERCENTILE METHOD ===
+// Calculate historical percentile for each ROI
+get_percentile_rank(float value, int lookback) =>
+    int count_below = 0
+    for i = 1 to lookback
+        if value[i] < value
+            count_below += 1
+    float(count_below) / float(lookback) * 100
+
+// Get percentile rank for average ROI
+avg_roi = (roi1 + roi2 + roi3 + roi4) / 4
+roi_percentile = get_percentile_rank(avg_roi, inp_percentile_lookback)
+
+// Percentile-based zones
+is_gift_percentile = roi_percentile < inp_gift_percentile
+is_bubble_percentile = roi_percentile > inp_bubble_percentile
+
+// === CONVERGENCE METHOD ===
+// Check if all lines are converging (close together)
+roi_max = math.max(math.max(roi1, roi2), math.max(roi3, roi4))
+roi_min = math.min(math.min(roi1, roi2), math.min(roi3, roi4))
+roi_spread = roi_max - roi_min
+is_converging = roi_spread < inp_convergence_spread
+
+// Convergence-based zones: All lines close together AND in same direction
+is_gift_convergence = is_converging and (roi_max < inp_convergence_gift)
+is_bubble_convergence = is_converging and (roi_min > inp_convergence_bubble)
+
+// === FINAL ZONE SELECTION ===
+bool is_gift = false
+bool is_bubble = false
+
+switch zone_method
+    "Percentile" =>
+        is_gift := is_gift_percentile
+        is_bubble := is_bubble_percentile
+    "Convergence" =>
+        is_gift := is_gift_convergence
+        is_bubble := is_bubble_convergence
+
+// Background coloring
+bgcolor(is_gift ? color.new(color.green, 80) : na, title="GIFT Zone Background")
+bgcolor(is_bubble ? color.new(color.red, 80) : na, title="BUBBLE Zone Background")
+
+//=============================================================================
+// INFO TABLE
+//=============================================================================
+
+// Determine current zone status
+zone_status = is_gift ? "GIFT" : is_bubble ? "BUBBLE" : "Normal"
+zone_color = is_gift ? color.green : is_bubble ? color.red : color.gray
+
+var table info_table = table.new(position.top_right, 2, 8, 
+                                  bgcolor=color.new(color.black, 80),
+                                  border_color=color.new(color.white, 70),
+                                  border_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(info_table, 0, 0, "PnL MATRIX", text_color=color.white, 
+               text_size=size.normal, bgcolor=color.new(#1565C0, 40), text_halign=text.align_center)
+    table.merge_cells(info_table, 0, 0, 1, 0)
+    
+    // Zone Status
+    table.cell(info_table, 0, 1, "Zone", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 1, zone_status, text_color=zone_color, text_size=size.normal)
+    
+    // Zone Method Info
+    table.cell(info_table, 0, 2, zone_method, text_color=color.gray, text_size=size.small)
+    method_info = zone_method == "Percentile" ? str.tostring(roi_percentile, "#") + "th" : str.tostring(roi_spread, "#.#") + "% spread"
+    table.cell(info_table, 1, 2, method_info, text_color=color.white, text_size=size.small)
+    
+    // Cost Method
+    table.cell(info_table, 0, 3, "Cost Basis", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 3, cost_method, text_color=color.white, text_size=size.small)
+    
+    // ROI values
+    table.cell(info_table, 0, 4, str.tostring(inp_years_1) + "Y ROI", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 4, str.tostring(roi1, "#.#") + "%", 
+               text_color=roi1 > 0 ? color.green : color.red, text_size=size.small)
+    
+    table.cell(info_table, 0, 5, str.tostring(inp_years_2) + "Y ROI", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 5, str.tostring(roi2, "#.#") + "%", 
+               text_color=roi2 > 0 ? color.green : color.red, text_size=size.small)
+    
+    table.cell(info_table, 0, 6, str.tostring(inp_years_3) + "Y ROI", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 6, str.tostring(roi3, "#.#") + "%", 
+               text_color=roi3 > 0 ? color.green : color.red, text_size=size.small)
+    
+    table.cell(info_table, 0, 7, str.tostring(inp_years_4) + "Y ROI", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 7, str.tostring(roi4, "#.#") + "%", 
+               text_color=roi4 > 0 ? color.green : color.red, text_size=size.small)
+
+//=============================================================================
+// ALERTS
+//=============================================================================
+
+alertcondition(is_gift, "GIFT Zone", "PnL Matrix: All investor cohorts are underwater!")
+alertcondition(is_bubble, "BUBBLE Zone", "PnL Matrix: All investor cohorts are in deep profit!")

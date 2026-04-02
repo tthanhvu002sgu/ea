@@ -1,0 +1,51 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © Quantified Detrended CVD (Z-Score)
+
+//@version=5
+indicator("Detrended CVD (Z-Score Oscillator)", format=format.price, precision=2)
+
+// 📊 1. THÔNG SỐ ĐẦU VÀO
+grp_calc = "=== CẤU HÌNH Z-SCORE ==="
+length = input.int(100, "Chu kỳ chuẩn hóa (Window Size)", minval=10, group=grp_calc, tooltip="Độ dài 'trí nhớ' của chỉ báo. Càng lớn, dữ liệu vĩ mô càng được giữ lại.")
+limit_std = input.float(2.0, "Ngưỡng Cảnh báo (Standard Deviation)", group=grp_calc)
+
+// 🧮 2. TÍNH TOÁN DELTA VÀ CVD THÔ (RAW CVD)
+// Lưu ý: Đây là thuật toán nội suy Delta cơ bản từ OHLC và Volume. 
+// Trên thị trường Futures/Crypto chuẩn, bạn nên dùng dữ liệu Up/Down Volume thực tế của sàn.
+float tick_delta = 0.0
+if close > open
+    tick_delta := volume
+else if close < open
+    tick_delta := -volume
+else
+    tick_delta := 0
+
+// Tính Cumulative Delta vô hạn
+var float raw_cvd = 0.0
+raw_cvd += tick_delta
+
+// 🚀 3. CHUẨN HÓA Z-SCORE (NORMALIZATION & DETRENDING)
+// Tính giá trị Trung bình (Mean) và Độ lệch chuẩn (StDev) của CVD trong N nến
+mean_cvd = ta.sma(raw_cvd, length)
+std_cvd = ta.stdev(raw_cvd, length)
+
+// Công thức Z-Score: (Giá trị hiện tại - Giá trị trung bình) / Độ lệch chuẩn
+// Giới hạn lỗi chia cho 0 khi thị trường đóng băng
+float z_cvd = std_cvd != 0 ? (raw_cvd - mean_cvd) / std_cvd : 0.0
+
+// 🖌️ 4. TRỰC QUAN HÓA (VISUALIZATION)
+// Đổi màu Histogram dựa trên trạng thái Động lượng của CVD
+color hist_color = z_cvd > limit_std ? color.new(color.lime, 0) : 
+                   z_cvd < -limit_std ? color.new(color.red, 0) : 
+                   z_cvd > 0 ? color.new(color.teal, 40) : color.new(color.maroon, 40)
+
+plot(z_cvd, title="Z-Score CVD", style=plot.style_histogram, color=hist_color, linewidth=2)
+
+// Vẽ các đường biên giới hạn (Bands)
+hline(0, "Baseline", color=color.gray, linestyle=hline.style_dotted)
+hline(limit_std, "Upper Band (+2 Std)", color=color.red, linestyle=hline.style_dashed)
+hline(-limit_std, "Lower Band (-2 Std)", color=color.lime, linestyle=hline.style_dashed)
+
+// Vẽ đường tín hiệu làm mượt (Signal Line)
+signal_line = ta.ema(z_cvd, 9)
+plot(signal_line, title="Signal Line", color=color.orange, linewidth=1)

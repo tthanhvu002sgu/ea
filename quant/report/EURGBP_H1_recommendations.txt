@@ -1,0 +1,31 @@
+TRADING RECOMMENDATIONS REPORT
+Generated: 2026-02-10 17:34:49
+============================================================
+
+1. MARKET CONTEXT (MEI)
+   Score: 81.5/100 (HIGHLY EFFICIENT)
+   Recommendation: AVOID OR MINIMIZE
+   ⚠️ WARNING: Market is efficient. Most simple strategies will fail.
+   Suggestion: Wait for inefficient windows (see Rolling MEI chart).
+
+2. MARKET REGIME
+   Current Regime: RANGING
+   Dominant Regime: RANGING
+   Strategy Focus: Mean Reversion
+
+3. TOP PERFORMING STRATEGIES (Past Data)
+   1. consecutive_rsi_reversal  | WR: 54.3% | PF: 1.02 | Net: 11.5 pips
+   2. far_below_sma             | WR: 52.9% | PF: 1.06 | Net: 17.6 pips
+   3. sell_swing_high           | WR: 52.7% | PF: 1.21 | Net: 1227.4 pips
+   4. rsi_oversold_25           | WR: 51.4% | PF: 1.09 | Net: 102.4 pips
+   5. rsi_overbought_80         | WR: 51.4% | PF: 1.03 | Net: 20.2 pips
+
+4. RECOMMENDED PORTFOLIO ALLOCATION
+   - support_resistance_sell_swing_high : 50.0%  (WR: 52.7%, PF: 1.21)
+   - support_resistance_buy_swing_low   : 50.0%  (WR: 50.5%, PF: 1.15)
+
+============================================================
+ACTION PLAN:
+🛑 CAUTION: Market is efficient.
+   → Reduce risk or paper trade only.
+   → Look for specific time windows in Rolling MEI chart.

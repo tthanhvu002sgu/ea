@@ -1,0 +1,40 @@
+//@version=5
+indicator("Efficiency Ratio", shorttitle="ER", overlay=false)
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+length = input.int(10, title="Period (n)", minval=1)
+
+// -----------------------------------------------------------------------------
+// CALCULATIONS
+// -----------------------------------------------------------------------------
+// Numerator: Absolute price change over 'n' periods
+// Abs(Close_n - Close_0)
+direction = math.abs(close - close[length])
+
+// Denominator: Sum of absolute bar-to-bar price changes over 'n' periods
+// Sum(Abs(Close_i - Close_i-1))
+volatility = math.sum(math.abs(close - close[1]), length)
+
+// Efficiency Ratio calculation
+// Avoid division by zero
+er = volatility == 0 ? 0 : direction / volatility
+
+// -----------------------------------------------------------------------------
+// PLOTTING & ZONES
+// -----------------------------------------------------------------------------
+plot(er, title="Efficiency Ratio", color=color.new(color.blue, 0), linewidth=2)
+
+// Horizontal lines for bounds and zones with dashed style
+h_100 = hline(1.0, title="Upper Bound", color=color.gray, linestyle=hline.style_dashed)
+h_70  = hline(0.70, title="0.7 Level", color=color.new(color.green, 50), linestyle=hline.style_dashed)
+h_45  = hline(0.45, title="0.45 Level", color=color.new(color.yellow, 50), linestyle=hline.style_dashed)
+h_30  = hline(0.30, title="0.3 Level", color=color.new(color.orange, 50), linestyle=hline.style_dashed)
+h_00  = hline(0.0, title="Lower Bound", color=color.gray, linestyle=hline.style_dashed)
+
+// Background fill between Horizontal Lines for visual zones
+fill(h_70, h_100, color=color.new(color.green, 85), title="ER >= 0.7 Zone")
+fill(h_45, h_70,  color=color.new(color.yellow, 85), title="0.45 <= ER < 0.7 Zone")
+fill(h_30, h_45,  color=color.new(color.orange, 85), title="0.3 <= ER < 0.45 Zone")
+

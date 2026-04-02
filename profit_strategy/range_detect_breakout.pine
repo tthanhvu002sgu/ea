@@ -1,0 +1,142 @@
+// ============================================================
+// Range Detect Breakout — Pine Script v6 (Indicator)
+// Converted from RangeBreakoutEA_v2.mq5 (MQL5)
+// ============================================================
+// Logic:
+//   1. EMA 100 (D1) — bộ lọc xu hướng vĩ mô
+//   2. EMA 21 (H1)  — trailing reference
+//   3. Range Detector: Squeeze + Overlap ratio
+//   4. Tín hiệu: tam giác xanh/đỏ tại đỉnh/đáy range
+// ============================================================
+
+//@version=6
+indicator(
+     title      = "Range Detect Breakout",
+     shorttitle = "RDB",
+     overlay    = true
+ )
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+
+// === Bộ lọc xu hướng ===
+grp_trend   = "=== BỘ LỌC XU HƯỚNG ==="
+i_filterTF  = input.timeframe("D",  "Khung Filter TF (EMA D1)",  group = grp_trend)
+i_emaPeriod = input.int(100,         "Chu kỳ EMA Filter (D1)",    group = grp_trend, minval = 1)
+
+// === EMA Trailing ===
+grp_trail   = "=== EMA TRAILING ==="
+i_trailTF   = input.timeframe("60", "Khung Trailing TF (EMA H1)", group = grp_trail)
+i_trailEMA  = input.int(21,          "Chu kỳ EMA Trailing (H1)",  group = grp_trail, minval = 1)
+
+// === Range Detector ===
+grp_range     = "=== RANGE DETECTOR ==="
+i_rangePeriod = input.int(20,   "Số nến Range (Range Period)",    group = grp_range, minval = 2)
+i_avgPeriod   = input.int(100,  "Số nến trung bình (Avg Period)", group = grp_range, minval = 2)
+i_threshold   = input.float(0.85, "Hệ số nén (Squeeze)",          group = grp_range, step = 0.01)
+i_overlapPct  = input.float(0.60, "Tỷ lệ Overlap (%)",            group = grp_range, step = 0.01)
+i_minGap      = input.int(5,    "Khoảng cách Overlap tối thiểu",  group = grp_range, minval = 1)
+
+// === Hiển thị ===
+grp_visual  = "=== HIỂN THỊ ==="
+i_showBoxes = input.bool(true,  "Hiển thị Range Box", group = grp_visual)
+
+// ─────────────────────────────────────────────
+// EMA CALCULATIONS (multi-timeframe)
+// ─────────────────────────────────────────────
+
+// EMA 100 trên D1 — bộ lọc xu hướng
+ema_filter = request.security(syminfo.tickerid, i_filterTF,
+             ta.ema(close, i_emaPeriod), gaps = barmerge.gaps_off)
+
+// EMA 21 trên H1 — trailing stop reference
+ema_trail = request.security(syminfo.tickerid, i_trailTF,
+            ta.ema(close, i_trailEMA), gaps = barmerge.gaps_off)
+
+// Xác định xu hướng từ close D1 so với EMA D1
+close_d1  = request.security(syminfo.tickerid, i_filterTF, close, gaps = barmerge.gaps_off)
+is_bullish = close_d1 > ema_filter
+is_bearish = close_d1 < ema_filter
+
+// ─────────────────────────────────────────────
+// RANGE DETECTION FUNCTIONS
+// ─────────────────────────────────────────────
+
+f_barRange(length) =>
+    ta.highest(high, length) - ta.lowest(low, length)
+
+f_overlapRatio(length) =>
+    rh   = ta.highest(high, length)
+    rl   = ta.lowest(low,   length)
+    mid  = (rh + rl) / 2
+    half = (rh - rl) / 2 * 0.5
+    cnt  = 0
+    for i = 0 to length - 1
+        if high[i] >= (mid - half) and low[i] <= (mid + half)
+            cnt += 1
+    float(cnt) / float(length)
+
+f_isRanging() =>
+    cur_range = f_barRange(i_rangePeriod)
+    avg_range = 0.0
+    for i = 0 to i_avgPeriod - 1
+        avg_range += (ta.highest(high, i_rangePeriod)[i] - ta.lowest(low, i_rangePeriod)[i])
+    avg_range /= i_avgPeriod
+
+    cond_squeeze = avg_range > 0 ? cur_range < avg_range * i_threshold : false
+    cond_overlap = f_overlapRatio(i_rangePeriod) >= i_overlapPct
+
+    cond_squeeze and cond_overlap
+
+// ─────────────────────────────────────────────
+// RANGE DETECTION (dùng [1] — nến đã đóng, tránh repaint)
+// ─────────────────────────────────────────────
+is_ranging = f_isRanging()[1]
+range_high = ta.highest(high, i_rangePeriod)[1]
+range_low  = ta.lowest(low,   i_rangePeriod)[1]
+
+// ─────────────────────────────────────────────
+// ENTRY SIGNALS
+// ─────────────────────────────────────────────
+buy_signal  = is_ranging and is_bullish
+sell_signal = is_ranging and is_bearish
+
+// ─────────────────────────────────────────────
+// RANGE BOX VISUALIZATION
+// ─────────────────────────────────────────────
+var box range_box = na
+
+range_started = is_ranging and not is_ranging[1]
+
+if i_showBoxes
+    if range_started
+        range_box := box.new(
+             left         = bar_index - i_rangePeriod,
+             top          = range_high,
+             right        = bar_index,
+             bottom       = range_low,
+             border_color = color.gray,
+             bgcolor      = color.new(color.gray, 85),
+             extend       = extend.none
+         )
+    else if is_ranging and not na(range_box)
+        box.set_right(range_box,  bar_index)
+        box.set_top(range_box,    range_high)
+        box.set_bottom(range_box, range_low)
+
+// ─────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────
+
+// EMA 100 D1 — xu hướng vĩ mô
+plot(ema_filter, title = "EMA 100 (D1)", color = color.orange, linewidth = 2)
+
+// EMA 21 H1 — trailing reference
+plot(ema_trail,  title = "EMA 21 (H1)",  color = color.aqua,   linewidth = 1)
+
+// Entry signals
+plotshape(buy_signal,  title = "Buy Signal",  location = location.belowbar,
+          style = shape.triangleup,   color = color.green, size = size.small)
+plotshape(sell_signal, title = "Sell Signal", location = location.abovebar,
+          style = shape.triangledown, color = color.red,   size = size.small)

@@ -1,0 +1,78 @@
+{
+  "metadata": {
+    "file": "EURUSD_H1.csv",
+    "total_candles": 15298,
+    "analysis_date": "2026-02-10 11:11:42.224790"
+  },
+  "mei_score": 91.63940266761456,
+  "classification": {
+    "class": "HIGHLY EFFICIENT",
+    "color": "\ud83d\udd34",
+    "description": "Very hard to profit",
+    "recommendation": "AVOID OR MINIMIZE",
+    "strategies": [
+      "Market making only",
+      "Ultra HFT strategies",
+      "Find other markets",
+      "Focus on fundamentals"
+    ]
+  },
+  "components": {
+    "hurst": {
+      "value": 0.4843942869020492,
+      "score": 96.87885738040984,
+      "interpretation": "Random Walk (Highly efficient - Hard to profit)"
+    },
+    "autocorr": {
+      "value": 0.016650711401214997,
+      "lags": {
+        "lag_1": 0.028745269030660145,
+        "lag_2": 0.0050059144601474,
+        "lag_3": 0.015494587644707675,
+        "lag_4": 0.04161002257709822,
+        "lag_5": 0.0069643858875048205,
+        "lag_6": 0.007883601744838544,
+        "lag_7": 0.015244169081356304,
+        "lag_8": 0.013313864646415147,
+        "lag_9": 0.014502667600123257,
+        "lag_10": 0.017742631339298473
+      },
+      "score": 83.349288598785,
+      "interpretation": "Low serial correlation - Efficient"
+    },
+    "variance_ratio": {
+      "value": 0.9178222250848601,
+      "z_statistic": -1.3682592668366163,
+      "significant": false,
+      "score": 95.891111254243,
+      "interpretation": "Random walk"
+    },
+    "runs_test": {
+      "actual_runs": 2505,
+      "expected_runs": 2482.9319097502016,
+      "z_score": 0.6265194169539633,
+      "score": 81.2044174913811,
+      "interpretation": "Random sequence"
+    },
+    "entropy": {
+      "value": 4.3152142604969095,
+      "normalized": 0.9411667510515476,
+      "patterns_found": 24,
+      "patterns_possible": 24,
+      "score": 94.11667510515475,
+      "interpretation": "Mostly random"
+    },
+    "predictability": {
+      "ma_sharpe": 0.13989537953461365,
+      "rsi_sharpe": 0.4242602831907899,
+      "momentum_sharpe": 0.2731730797902699,
+      "avg_sharpe": 0.2791095808385578,
+      "score": 86.04452095807211,
+      "interpretation": "Simple strategies fail (Efficient)"
+    }
+  },
+  "summary": [
+    "Market behaves like random walk - very efficient",
+    "Low autocorrelation - market is efficient"
+  ]
+}

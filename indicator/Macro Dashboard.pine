@@ -1,0 +1,160 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © Macro Dashboard - Valuator & PnL Matrix
+
+//@version=6
+indicator("Macro Dashboard", overlay=true)
+
+//=============================================================================
+// INPUT PARAMETERS
+//=============================================================================
+grp_pnl = "PnL Matrix Settings"
+inp_percentile_lookback = input.int(208, "Percentile Lookback (weeks)", group=grp_pnl)
+inp_pnl_gift   = input.float(10.0, "Gift Zone (%)", group=grp_pnl)
+inp_pnl_bubble = input.float(90.0, "Bubble Zone (%)", group=grp_pnl)
+
+grp_val = "The Valuator Settings"
+inp_lookback    = input.int(200, "Regression Lookback (bars)", group=grp_val)
+inp_ema_period  = input.int(52, "EMA Period", group=grp_val)
+inp_val_gift    = input.float(-1.5, "Gift Zone (Z <)", group=grp_val)
+inp_val_cheap   = input.float(-0.8, "Cheap Zone (Z <)", group=grp_val)
+inp_val_exp     = input.float(0.8, "Expensive Zone (Z >)", group=grp_val)
+inp_val_bubble  = input.float(1.5, "Bubble Zone (Z >)", group=grp_val)
+
+// Colors
+color_gift      = color.new(#00E676, 0)
+color_cheap     = color.new(#81C784, 0)
+color_fair      = color.new(#90A4AE, 0)
+color_expensive = color.new(#FF9800, 0)
+color_bubble    = color.new(#F44336, 0)
+color_text      = color.white
+color_bg        = color.new(color.black, 80)
+color_border    = color.new(color.white, 70)
+
+//=============================================================================
+// CORE LOGIC FUNCTIONS (Must be evaluated on Weekly TF)
+//=============================================================================
+
+// VWAP Cost Basis Method
+get_vwap(len) =>
+    sum_pv = ta.sma(close * volume, len) * len
+    sum_v  = ta.sma(volume, len) * len
+    sum_v > 0 ? sum_pv / sum_v : ta.sma(close, len)
+
+f_pnl_matrix() =>
+    cost_1y = get_vwap(52)
+    cost_2y = get_vwap(104)
+    cost_3y = get_vwap(156)
+    cost_4y = get_vwap(208)
+    
+    roi1 = cost_1y > 0 ? (close - cost_1y) / cost_1y * 100 : 0
+    roi2 = cost_2y > 0 ? (close - cost_2y) / cost_2y * 100 : 0
+    roi3 = cost_3y > 0 ? (close - cost_3y) / cost_3y * 100 : 0
+    roi4 = cost_4y > 0 ? (close - cost_4y) / cost_4y * 100 : 0
+    
+    avg_roi = (roi1 + roi2 + roi3 + roi4) / 4
+    
+    int count_below = 0
+    for i = 1 to inp_percentile_lookback
+        if avg_roi[i] < avg_roi
+            count_below += 1
+    
+    float(count_below) / float(inp_percentile_lookback) * 100
+
+f_valuator() =>
+    lookback = math.min(inp_lookback, bar_index + 1)
+    sum_x  = 0.0
+    sum_y  = 0.0
+    sum_xy = 0.0
+    sum_xx = 0.0
+
+    for i = 0 to lookback - 1
+        x = float(i)
+        y = math.log(close[i])
+        sum_x  += x
+        sum_y  += y
+        sum_xy += x * y
+        sum_xx += x * x
+
+    n = float(lookback)
+    b = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x)
+    a = (sum_y - b * sum_x) / n
+
+    fair_value_log = a
+    log_price     = math.log(close)
+    log_deviation = log_price - fair_value_log
+
+    mean_dev = ta.ema(log_deviation, inp_ema_period)
+    variance = ta.ema(math.pow(log_deviation - mean_dev, 2), inp_ema_period)
+    std_dev  = math.sqrt(variance)
+
+    std_dev > 0 ? (log_deviation - mean_dev) / std_dev : 0.0
+
+//=============================================================================
+// REQUEST WEEKLY DATA
+//=============================================================================
+// Requests current week (W0) and previous week (W-1) from the functions
+[pnl_w0, pnl_w1, val_w0, val_w1] = request.security(syminfo.tickerid, "W", [f_pnl_matrix(), f_pnl_matrix()[1], f_valuator(), f_valuator()[1]], barmerge.gaps_off)
+
+//=============================================================================
+// FORMATTING FUNCTIONS
+//=============================================================================
+get_pnl_zone(perc) =>
+    zone = "NORMAL"
+    clr = color_fair
+    if perc < inp_pnl_gift
+        zone := "GIFT"
+        clr := color_gift
+    else if perc > inp_pnl_bubble
+        zone := "BUBBLE"
+        clr := color_bubble
+    [zone, clr]
+
+get_val_zone(z) =>
+    zone = "FAIR"
+    clr = color_fair
+    if z < inp_val_gift
+        zone := "GIFT"
+        clr := color_gift
+    else if z < inp_val_cheap
+        zone := "CHEAP"
+        clr := color_cheap
+    else if z > inp_val_bubble
+        zone := "BUBBLE"
+        clr := color_bubble
+    else if z > inp_val_exp
+        zone := "EXP"
+        clr := color_expensive
+    [zone, clr]
+
+//=============================================================================
+// DASHBOARD PLOTTING
+//=============================================================================
+var table dash = table.new(position.top_right, 3, 4, bgcolor=color_bg, border_color=color_border, border_width=1)
+
+if barstate.islast
+    // Current (W0) status
+    [pnl_zone_w0, pnl_clr_w0] = get_pnl_zone(pnl_w0)
+    [val_zone_w0, val_clr_w0] = get_val_zone(val_w0)
+    
+    // Previous (W-1) status
+    [pnl_zone_w1, pnl_clr_w1] = get_pnl_zone(pnl_w1)
+    [val_zone_w1, val_clr_w1] = get_val_zone(val_w1)
+    
+    // Headers
+    table.cell(dash, 0, 0, "MACRO DASHBOARD (W1)", text_color=color_text, text_size=size.normal, bgcolor=color.new(#1565C0, 40), text_halign=text.align_center)
+    table.merge_cells(dash, 0, 0, 2, 0)
+    
+    // Sub-headers
+    table.cell(dash, 0, 1, "", bgcolor=color_bg) // Empty cell top left
+    table.cell(dash, 1, 1, "Current (W0)", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 2, 1, "Previous (W-1)", text_color=color.gray, text_size=size.small)
+    
+    // Row 1: PnL Matrix
+    table.cell(dash, 0, 2, "PnL Matrix", text_color=color_text, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 2, pnl_zone_w0 + " (" + str.tostring(pnl_w0, "#.1") + "%)", text_color=pnl_clr_w0, text_size=size.small)
+    table.cell(dash, 2, 2, pnl_zone_w1 + " (" + str.tostring(pnl_w1, "#.1") + "%)", text_color=pnl_clr_w1, text_size=size.small)
+
+    // Row 2: The Valuator
+    table.cell(dash, 0, 3, "The Valuator", text_color=color_text, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 3, val_zone_w0 + " (" + (val_w0 > 0 ? "+" : "") + str.tostring(val_w0, "#.2") + ")", text_color=val_clr_w0, text_size=size.small)
+    table.cell(dash, 2, 3, val_zone_w1 + " (" + (val_w1 > 0 ? "+" : "") + str.tostring(val_w1, "#.2") + ")", text_color=val_clr_w1, text_size=size.small)

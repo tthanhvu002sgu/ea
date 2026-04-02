@@ -1,0 +1,317 @@
+//+------------------------------------------------------------------+
+//|                                          True Flow (PVE).mql5    |
+//|                                                                  |
+//|  Indicator Theory: "The Quality Vector"                          |
+//|  - Velocity (V): Body size = |Close - Open|                      |
+//|  - Air Drag (D): Wick size = (High-Low) - Body                   |
+//|  - Fuel (F): Volume                                              |
+//|                                                                  |
+//|  Purity Coefficient (k) = Body / Range = Body / (High - Low)    |
+//|  - Marubozu (solid): k → 1                                       |
+//|  - Doji (hollow): k → 0                                          |
+//|                                                                  |
+//|  True Flow = Volume × Body × k² × Direction                      |
+//|  k² penalizes "hollow" candles heavily                           |
+//+------------------------------------------------------------------+
+#property copyright "True Flow Indicator"
+#property link      ""
+#property version   "1.00"
+#property strict
+#property indicator_separate_window
+#property indicator_buffers 3
+#property indicator_plots   2
+
+//--- Plot 1: Histogram
+#property indicator_label1  "True Flow"
+#property indicator_type1   DRAW_COLOR_HISTOGRAM
+#property indicator_color1  clrDodgerBlue, clrOrangeRed, clrGray
+#property indicator_style1  STYLE_SOLID
+#property indicator_width1  3
+
+//--- Plot 2: Signal Line
+#property indicator_label2  "Signal"
+#property indicator_type2   DRAW_LINE
+#property indicator_color2  clrGold
+#property indicator_style2  STYLE_SOLID
+#property indicator_width2  2
+
+//--- Input parameters
+input int      InpSmoothPeriod   = 1;       // Smoothing Period (1 = no smoothing)
+input int      InpSignalPeriod   = 14;      // Signal Line Period (SMA)
+input bool     InpNormalizeVol   = false;   // Normalize Volume (relative)
+input int      InpVolNormPeriod  = 20;      // Volume Normalization Period
+input double   InpMinPurity      = 0.0;     // Minimum Purity Threshold (0-1)
+input bool     InpShowKLine      = false;   // Show Purity Line (separate buffer)
+
+//--- Indicator buffers
+double   TrueFlowBuffer[];      // Main histogram
+double   ColorBuffer[];         // Color index: 0=blue(bull), 1=red(bear), 2=gray(neutral)
+double   SignalBuffer[];        // Signal line (SMA of True Flow)
+
+//--- Global variables
+int      smoothPeriod;
+int      signalPeriod;
+
+//+------------------------------------------------------------------+
+//| Custom indicator initialization function                          |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Validate inputs
+   smoothPeriod = (InpSmoothPeriod < 1) ? 1 : InpSmoothPeriod;
+   signalPeriod = (InpSignalPeriod < 1) ? 14 : InpSignalPeriod;
+   
+   //--- Set indicator buffers
+   SetIndexBuffer(0, TrueFlowBuffer, INDICATOR_DATA);
+   SetIndexBuffer(1, ColorBuffer, INDICATOR_COLOR_INDEX);
+   SetIndexBuffer(2, SignalBuffer, INDICATOR_DATA);
+   
+   //--- Set buffer properties
+   ArraySetAsSeries(TrueFlowBuffer, true);
+   ArraySetAsSeries(ColorBuffer, true);
+   ArraySetAsSeries(SignalBuffer, true);
+   
+   //--- Set empty value for signal line
+   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, 0.0);
+   
+   //--- Indicator appearance
+   IndicatorSetString(INDICATOR_SHORTNAME, "True Flow (PVE)");
+   IndicatorSetInteger(INDICATOR_DIGITS, 0);
+   
+   //--- Set level at 0 for visual reference
+   IndicatorSetInteger(INDICATOR_LEVELS, 1);
+   IndicatorSetDouble(INDICATOR_LEVELVALUE, 0, 0.0);
+   IndicatorSetInteger(INDICATOR_LEVELCOLOR, 0, clrDimGray);
+   IndicatorSetInteger(INDICATOR_LEVELSTYLE, 0, STYLE_DOT);
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Custom indicator iteration function                               |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+   //--- Handle insufficient data
+   if(rates_total < smoothPeriod + InpVolNormPeriod)
+      return(0);
+   
+   //--- Set arrays as series (newest first)
+   ArraySetAsSeries(open, true);
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   ArraySetAsSeries(close, true);
+   ArraySetAsSeries(tick_volume, true);
+   ArraySetAsSeries(volume, true);
+   ArraySetAsSeries(time, true);
+   
+   //--- Determine start position
+   int startPos;
+   if(prev_calculated == 0)
+   {
+      startPos = rates_total - InpVolNormPeriod - 1;
+      //--- Initialize buffers
+      ArrayInitialize(TrueFlowBuffer, 0.0);
+      ArrayInitialize(ColorBuffer, 2);  // Gray by default
+      ArrayInitialize(SignalBuffer, 0.0);
+   }
+   else
+   {
+      startPos = rates_total - prev_calculated + 1;
+      if(startPos < 0) startPos = 0;
+   }
+   
+   //--- Main calculation loop
+   for(int i = startPos; i >= 0; i--)
+   {
+      //--- Calculate candle components
+      double range = high[i] - low[i];
+      double body = MathAbs(close[i] - open[i]);
+      
+      //--- Avoid division by zero
+      if(range < _Point)
+      {
+         TrueFlowBuffer[i] = 0;
+         ColorBuffer[i] = 2;  // Gray for Doji
+         continue;
+      }
+      
+      //--- Calculate Purity Coefficient (k)
+      double k = body / range;
+      
+      //--- Apply minimum purity threshold
+      if(k < InpMinPurity)
+      {
+         TrueFlowBuffer[i] = 0;
+         ColorBuffer[i] = 2;  // Gray
+         continue;
+      }
+      
+      //--- Get volume (use tick_volume if real volume is 0)
+      double vol;
+      if(volume[i] > 0)
+         vol = (double)volume[i];
+      else
+         vol = (double)tick_volume[i];
+      
+      //--- Normalize volume if enabled
+      if(InpNormalizeVol && i + InpVolNormPeriod < rates_total)
+      {
+         double avgVol = 0;
+         for(int j = i; j < i + InpVolNormPeriod && j < rates_total; j++)
+         {
+            if(volume[j] > 0)
+               avgVol += (double)volume[j];
+            else
+               avgVol += (double)tick_volume[j];
+         }
+         avgVol /= InpVolNormPeriod;
+         
+         if(avgVol > 0)
+            vol = vol / avgVol;  // Relative volume (1.0 = average)
+      }
+      
+      //--- Determine direction
+      int direction = 0;
+      if(close[i] > open[i])
+         direction = 1;   // Bullish
+      else if(close[i] < open[i])
+         direction = -1;  // Bearish
+      else
+         direction = 0;   // Neutral (Doji)
+      
+      //--- Calculate True Flow: Volume × Body × k² × Direction
+      double trueFlow = vol * body * k * k * direction;
+      
+      //--- Apply smoothing if needed
+      if(smoothPeriod > 1 && i + smoothPeriod < rates_total)
+      {
+         double sum = trueFlow;
+         for(int j = 1; j < smoothPeriod && i + j < rates_total; j++)
+         {
+            sum += TrueFlowBuffer[i + j];
+         }
+         trueFlow = sum / smoothPeriod;
+      }
+      
+      //--- Store in buffer
+      TrueFlowBuffer[i] = trueFlow;
+      
+      //--- Set color based on direction
+      if(trueFlow > 0)
+         ColorBuffer[i] = 0;  // Blue (Bullish)
+      else if(trueFlow < 0)
+         ColorBuffer[i] = 1;  // Red (Bearish)
+      else
+         ColorBuffer[i] = 2;  // Gray (Neutral)
+   }
+   
+   //--- Calculate Signal Line (SMA of True Flow)
+   for(int i = startPos; i >= 0; i--)
+   {
+      if(i + signalPeriod >= rates_total)
+      {
+         SignalBuffer[i] = 0.0;
+         continue;
+      }
+      
+      double sum = 0.0;
+      for(int j = 0; j < signalPeriod; j++)
+      {
+         sum += TrueFlowBuffer[i + j];
+      }
+      SignalBuffer[i] = sum / signalPeriod;
+   }
+   
+   return(rates_total);
+}
+
+//+------------------------------------------------------------------+
+//| Get Purity Description                                            |
+//+------------------------------------------------------------------+
+string GetPurityDescription(double k)
+{
+   if(k >= 0.9) return "Marubozu (Pure)";
+   if(k >= 0.7) return "Strong";
+   if(k >= 0.5) return "Moderate";
+   if(k >= 0.3) return "Weak";
+   return "Hollow/Noisy";
+}
+
+//+------------------------------------------------------------------+
+//| ChartEvent handler for displaying info                            |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id,
+                  const long &lparam,
+                  const double &dparam,
+                  const string &sparam)
+{
+   if(id == CHARTEVENT_MOUSE_MOVE)
+   {
+      //--- Get mouse position
+      int x = (int)lparam;
+      int y = (int)dparam;
+      datetime dt;
+      double price;
+      int subwindow;
+      
+      //--- Convert to chart coordinates
+      if(ChartXYToTimePrice(0, x, y, subwindow, dt, price))
+      {
+         int barIndex = iBarShift(_Symbol, _Period, dt);
+         if(barIndex >= 0 && barIndex < ArraySize(TrueFlowBuffer))
+         {
+            //--- Calculate candle info
+            double open_price = iOpen(_Symbol, _Period, barIndex);
+            double high_price = iHigh(_Symbol, _Period, barIndex);
+            double low_price = iLow(_Symbol, _Period, barIndex);
+            double close_price = iClose(_Symbol, _Period, barIndex);
+            long vol = iVolume(_Symbol, _Period, barIndex);
+            
+            double range = high_price - low_price;
+            double body = MathAbs(close_price - open_price);
+            double k = (range > _Point) ? body / range : 0;
+            
+            //--- Update comment with details
+            string info = StringFormat(
+               "═══ True Flow Analysis ═══\n" +
+               "Bar: %d | %s\n" +
+               "─────────────────────────\n" +
+               "Body (V): %.5f\n" +
+               "Range: %.5f\n" +
+               "Wicks (D): %.5f\n" +
+               "Volume (F): %I64d\n" +
+               "─────────────────────────\n" +
+               "Purity (k): %.2f%% [%s]\n" +
+               "True Flow: %.0f\n" +
+               "Signal: %.0f\n",
+               barIndex, TimeToString(dt, TIME_DATE|TIME_MINUTES),
+               body, range, range - body, vol,
+               k * 100, GetPurityDescription(k),
+               TrueFlowBuffer[barIndex],
+               SignalBuffer[barIndex]
+            );
+            
+            Comment(info);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Indicator deinitialization                                        |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Comment("");  // Clear comment on removal
+}
+//+------------------------------------------------------------------+

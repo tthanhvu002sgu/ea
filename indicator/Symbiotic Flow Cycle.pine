@@ -1,0 +1,210 @@
+//@version=5
+indicator("Symbiotic Flow Cycle [SFC] Dashboard", shorttitle="SFC HUD", overlay=true, precision=2)
+
+// =========================================================================
+// INPUT PARAMETERS
+// =========================================================================
+grp_smc = "=== Smart Money Catalyst (SMC) ==="
+length_smc = input.int(20, "SMC Lookback Period", group=grp_smc)
+z_threshold = input.float(2.0, "Z-Score Threshold", step=0.1, group=grp_smc)
+smc_decay = input.float(0.85, "SMC Memory Decay (0.1-0.99)", step=0.05, group=grp_smc)
+
+grp_rvi = "=== Retail Validation Index (RVI) ==="
+length_rvi = input.int(20, "RVI Lookback Period", group=grp_rvi)
+
+grp_sao = "=== Symbiotic Alignment (SAO) ==="
+sao_length = input.int(20, "Correlation Length", group=grp_sao)
+lag_n = input.int(3, "Cross-Correlation Lag (n)", group=grp_sao)
+weight_1 = input.float(0.5, "Lag Weight (W1)", step=0.1, group=grp_sao)
+
+grp_hurst = "=== Trend Proxy / Phases ==="
+length_chop = input.int(100, "CHOP Lookback (Trend Proxy)", group=grp_hurst)
+show_bg = input.bool(false, "Hiển thị màu nền Pha (Background)", group=grp_hurst)
+
+// =========================================================================
+// UTILITY FUNCTIONS
+// =========================================================================
+f_normalize(src, len) =>
+    min_val = ta.lowest(src, len)
+    max_val = ta.highest(src, len)
+    max_val - min_val == 0 ? 0 : 100.0 * (src - min_val) / (max_val - min_val)
+
+// =========================================================================
+// A. SMART MONEY CATALYST (SMC)
+// =========================================================================
+candle_body = math.abs(close - open)
+candle_range = high - low
+body_ratio = candle_range == 0 ? 0 : math.pow(candle_body / candle_range, 2)
+
+dp_v = math.abs(close - open) * volume
+dp_v_adjusted = dp_v * body_ratio 
+
+dp_v_mean = ta.sma(dp_v_adjusted, length_smc)
+dp_v_std = ta.stdev(dp_v_adjusted, length_smc)
+z_score = dp_v_std == 0 ? 0 : (dp_v_adjusted - dp_v_mean) / dp_v_std
+
+var float smc_memory = 0.0
+is_shock = z_score > z_threshold
+
+if is_shock
+    smc_memory := smc_memory * smc_decay + dp_v_adjusted
+else
+    smc_memory := smc_memory * smc_decay
+
+sum_smc = math.sum(smc_memory, length_smc)
+smc = f_normalize(sum_smc, length_smc * 3)
+
+// =========================================================================
+// B. RETAIL VALIDATION INDEX (RVI)
+// =========================================================================
+ret = close - close[1]
+is_up = ret > 0 ? 1 : 0
+is_down = ret < 0 ? 1 : 0
+
+prob_up = math.sum(is_up, length_rvi) / length_rvi
+prob_down = math.sum(is_down, length_rvi) / length_rvi
+
+prob_flat = 1.0 - prob_up - prob_down
+entropy = 0.0
+if prob_up > 0
+    entropy -= prob_up * (math.log(prob_up) / math.log(2))
+if prob_down > 0
+    entropy -= prob_down * (math.log(prob_down) / math.log(2))
+if prob_flat > 0
+    entropy -= prob_flat * (math.log(prob_flat) / math.log(2))
+
+entropy := math.max(entropy, 0.01) 
+
+mean_vol = ta.sma(volume, length_rvi)
+raw_rvi = mean_vol / entropy
+rvi = f_normalize(raw_rvi, length_rvi * 3)
+
+// =========================================================================
+// C. SYMBIOTIC ALIGNMENT OSCILLATOR (SAO)
+// =========================================================================
+corr_0 = ta.correlation(smc, rvi, sao_length)
+corr_n = ta.correlation(smc[lag_n], rvi, sao_length)
+
+corr_0_safe = nz(corr_0, 0)
+corr_n_safe = nz(corr_n, 0)
+
+sao_raw = corr_0_safe + (weight_1 * corr_n_safe)
+sao_normalized = sao_raw / (1.0 + weight_1)
+sao = math.max(-1.0, math.min(1.0, sao_normalized))
+
+// =========================================================================
+// D. SFC CYCLE PHASES (Softmax Neural Engine)
+// =========================================================================
+atr_sum = math.sum(ta.atr(1), length_chop)
+hl_range_chop = ta.highest(high, length_chop) - ta.lowest(low, length_chop)
+chop = hl_range_chop == 0 ? 0 : 100.0 * math.log10(atr_sum / hl_range_chop) / math.log10(length_chop)
+trend_proxy = 1.0 - (chop / 100.0)
+
+// Scores for Softmax
+s1_trend = (trend_proxy - 0.5) * 2.0
+s1_sao   = sao
+s1_smc   = (smc / 100.0) * 2.0 - 1.0
+s1_rvi   = (rvi - nz(rvi[1])) / 100.0
+score_1  = s1_trend + s1_sao + s1_smc + s1_rvi
+
+s2_trend = (trend_proxy - 0.5) * 2.0
+s2_sao   = -sao
+s2_smc   = -(smc - nz(smc[1])) / 100.0
+s2_rvi   = (rvi / 100.0) * 2.0 - 1.0
+score_2  = s2_trend + s2_sao + s2_smc + s2_rvi
+
+s3_trend = (0.5 - trend_proxy) * 2.0
+s3_sao   = (1.0 - math.abs(sao)) * 1.5
+s3_smc   = -(smc / 100.0) * 2.0
+s3_rvi   = -(rvi / 100.0) * 2.0 + 1.0
+score_3  = s3_trend + s3_sao + s3_smc + s3_rvi
+
+exp_1 = math.exp(score_1)
+exp_2 = math.exp(score_2)
+exp_3 = math.exp(score_3)
+sum_exp = exp_1 + exp_2 + exp_3
+
+prob_1 = exp_1 / sum_exp
+prob_2 = exp_2 / sum_exp
+prob_3 = exp_3 / sum_exp
+
+var int active_phase = 0
+float current_max_prob = math.max(prob_1, math.max(prob_2, prob_3))
+int current_max_phase = 0
+
+if prob_1 > prob_2 and prob_1 > prob_3
+    current_max_phase := 1
+else if prob_2 > prob_1 and prob_2 > prob_3
+    current_max_phase := 2
+else
+    current_max_phase := 3
+
+if current_max_prob > 0.5 or active_phase == 0
+    active_phase := current_max_phase
+
+float max_prob = current_max_prob
+
+// Background coloring
+color phase_color = color.new(color.gray, 100)
+if show_bg
+    if active_phase == 1
+        phase_color := color.new(color.lime, 95 - int(max_prob * 30))
+    else if active_phase == 2
+        phase_color := color.new(color.red, 95 - int(max_prob * 30))
+
+bgcolor(phase_color, title="Market Phase Background")
+
+// =========================================================================
+// TEXT INTERPRETATION LOGIC 
+// =========================================================================
+bool smc_up = smc >= ta.sma(smc, sao_length)
+string txt_smc = smc > 70 ? (smc_up ? "🔥 Bạo Lực Đi Lên" : "⚠️ Giảm Bơm (Phân phối)") : (smc > 30 ? (smc_up ? "⚡ Đang Mồi Lửa (Gom)" : "📉 Bắt Đầu Rút Vốn") : (smc_up ? "💤 Ngừng Rút / Chờ Thời" : "🥶 Nằm Im / Cạn Kiệt"))
+color clr_smc = smc > 70 ? color.new(#00BFFF, 0) : (smc > 30 ? color.new(color.aqua, 0) : color.new(color.gray, 0))
+
+bool rvi_up = rvi >= ta.sma(rvi, sao_length)
+string txt_rvi = rvi > 70 ? (rvi_up ? "😈 Cực Hưng Phấn / Đu Bám" : "😰 Bị Kẹt Hàng / Suy Yếu") : (rvi > 30 ? (rvi_up ? "🚶 FOMO Nhập Cuộc" : "🏃 Cắt Lỗ / Rút Lui") : (rvi_up ? "👀 Bắt Đầu Chú Ý Dần" : "🙈 Mất Phương Hướng / Đứng Ngoài"))
+color clr_rvi = rvi > 70 ? color.new(#FF8C00, 0) : (rvi > 30 ? color.new(color.orange, 0) : color.new(color.gray, 0))
+
+string txt_sao = sao > 0.3 ? "🤝 ĐỒNG PHA (Nhỏ lẻ đi theo Cá mập)" : (sao < -0.3 ? "⚔️ PHÂN KỲ (Cá mập úp bô Nhỏ lẻ)" : "🤷 Mất Kết Nối")
+color clr_sao = sao > 0.3 ? color.new(#00FA9A, 0) : (sao < -0.3 ? color.new(#FF4500, 0) : color.new(#A9A9A9, 0))
+
+// =========================================================================
+// SUPER DASHBOARD (Góc Dưới Bên Trái)
+// =========================================================================
+var table hud = table.new(position.bottom_left, 3, 7, border_width=1, border_color=color.new(color.gray, 80))
+
+if barstate.islast
+    // Header
+    table.cell(hud, 0, 0, "SYMBIOTIC FLOW CYCLE (SFC)", text_color=color.white, text_size=size.small, bgcolor=color.new(#1565C0, 30), text_halign=text.align_center)
+    table.merge_cells(hud, 0, 0, 2, 0)
+
+    // --- Row 1: Shark Behavior ---
+    table.cell(hud, 0, 1, "CÁ MẬP (SMC)", text_color=color.gray, text_size=size.tiny, bgcolor=color.new(color.black, 10))
+    table.cell(hud, 1, 1, str.tostring(math.round(smc, 1)), text_color=clr_smc, text_size=size.small, bgcolor=color.new(color.black, 10))
+    table.cell(hud, 2, 1, txt_smc, text_color=clr_smc, text_size=size.tiny, bgcolor=color.new(color.black, 10), text_halign=text.align_left)
+
+    // --- Row 2: Retail Behavior ---
+    table.cell(hud, 0, 2, "NHỎ LẺ (RVI)", text_color=color.gray, text_size=size.tiny, bgcolor=color.new(color.black, 10))
+    table.cell(hud, 1, 2, str.tostring(math.round(rvi, 1)), text_color=clr_rvi, text_size=size.small, bgcolor=color.new(color.black, 10))
+    table.cell(hud, 2, 2, txt_rvi, text_color=clr_rvi, text_size=size.tiny, bgcolor=color.new(color.black, 10), text_halign=text.align_left)
+
+    // --- Row 3: Alignment ---
+    table.cell(hud, 0, 3, "TƯƠNG QUAN (SAO)", text_color=color.gray, text_size=size.tiny, bgcolor=color.new(color.black, 10))
+    table.cell(hud, 1, 3, str.tostring(math.round(sao, 2)), text_color=clr_sao, text_size=size.small, bgcolor=color.new(color.black, 10))
+    table.cell(hud, 2, 3, txt_sao, text_color=clr_sao, text_size=size.tiny, bgcolor=color.new(color.black, 10), text_halign=text.align_left)
+
+    // --- Row 4: Separator ---
+    table.cell(hud, 0, 4, "── CHU KỲ (Softmax Neural Engine) ──", text_color=color.new(color.gray, 30), text_size=size.tiny, bgcolor=color.new(color.black, 10))
+    table.merge_cells(hud, 0, 4, 2, 4)
+
+    // --- Row 5: Action Matrix ---
+    color pha_bg = active_phase == 1 ? color.new(color.lime, 80) : (active_phase == 2 ? color.new(color.red, 80) : color.new(color.gray, 80))
+    color pha_tx = active_phase == 1 ? color.lime : (active_phase == 2 ? color.red : color.white)
+    string pha_str = active_phase == 1 ? "PHA 1: SYMBIOTIC GROWTH" : (active_phase == 2 ? "PHA 2: RETAIL EXHAUSTION" : "PHA 3: CONTRACTION")
+    
+    table.cell(hud, 0, 5, pha_str, text_color=pha_tx, text_size=size.small, bgcolor=pha_bg, text_halign=text.align_center)
+    table.merge_cells(hud, 0, 5, 2, 5)
+
+    string rx_str = active_phase == 1 ? "MUA 👉 Đợi Pullback / Breakout" : (active_phase == 2 ? "BÁN 👉 Tìm Nến Exhaustion / Phân kỳ" : "ĐỨNG NGOÀI 👉 Không có tín hiệu")
+    table.cell(hud, 0, 6, rx_str, text_color=pha_tx, text_size=size.tiny, bgcolor=color.new(color.black, 10), text_halign=text.align_center)
+    table.merge_cells(hud, 0, 6, 2, 6)

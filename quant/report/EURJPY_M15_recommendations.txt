@@ -1,0 +1,74 @@
+══════════════════════════════════════════════════════════════════════
+  TRADING RECOMMENDATIONS REPORT
+  Generated: 2026-02-10 20:24:58
+══════════════════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────────────────────
+1. MARKET EFFICIENCY INDEX (MEI)
+──────────────────────────────────────────────────────────────────────
+   Score: 82.7/100 (HIGHLY EFFICIENT)
+   Recommendation: AVOID OR MINIMIZE
+   ⚠️  WARNING: Thị trường RẤT HIỆU QUẢ. Strategies đơn giản sẽ thua.
+   → Chỉ trade khi Rolling MEI chart cho thấy window inefficient.
+
+──────────────────────────────────────────────────────────────────────
+2. MARKET REGIME ANALYSIS
+──────────────────────────────────────────────────────────────────────
+   Current:  RANGING
+   Dominant: RANGING
+
+   📊 Phân bổ thời gian:
+      RANGING          84.8%  ██████████████████████████████████████████
+      VOLATILE         13.0%  ██████
+      TRENDING_UP       1.4%  
+      TRENDING_DOWN     0.8%  
+
+   ⏱️  Thời gian trung bình mỗi đợt regime:
+      RANGING         TB: 14.8 giờ     (dài nhất: 1211 nến)
+      TRENDING_UP     TB: 1.0 giờ      (dài nhất: 31 nến)
+      TRENDING_DOWN   TB: 0.8 giờ      (dài nhất: 14 nến)
+      VOLATILE        TB: 3.5 giờ      (dài nhất: 245 nến)
+
+   🎯 Khuyến nghị cho regime RANGING hiện tại:
+      ✅ NÊN dùng:
+         • Mean Reversion (RSI + BB)
+         • Support/Resistance bounce
+         • Fade breakouts
+      ❌ NÊN TRÁNH:
+         • Trend following
+         • Breakout trading
+      ⚙️  Tham số gợi ý:
+         Hold time: Short (3-8 candles)
+         TP/SL:     1.5:1 to 2:1
+         Indicator: RSI, BB, Support/Resistance
+
+   → Focus: MEAN REVERSION (mua đáy bán đỉnh, trade trong range)
+
+──────────────────────────────────────────────────────────────────────
+3. TOP PERFORMING STRATEGIES (by Profit Factor)
+──────────────────────────────────────────────────────────────────────
+   1. far_below_sma                  | WR: 57.1% | PF: 1.59 | Net: +1289.4 pips | Trades: 91
+   2. buy_swing_low                  | WR: 55.9% | PF: 1.37 | Net: +12907.7 pips | Trades: 3879
+   3. sell_swing_high                | WR: 50.4% | PF: 1.12 | Net: +4756.2 pips | Trades: 3882
+   4. golden_cross                   | WR: 53.0% | PF: 1.04 | Net: +607.7 pips | Trades: 545
+   5. macd_histogram_reversal_bull   | WR: 50.7% | PF: 1.02 | Net: +225.4 pips | Trades: 991
+
+──────────────────────────────────────────────────────────────────────
+4. RECOMMENDED PORTFOLIO
+──────────────────────────────────────────────────────────────────────
+   • mean_reversion_far_below_sma            50.0%  (WR: 57.1%, PF: 1.59)
+   • support_resistance_buy_swing_low        50.0%  (WR: 55.9%, PF: 1.37)
+
+   💰 Ước tính với $500, lot 0.01:
+      Lãi/tháng:     $+15.16
+      Drawdown max:  $39.59
+      Calmar Ratio:  4.594
+      Sharpe Ratio:  0.194
+
+══════════════════════════════════════════════════════════════════════
+ACTION PLAN:
+══════════════════════════════════════════════════════════════════════
+🛑 DỪNG: Thị trường hiệu quả (MEI = 83).
+   → Không trade hoặc chỉ paper trade.
+   → Theo dõi Rolling MEI chart để chờ window tốt.
+   → Xem xét các instrument/timeframe khác.

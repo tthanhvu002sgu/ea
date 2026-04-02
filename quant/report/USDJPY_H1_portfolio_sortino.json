@@ -1,0 +1,118 @@
+{
+  "metadata": {
+    "analysis_file": "report\\USDJPY_H1_analysis.json",
+    "total_strategies_analyzed": 16,
+    "selected_strategies": 3,
+    "optimization_success": true
+  },
+  "portfolio_allocation": [
+    {
+      "strategy": "trend_following_golden_cross",
+      "category": "trend_following",
+      "allocation": 49.99999999999998,
+      "win_rate": 55.34591194968554,
+      "profit_factor": 1.3725586929394336,
+      "avg_profit": 16.14842767295592,
+      "total_trades": 159
+    },
+    {
+      "strategy": "support_resistance_buy_swing_low",
+      "category": "support_resistance",
+      "allocation": 29.77552835106229,
+      "win_rate": 56.45021645021645,
+      "profit_factor": 1.3806310711258902,
+      "avg_profit": 7.0769696969697184,
+      "total_trades": 1155
+    },
+    {
+      "strategy": "support_resistance_sell_swing_high",
+      "category": "support_resistance",
+      "allocation": 20.22447164893774,
+      "win_rate": 50.17301038062284,
+      "profit_factor": 1.145627531417769,
+      "avg_profit": 2.9050173010380864,
+      "total_trades": 1156
+    }
+  ],
+  "optimized_portfolio_metrics": {
+    "sharpe_ratio": 0.13637913761825768,
+    "sortino_ratio": 0.83337721494879,
+    "mean_return_per_trade": 9.985640234393674,
+    "std_return": 73.21970507208174,
+    "max_drawdown": 1173.3913443067195,
+    "expected_total_return": 9985.640234393675
+  },
+  "equal_weight_portfolio_metrics": {
+    "sharpe_ratio": 0.09018399686052737,
+    "sortino_ratio": 0.5210667035994634,
+    "mean_return_per_trade": 4.459153041526971,
+    "std_return": 49.44505895456378,
+    "max_drawdown": 920.8706721557428
+  },
+  "improvement": {
+    "sharpe_improvement": 51.22321294893668,
+    "return_improvement": 123.93580443191605
+  },
+  "individual_strategy_metrics": [
+    {
+      "strategy": "support_resistance_buy_swing_low",
+      "sharpe_ratio": 0.14263193853993333,
+      "mean_return": 6.375394757237978,
+      "std_return": 44.69822693640968
+    },
+    {
+      "strategy": "trend_following_golden_cross",
+      "sharpe_ratio": 0.14365049863174437,
+      "mean_return": 14.926885401024755,
+      "std_return": 103.91112835111429
+    },
+    {
+      "strategy": "trend_following_cross_above_sma20",
+      "sharpe_ratio": 0.11733049621170176,
+      "mean_return": 7.34371619403988,
+      "std_return": 62.590003717272836
+    },
+    {
+      "strategy": "mean_reversion_far_below_sma",
+      "sharpe_ratio": 0.06340108560502121,
+      "mean_return": 4.329411800714453,
+      "std_return": 68.28608310725163
+    },
+    {
+      "strategy": "breakout_breakout_high_volume",
+      "sharpe_ratio": 0.07439516134777491,
+      "mean_return": 3.140141461006409,
+      "std_return": 42.208947519143024
+    },
+    {
+      "strategy": "breakout_breakout_high",
+      "sharpe_ratio": 0.06869403687934313,
+      "mean_return": 2.8394736715520077,
+      "std_return": 41.33508235277204
+    },
+    {
+      "strategy": "support_resistance_sell_swing_high",
+      "sharpe_ratio": 0.07066830442866477,
+      "mean_return": 3.0848274866084604,
+      "std_return": 43.652207471914096
+    },
+    {
+      "strategy": "candlestick_patterns_bearish_pin",
+      "sharpe_ratio": 0.04527112814659131,
+      "mean_return": 1.376931958599525,
+      "std_return": 30.415234056922902
+    },
+    {
+      "strategy": "volume_analysis_high_volume_bullish",
+      "sharpe_ratio": 0.02762118004278419,
+      "mean_return": 0.8123379882922667,
+      "std_return": 29.409966809310284
+    },
+    {
+      "strategy": "candlestick_patterns_bullish_engulfing",
+      "sharpe_ratio": 0.009587334582800366,
+      "mean_return": 0.3624096961939663,
+      "std_return": 37.80088126309137
+    }
+  ]
+}

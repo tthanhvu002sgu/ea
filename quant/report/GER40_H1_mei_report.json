@@ -1,0 +1,78 @@
+{
+  "metadata": {
+    "file": "GER40_H1.csv",
+    "total_candles": 13215,
+    "analysis_date": "2026-02-10 17:36:45.571775"
+  },
+  "mei_score": 88.25893155255626,
+  "classification": {
+    "class": "HIGHLY EFFICIENT",
+    "color": "\ud83d\udd34",
+    "description": "Very hard to profit",
+    "recommendation": "AVOID OR MINIMIZE",
+    "strategies": [
+      "Market making only",
+      "Ultra HFT strategies",
+      "Find other markets",
+      "Focus on fundamentals"
+    ]
+  },
+  "components": {
+    "hurst": {
+      "value": 0.4794002003741955,
+      "score": 95.8800400748391,
+      "interpretation": "Random Walk (Highly efficient - Hard to profit)"
+    },
+    "autocorr": {
+      "value": 0.023576963523566474,
+      "lags": {
+        "lag_1": 0.03640845726866846,
+        "lag_2": 0.023420672422487188,
+        "lag_3": 0.01771250009421601,
+        "lag_4": 0.05680620595907551,
+        "lag_5": 0.014246698485022536,
+        "lag_6": 0.01796163844704204,
+        "lag_7": 0.00018138825156560108,
+        "lag_8": 0.027070558445923435,
+        "lag_9": 0.028464023514850164,
+        "lag_10": 0.013497492346813812
+      },
+      "score": 76.42303647643352,
+      "interpretation": "Low serial correlation - Efficient"
+    },
+    "variance_ratio": {
+      "value": 1.027694772736283,
+      "z_statistic": 0.46111773503826164,
+      "significant": false,
+      "score": 98.61526136318585,
+      "interpretation": "Random walk"
+    },
+    "runs_test": {
+      "actual_runs": 2510,
+      "expected_runs": 2483.108184194651,
+      "z_score": 0.7641040189743742,
+      "score": 77.07687943076877,
+      "interpretation": "Random sequence"
+    },
+    "entropy": {
+      "value": 4.311766087103181,
+      "normalized": 0.9404146896348652,
+      "patterns_found": 24,
+      "patterns_possible": 24,
+      "score": 94.04146896348652,
+      "interpretation": "Mostly random"
+    },
+    "predictability": {
+      "ma_sharpe": 1.5532513001682362,
+      "rsi_sharpe": -0.37036746696602346,
+      "momentum_sharpe": 1.55529514668118,
+      "avg_sharpe": 0.9127263266277975,
+      "score": 54.36368366861012,
+      "interpretation": "Simple strategies work (Inefficient)"
+    }
+  },
+  "summary": [
+    "Market behaves like random walk - very efficient",
+    "Low autocorrelation - market is efficient"
+  ]
+}

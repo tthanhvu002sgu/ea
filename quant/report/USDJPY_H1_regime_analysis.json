@@ -1,0 +1,109 @@
+{
+  "metadata": {
+    "file": "USDJPY_H1.csv",
+    "total_candles": 15308,
+    "model_accuracy": null
+  },
+  "current_regime": "RANGING",
+  "dominant_regime": "RANGING",
+  "regime_distribution": {
+    "RANGING": 12635,
+    "TRENDING_UP": 399,
+    "TRENDING_DOWN": 485,
+    "VOLATILE": 1789
+  },
+  "average_regime_durations": {
+    "RANGING": {
+      "avg_duration_candles": 43.0242214532872,
+      "avg_duration_hours": 10.7560553633218,
+      "max_duration_candles": 508,
+      "min_duration_candles": 1
+    },
+    "TRENDING_UP": {
+      "avg_duration_candles": 4.75,
+      "avg_duration_hours": 1.1875,
+      "max_duration_candles": 17,
+      "min_duration_candles": 1
+    },
+    "TRENDING_DOWN": {
+      "avg_duration_candles": 5.773809523809524,
+      "avg_duration_hours": 1.443452380952381,
+      "max_duration_candles": 25,
+      "min_duration_candles": 1
+    },
+    "VOLATILE": {
+      "avg_duration_candles": 12.337931034482759,
+      "avg_duration_hours": 3.0844827586206898,
+      "max_duration_candles": 134,
+      "min_duration_candles": 1
+    }
+  },
+  "total_transitions": 603,
+  "recommendations": {
+    "RANGING": {
+      "best_strategies": [
+        "Mean Reversion (RSI + BB)",
+        "Support/Resistance bounce",
+        "Fade breakouts"
+      ],
+      "avoid": [
+        "Trend following",
+        "Breakout trading"
+      ],
+      "parameters": {
+        "hold_time": "Short (3-8 candles)",
+        "TP_SL_ratio": "1.5:1 to 2:1",
+        "indicators": "RSI, BB, Support/Resistance"
+      }
+    },
+    "TRENDING_UP": {
+      "best_strategies": [
+        "Pullback to MA",
+        "Breakout continuation",
+        "Higher lows entry"
+      ],
+      "avoid": [
+        "Counter-trend trades",
+        "Selling at resistance"
+      ],
+      "parameters": {
+        "hold_time": "Long (15-30 candles)",
+        "TP_SL_ratio": "2:1 to 3:1",
+        "indicators": "MA, ADX, MACD"
+      }
+    },
+    "TRENDING_DOWN": {
+      "best_strategies": [
+        "Pullback to MA (short)",
+        "Lower highs entry",
+        "Breakdown continuation"
+      ],
+      "avoid": [
+        "Buying dips",
+        "Counter-trend longs"
+      ],
+      "parameters": {
+        "hold_time": "Long (15-30 candles)",
+        "TP_SL_ratio": "2:1 to 3:1",
+        "indicators": "MA, ADX, MACD"
+      }
+    },
+    "VOLATILE": {
+      "best_strategies": [
+        "Reduce position size",
+        "Widen stops",
+        "Wait for consolidation"
+      ],
+      "avoid": [
+        "Scalping",
+        "Tight stops",
+        "High frequency trading"
+      ],
+      "parameters": {
+        "hold_time": "Variable",
+        "TP_SL_ratio": "Wider stops (1:1)",
+        "indicators": "ATR, Volatility bands"
+      }
+    }
+  }
+}

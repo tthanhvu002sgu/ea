@@ -1,0 +1,109 @@
+{
+  "metadata": {
+    "analysis_file": "report\\EURUSD_H1_analysis.json",
+    "total_strategies_analyzed": 21,
+    "selected_strategies": 2,
+    "optimization_success": true
+  },
+  "portfolio_allocation": [
+    {
+      "strategy": "support_resistance_buy_swing_low",
+      "category": "support_resistance",
+      "allocation": 50.0,
+      "win_rate": 55.32467532467532,
+      "profit_factor": 1.4093614283416418,
+      "avg_profit": 3.9662337662337417,
+      "total_trades": 1155
+    },
+    {
+      "strategy": "support_resistance_sell_swing_high",
+      "category": "support_resistance",
+      "allocation": 50.0,
+      "win_rate": 53.163444639718804,
+      "profit_factor": 1.2566046021429733,
+      "avg_profit": 2.56739894551837,
+      "total_trades": 1138
+    }
+  ],
+  "optimized_portfolio_metrics": {
+    "sharpe_ratio": 0.13674815729075282,
+    "sortino_ratio": 0.882289954608036,
+    "mean_return_per_trade": 3.154147228404288,
+    "std_return": 23.06537280570418,
+    "max_drawdown": 370.2751205262043,
+    "expected_total_return": 3154.147228404288
+  },
+  "equal_weight_portfolio_metrics": {
+    "sharpe_ratio": 0.050239409365780155,
+    "sortino_ratio": 0.2554569023142277,
+    "mean_return_per_trade": 1.0123946006518099,
+    "std_return": 20.15140331927126,
+    "max_drawdown": 416.86539167188926
+  },
+  "improvement": {
+    "sharpe_improvement": 172.19300349477604,
+    "return_improvement": 211.55314601377304
+  },
+  "individual_strategy_metrics": [
+    {
+      "strategy": "support_resistance_buy_swing_low",
+      "sharpe_ratio": 0.15710056460219757,
+      "mean_return": 3.7007661214700156,
+      "std_return": 23.55666977289939
+    },
+    {
+      "strategy": "support_resistance_sell_swing_high",
+      "sharpe_ratio": 0.11378414480660538,
+      "mean_return": 2.6075283353385608,
+      "std_return": 22.916447100520713
+    },
+    {
+      "strategy": "rsi_extremes_rsi_oversold_20",
+      "sharpe_ratio": 0.05426746441249894,
+      "mean_return": 0.7963936544668516,
+      "std_return": 14.675343008718597
+    },
+    {
+      "strategy": "trend_following_golden_cross",
+      "sharpe_ratio": 0.04513962137671779,
+      "mean_return": 2.4367213875991673,
+      "std_return": 53.98187475396028
+    },
+    {
+      "strategy": "consecutive_candles_bear_streak_4",
+      "sharpe_ratio": 0.023226528971862493,
+      "mean_return": 0.35811824196554454,
+      "std_return": 15.418500215825734
+    },
+    {
+      "strategy": "consecutive_candles_bear_streak_3",
+      "sharpe_ratio": 0.015108889122117814,
+      "mean_return": 0.24182057767868315,
+      "std_return": 16.00518580314971
+    },
+    {
+      "strategy": "consecutive_candles_bear_streak_5",
+      "sharpe_ratio": 0.02053202042640957,
+      "mean_return": 0.30798741461595314,
+      "std_return": 15.00034620167241
+    },
+    {
+      "strategy": "rsi_extremes_rsi_oversold_30",
+      "sharpe_ratio": -0.000771023206812062,
+      "mean_return": -0.011403985063277673,
+      "std_return": 14.790715717143662
+    },
+    {
+      "strategy": "candlestick_patterns_bullish_pin",
+      "sharpe_ratio": -0.002091649271114467,
+      "mean_return": -0.03164984827981624,
+      "std_return": 15.131527410880244
+    },
+    {
+      "strategy": "rsi_extremes_rsi_oversold_25",
+      "sharpe_ratio": -0.01989615070122091,
+      "mean_return": -0.2823358932735818,
+      "std_return": 14.190478224325899
+    }
+  ]
+}
