@@ -1,0 +1,305 @@
+//@version=6
+indicator("PRO Scalper",
+     overlay=true, max_bars_back=1000, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ═════════ Core
+groupCore = "Core"
+atrLen    = input.int(14, "ATR Len", minval=1, group=groupCore)
+atr       = ta.atr(atrLen)
+
+
+longOK  = true
+shortOK = true
+
+// ═════════ Delta proxy (для пузырьков/плотностей)
+groupDelta = "Delta / Volume"
+deltaMode  = input.string("RangeWeighted", "Delta proxy", options=["RangeWeighted","CloseVsPrev","CloseVsOpen"], group=groupDelta)
+
+rng = math.max(high - low, syminfo.mintick)
+dRW = rng > 0 ? volume * (close - open) / rng : 0
+dCP = close >= close[1] ? volume : -volume
+dCO = close >= open     ? volume : -volume
+delta = deltaMode=="RangeWeighted" ? dRW : deltaMode=="CloseVsOpen" ? dCO : dCP
+
+// ═════════ Bubbles
+groupBub = "Bubbles"
+showBub  = input.bool(true, "Show Bubbles (abs delta)", group=groupBub)
+qbLen    = input.int(200, "Quantile lookback", minval=50, group=groupBub)
+qbPct    = input.float(85,  "Quantile %", step=0.5, minval=50, maxval=99.9, group=groupBub)
+
+absDel = math.abs(delta)
+thrBub = ta.percentile_linear_interpolation(absDel, qbLen, qbPct)
+
+bubbleSize(r)=>
+    s = size.tiny
+    if r >= 3
+        s := size.huge
+    else if r >= 2.25
+        s := size.large
+    else if r >= 1.6
+        s := size.normal
+    else if r >= 1.1
+        s := size.small
+    s
+
+if showBub and absDel >= math.max(thrBub, 1)
+    ratio = absDel / math.max(thrBub, 1)
+    y  = delta>=0 ? low : high
+    c0 = delta>=0 ? color.lime : color.red
+    c  = color.new(c0, 85 - int(math.min(60.0, (ratio-1.0)*30.0)))
+    label.new(bar_index, y, "", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_circle, color=c, textcolor=c, size=bubbleSize(ratio))
+
+// ═════════ Zones x2 (midline + only-in-trend)
+groupZ = "Zones (AI-style, 2 pairs)"
+showZones = input.bool(true, "Show Zones", group=groupZ)
+zDepth    = input.float(0.6, "Zone depth × ATR", step=0.05, group=groupZ)
+zExtend   = input.int(120, "Extend (bars)", minval=10, group=groupZ)
+L1 = input.int(10, "Pivot A Left",  minval=2, group=groupZ)
+R1 = input.int(10, "Pivot A Right", minval=2, group=groupZ)
+L2 = input.int(5,  "Pivot B Left",  minval=2, group=groupZ)
+R2 = input.int(5,  "Pivot B Right", minval=2, group=groupZ)
+showZoneMid   = input.bool(true,  "Show zone midline", group=groupZ)
+onlyTrendZone = input.bool(false, "Show only in-trend zones", group=groupZ)
+labSize = input.string("Small", "Label size", options=["Tiny","Small","Normal"], group=groupZ)
+_lsize  = labSize=="Tiny" ? size.tiny : labSize=="Small" ? size.small : size.normal
+
+colSupIn  = color.new(#E57373, 76)
+colSupOut = color.new(#E57373, 96)
+colSupBrI = color.new(#E57373, 25)
+colSupBrO = color.new(#E57373, 90)
+colDemIn  = color.new(#81C784, 76)
+colDemOut = color.new(#81C784, 96)
+colDemBrI = color.new(#81C784, 25)
+colDemBrO = color.new(#81C784, 90)
+colHide   = color.new(color.white, 100)
+midCol    = color.new(color.gray, 50)
+
+mkZone(_left, _top, _bot, isSupply, _right, inTrend) =>
+    color fill = isSupply ? (inTrend ? colSupIn : colSupOut) : (inTrend ? colDemIn : colDemOut)
+    color brd  = isSupply ? (inTrend ? colSupBrI : colSupBrO) : (inTrend ? colDemBrI : colDemBrO)
+    box.new(_left, _top, _right, _bot, xloc=xloc.bar_index, bgcolor=fill, border_color=brd)
+
+type PairState
+    box   sup
+    float supTop
+    float supBot
+    line  supMid
+    box   dem
+    float demTop
+    float demBot
+    line  demMid
+    int   supTouches
+    int   demTouches
+    bool  inSupPrev
+    bool  inDemPrev
+    label labSup
+    label labDem
+
+makeMidline(x0, mid) =>
+    line.new(x0, mid, x0 + zExtend, mid, xloc=xloc.bar_index, extend=extend.none, style=line.style_dashed, color=midCol, width=1)
+
+updatePair(ph, pl, R, PairState s, string tag) =>
+    box supRet = s.sup
+    float sTop = s.supTop
+    float sBot = s.supBot
+    line sMidL = s.supMid
+    box demRet = s.dem
+    float dTop = s.demTop
+    float dBot = s.demBot
+    line dMidL = s.demMid
+    int  supT  = s.supTouches
+    int  demT  = s.demTouches
+    bool wasS  = s.inSupPrev
+    bool wasD  = s.inDemPrev
+    label lSup = s.labSup
+    label lDem = s.labDem
+
+    if showZones and not na(ph)
+        sTop := ph
+        sBot := ph - zDepth * atr
+        int x0 = bar_index - R
+        if not na(supRet)
+            box.delete(supRet)
+        if not na(sMidL)
+            line.delete(sMidL)
+        supRet := mkZone(x0, sTop, sBot, true, bar_index + zExtend, shortOK)
+        if showZoneMid
+            sMidL := makeMidline(x0, (sTop + sBot) * 0.5)
+        supT := 0
+        wasS := false
+        if not na(lSup)
+            label.delete(lSup)
+        lSup := label.new(x0, sTop, "Supply " + tag + " (0)", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, size=_lsize, color=color.new(color.black, 100), textcolor=color.white)
+
+    if showZones and not na(pl)
+        dBot := pl
+        dTop := pl + zDepth * atr
+        int x1 = bar_index - R
+        if not na(demRet)
+            box.delete(demRet)
+        if not na(dMidL)
+            line.delete(dMidL)
+        demRet := mkZone(x1, dTop, dBot, false, bar_index + zExtend, longOK)
+        if showZoneMid
+            dMidL := makeMidline(x1, (dTop + dBot) * 0.5)
+        demT := 0
+        wasD := false
+        if not na(lDem)
+            label.delete(lDem)
+        lDem := label.new(x1, dBot, "Demand " + tag + " (0)", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, size=_lsize, color=color.new(color.black, 100), textcolor=color.white)
+
+    bool supInTrend = shortOK
+    bool demInTrend = longOK
+
+    if not na(supRet)
+        if onlyTrendZone and not supInTrend
+            box.set_bgcolor(supRet, colHide), box.set_border_color(supRet, colHide)
+            if not na(lSup)
+                label.delete(lSup), lSup := na
+            if not na(sMidL)
+                line.delete(sMidL), sMidL := na
+        else
+            box.set_bgcolor(supRet, supInTrend ? colSupIn : colSupOut)
+            box.set_border_color(supRet, supInTrend ? colSupBrI : colSupBrO)
+            if showZoneMid and na(sMidL)
+                sMidL := makeMidline(box.get_left(supRet), (sTop + sBot) * 0.5)
+            if na(lSup)
+                lSup := label.new(box.get_left(supRet), sTop, "Supply " + tag + " (" + str.tostring(supT) + ")", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, size=_lsize, color=color.new(color.black, 100), textcolor=color.white)
+
+    if not na(demRet)
+        if onlyTrendZone and not demInTrend
+            box.set_bgcolor(demRet, colHide), box.set_border_color(demRet, colHide)
+            if not na(lDem)
+                label.delete(lDem), lDem := na
+            if not na(dMidL)
+                line.delete(dMidL), dMidL := na
+        else
+            box.set_bgcolor(demRet, demInTrend ? colDemIn : colDemOut)
+            box.set_border_color(demRet, demInTrend ? colDemBrI : colDemBrO)
+            if showZoneMid and na(dMidL)
+                dMidL := makeMidline(box.get_left(demRet), (dTop + dBot) * 0.5)
+            if na(lDem)
+                lDem := label.new(box.get_left(demRet), dBot, "Demand " + tag + " (" + str.tostring(demT) + ")", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, size=_lsize, color=color.new(color.black, 100), textcolor=color.white)
+
+    bool inS = not na(sTop) and not na(sBot) and high >= sBot and low <= sTop
+    bool inD = not na(dTop) and not na(dBot) and high >= dBot and low <= dTop
+    if inS and not wasS
+        supT += 1
+    wasS := inS
+    if inD and not wasD
+        demT += 1
+    wasD := inD
+
+    if not na(lSup)
+        label.set_x(lSup, not na(supRet) ? box.get_left(supRet) : bar_index)
+        label.set_y(lSup, sTop)
+        label.set_text(lSup, "Supply " + tag + " (" + str.tostring(supT) + ")")
+    if not na(lDem)
+        label.set_x(lDem, not na(demRet) ? box.get_left(demRet) : bar_index)
+        label.set_y(lDem, dBot)
+        label.set_text(lDem, "Demand " + tag + " (" + str.tostring(demT) + ")")
+
+    PairState.new(supRet, sTop, sBot, sMidL, demRet, dTop, dBot, dMidL, supT, demT, wasS, wasD, lSup, lDem)
+
+// Глобальные состояния пар
+var PairState pairA = PairState.new(na, na, na, na, na, na, na, na, 0, 0, false, false, na, na)
+var PairState pairB = PairState.new(na, na, na, na, na, na, na, na, 0, 0, false, false, na, na)
+
+// Обновление пар
+phA = ta.pivothigh(high, L1, R1)
+plA = ta.pivotlow(low,  L1, R1)
+pairA := updatePair(phA, plA, R1, pairA, "A")
+
+phB = ta.pivothigh(high, L2, R2)
+plB = ta.pivotlow(low,  L2, R2)
+pairB := updatePair(phB, plB, R2, pairB, "B")
+
+// Продление вправо (боксы + midlines)
+extendBox(_b) =>
+    if not na(_b)
+        box.set_right(_b, bar_index + zExtend)
+extendLine(_l, y) =>
+    if not na(_l)
+        line.set_x2(_l, bar_index + zExtend)
+        if not na(y)
+            line.set_y1(_l, y), line.set_y2(_l, y)
+
+extendBox(pairA.sup), extendBox(pairA.dem), extendBox(pairB.sup), extendBox(pairB.dem)
+extendLine(pairA.supMid, na(pairA.supTop) or na(pairA.supBot) ? na : (pairA.supTop + pairA.supBot)*0.5)
+extendLine(pairA.demMid, na(pairA.demTop) or na(pairA.demBot) ? na : (pairA.demTop + pairA.demBot)*0.5)
+extendLine(pairB.supMid, na(pairB.supTop) or na(pairB.supBot) ? na : (pairB.supTop + pairB.supBot)*0.5)
+extendLine(pairB.demMid, na(pairB.demTop) or na(pairB.demBot) ? na : (pairB.demTop + pairB.demBot)*0.5)
+
+// ═════════ Subtle Densities
+groupDen     = "Densities (Subtle)"
+showDen      = input.bool(true, "Show Densities", group=groupDen)
+denMetricSrc = input.string("AbsDelta", "Metric", options=["AbsDelta","Volume"], group=groupDen)
+qLen         = input.int(200, "Quantile lookback", minval=50, group=groupDen)
+qPct         = input.float(92, "Quantile %", step=0.5, minval=60, maxval=99.9, group=groupDen)
+denDepth     = input.float(0.45, "Depth × ATR", step=0.05, group=groupDen)
+denExtend    = input.int(150, "Extend (bars)", minval=10, group=groupDen)
+mergeX       = input.float(0.30, "Merge if |Δprice| < ×ATR", step=0.05, group=groupDen)
+volLen       = input.int(20, "Volume MA", group=groupDen)
+breakMult    = input.float(1.2, "Delete if break vol > MA×", step=0.1, group=groupDen)
+showMidLineD = input.bool(true, "Midline (dashed)", group=groupDen)
+
+denMetric = denMetricSrc=="AbsDelta" ? math.abs(delta) : volume
+denThr    = ta.percentile_linear_interpolation(denMetric, qLen, qPct)
+volMA     = ta.sma(volume, volLen)
+
+var box[]  dBoxes = array.new_box()
+var line[] dLines = array.new_line()
+var float[] dTop  = array.new_float()
+var float[] dBot  = array.new_float()
+var float[] dMid  = array.new_float()
+var int[]   dEnd  = array.new_int()
+var int[]   dDir  = array.new_int()
+
+newDensity(mid, isDemand) =>
+    float half = atr * denDepth
+    float top  = mid + half
+    float bot  = mid - half
+    color fillCol = isDemand ? color.new(#4CAF50, 90) : color.new(#F44336, 90)
+    color brdCol  = isDemand ? color.new(#4CAF50, 60) : color.new(#F44336, 60)
+    box b = box.new(bar_index, top, bar_index, bot, xloc=xloc.bar_index, bgcolor=fillCol, border_color=brdCol)
+    line ln = na
+    if showMidLineD
+        ln := line.new(bar_index, mid, bar_index, mid, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.gray, 50), style=line.style_dashed, width=1)
+    array.push(dBoxes, b), array.push(dLines, ln), array.push(dTop, top), array.push(dBot, bot), array.push(dMid, mid)
+    array.push(dEnd, bar_index + denExtend), array.push(dDir, isDemand ? 1 : -1)
+
+if showDen and denMetric >= denThr
+    mid = close
+    bool merged = false
+    sz = array.size(dBoxes)
+    if sz > 0
+        for i=0 to sz-1
+            if not merged and math.abs(mid - array.get(dMid, i)) <= atr*mergeX
+                array.set(dEnd, i, bar_index + denExtend)
+                merged := true
+    if not merged
+        newDensity(mid, delta>=0)
+
+sz2 = array.size(dBoxes)
+if sz2 > 0
+    for i = sz2-1 to 0
+        b   = array.get(dBoxes, i)
+        ln  = array.get(dLines, i)
+        top = array.get(dTop, i)
+        bot = array.get(dBot, i)
+        mid = array.get(dMid, i)
+        right = math.min(bar_index + 1, array.get(dEnd, i))
+        box.set_right(b, right)
+        if not na(ln)
+            line.set_x2(ln, right)
+            line.set_y1(ln, mid)
+            line.set_y2(ln, mid)
+        dir = array.get(dDir, i)
+        bool breakUp   = close > top and volume > volMA*breakMult
+        bool breakDown = close < bot and volume > volMA*breakMult
+        bool eaten = (dir==1 and breakDown) or (dir==-1 and breakUp)
+        if eaten or bar_index >= array.get(dEnd, i)
+            box.delete(b)
+            if not na(ln)
+                line.delete(ln)
+            array.remove(dBoxes, i), array.remove(dLines, i), array.remove(dTop, i), array.remove(dBot, i), array.remove(dMid, i), array.remove(dEnd, i), array.remove(dDir, i)

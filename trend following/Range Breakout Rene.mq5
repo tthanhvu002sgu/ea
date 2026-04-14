@@ -26,7 +26,8 @@ enum ENUM_TARGET_CALC_MODE {
 enum ENUM_STOP_CALC_MODE {
    STOP_OFF,               // OFF (SL at opposite border)
    STOP_POINTS,            // Points
-   STOP_FACTOR             // Factor (1.0 = opposite border)
+   STOP_FACTOR,            // Factor (1.0 = opposite border)
+   STOP_ACCOUNT_PERCENT    // % of Account Balance
 };
 
 //--- INPUT PARAMETERS ---
@@ -53,8 +54,10 @@ input int                 InpRangeEndMinute      = 30;           // Range End Mi
 input int                 InpDeleteOrderHour     = 18;           // Delete Orders Hour
 input int                 InpDeleteOrderMinute   = 0;            // Delete Orders Minute
 input bool                InpClosePositions      = true;         // Close Positions at End of Day
-input int                 InpClosePositionHour   = 18;           // Close Positions Hour
-input int                 InpClosePositionMinute = 0;            // Close Positions Minute
+input int                 InpCloseLongHour       = 18;           // Close Long Positions Hour
+input int                 InpCloseLongMinute     = 0;            // Close Long Positions Minute
+input int                 InpCloseShortHour      = 18;           // Close Short Positions Hour
+input int                 InpCloseShortMinute    = 0;            // Close Short Positions Minute
 
 input group "=== C. Trading Frequency & Filters ==="
 input int                 InpMaxLongTrades       = 1;            // Max Long Trades per Day
@@ -82,7 +85,8 @@ bool           isTesting            = false;
 bool           isOptimization       = false;
 bool           isVisualMode         = false;
 bool           dayFullyTraded       = false;
-bool           closedForDay         = false;
+bool           closedLongForDay     = false;
+bool           closedShortForDay    = false;
 bool           deletedForDay        = false;
 bool           rangeFilterPassed    = false;
 bool           rangeFilterChecked   = false;
@@ -213,7 +217,8 @@ void RecoverState(datetime currentTime, MqlDateTime &dt) {
     
     // Update flags
     dayFullyTraded    = (dailyLongTrades + dailyShortTrades >= InpMaxTotalTrades);
-    closedForDay      = false;
+    closedLongForDay  = false;
+    closedShortForDay = false;
     deletedForDay     = false;
     rangeFilterChecked = false;
     slTpPrecomputed   = false;
@@ -282,7 +287,8 @@ void OnTick() {
         RangeHigh          = 0;
         RangeLow           = 0;
         dayFullyTraded     = false;
-        closedForDay       = false;
+        closedLongForDay   = false;
+        closedShortForDay  = false;
         deletedForDay      = false;
         rangeFilterChecked = false;
         rangeFilterPassed  = false;
@@ -295,12 +301,14 @@ void OnTick() {
     MqlDateTime startDt = dt; startDt.hour = InpRangeStartHour;    startDt.min = InpRangeStartMinute;    startDt.sec = 0;
     MqlDateTime endDt   = dt; endDt.hour   = InpRangeEndHour;      endDt.min   = InpRangeEndMinute;      endDt.sec   = 0;
     MqlDateTime delDt   = dt; delDt.hour   = InpDeleteOrderHour;   delDt.min   = InpDeleteOrderMinute;   delDt.sec   = 0;
-    MqlDateTime closDt  = dt; closDt.hour  = InpClosePositionHour; closDt.min  = InpClosePositionMinute; closDt.sec  = 0;
+    MqlDateTime closLongDt = dt; closLongDt.hour = InpCloseLongHour; closLongDt.min = InpCloseLongMinute; closLongDt.sec = 0;
+    MqlDateTime closShortDt = dt; closShortDt.hour = InpCloseShortHour; closShortDt.min = InpCloseShortMinute; closShortDt.sec = 0;
 
     datetime startTime  = StructToTime(startDt);
     datetime endTime    = StructToTime(endDt);
     datetime deleteTime = StructToTime(delDt);
-    datetime closeTime  = StructToTime(closDt);
+    datetime closeLongTime  = StructToTime(closLongDt);
+    datetime closeShortTime = StructToTime(closShortDt);
 
     // Update state display
     if(currentTime < endTime) {
@@ -318,15 +326,21 @@ void OnTick() {
     }
 
     // 3. CLOSE POSITIONS at scheduled time (once per day)
-    if(currentTime >= closeTime && InpClosePositions) {
-        if(!closedForDay) {
-            CloseAllPositions();
-            DeletePendingOrders();
-            closedForDay = true;
+    if(InpClosePositions) {
+        if(currentTime >= closeLongTime && !closedLongForDay) {
+            ClosePositionsType(POSITION_TYPE_BUY);
+            DeletePendingOrdersType(ORDER_TYPE_BUY_STOP);
+            closedLongForDay = true;
         }
-        eaStateStr = "Trading Ended";
-        UpdateDashboard();
-        return;
+        if(currentTime >= closeShortTime && !closedShortForDay) {
+            ClosePositionsType(POSITION_TYPE_SELL);
+            DeletePendingOrdersType(ORDER_TYPE_SELL_STOP);
+            closedShortForDay = true;
+        }
+        
+        if (closedLongForDay && closedShortForDay) {
+            eaStateStr = "Trading Ended";
+        }
     }
 
     // 4. CALCULATE RANGE
@@ -424,6 +438,23 @@ void PrecomputeSlTp() {
             preSlBuy      = NormalizeDouble(preBuyEntry  - preSlDistBuy,  _Digits);
             preSlSell     = NormalizeDouble(preSellEntry + preSlDistSell, _Digits);
             break;
+        case STOP_ACCOUNT_PERCENT: {
+            double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+            double riskMoney = balance * (InpStopValue / 100.0);
+            double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+            double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+            double refLot = InpFixedLots;
+            if(tickSize > 0 && tickValue > 0 && refLot > 0) {
+                preSlDistBuy  = riskMoney / ((refLot * tickValue) / tickSize);
+                preSlDistSell = preSlDistBuy;
+            } else {
+                preSlDistBuy  = rangeSize;
+                preSlDistSell = rangeSize;
+            }
+            preSlBuy      = NormalizeDouble(preBuyEntry  - preSlDistBuy,  _Digits);
+            preSlSell     = NormalizeDouble(preSellEntry + preSlDistSell, _Digits);
+            break;
+        }
     }
     
     // --- TAKE PROFIT ---
@@ -490,8 +521,8 @@ void CheckBreakoutAndTrade() {
     }
 
     int totalTrades = dailyLongTrades + dailyShortTrades;
-    bool canBuy  = !hasOpenLong  && !hasPendingBuyStop  && (dailyLongTrades  < InpMaxLongTrades)  && (totalTrades < InpMaxTotalTrades);
-    bool canSell = !hasOpenShort && !hasPendingSellStop && (dailyShortTrades < InpMaxShortTrades) && (totalTrades < InpMaxTotalTrades);
+    bool canBuy  = !hasOpenLong  && !hasPendingBuyStop  && (dailyLongTrades  < InpMaxLongTrades)  && (totalTrades < InpMaxTotalTrades) && !closedLongForDay;
+    bool canSell = !hasOpenShort && !hasPendingSellStop && (dailyShortTrades < InpMaxShortTrades) && (totalTrades < InpMaxTotalTrades) && !closedShortForDay;
     
     if(!canBuy && !canSell) return;
 
@@ -611,19 +642,34 @@ double CalcLotFromRisk(double riskMoney, double slDistance) {
 }
 
 //+------------------------------------------------------------------+
-//| Close all open positions of this EA                               |
+//| Helper to close positions by type (BUY/SELL)                      |
 //+------------------------------------------------------------------+
-void CloseAllPositions() {
-    if(PositionsTotal() == 0) return;
-    
+void ClosePositionsType(long posType) {
     for(int i = PositionsTotal() - 1; i >= 0; i--) {
         ulong ticket = PositionGetTicket(i);
         if(PositionSelectByTicket(ticket)) {
             if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-               PositionGetInteger(POSITION_MAGIC) == (long)InpMagicNumber) {
+               PositionGetInteger(POSITION_MAGIC) == (long)InpMagicNumber &&
+               PositionGetInteger(POSITION_TYPE) == posType) {
                 if(!trade.PositionClose(ticket)) {
                     PrintFormat("WARNING: Failed to close position #%d. Error: %d", ticket, GetLastError());
                 }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Helper to delete pending orders by type                           |
+//+------------------------------------------------------------------+
+void DeletePendingOrdersType(long orderType) {
+    for(int i = OrdersTotal() - 1; i >= 0; i--) {
+        ulong ticket = OrderGetTicket(i);
+        if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+           OrderGetInteger(ORDER_MAGIC) == (long)InpMagicNumber &&
+           OrderGetInteger(ORDER_TYPE) == orderType) {
+            if(!trade.OrderDelete(ticket)) {
+                PrintFormat("WARNING: Failed to delete order #%d. Error: %d", ticket, GetLastError());
             }
         }
     }

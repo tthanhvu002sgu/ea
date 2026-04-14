@@ -3,7 +3,7 @@
 //|                                        Range Breakout Strategy   |
 //+------------------------------------------------------------------+
 #property copyright "Range Breakout Strategy"
-#property version   "2.00"
+#property version   "2.10"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -46,7 +46,7 @@ input ENUM_STOP_CALC_MODE InpStopMode            = STOP_FACTOR;  // Stop Loss Mo
 input double              InpStopValue           = 1.0;          // SL Value (Points or Factor)
 input ulong               InpMagicNumber         = 111;          // Magic Number
 
-input group "=== B. Time Settings (Server Time) ==="
+input group "=== B. Time Settings (Server Time) — Cross-Day Supported ==="
 input int                 InpRangeStartHour      = 0;            // Range Start Hour
 input int                 InpRangeStartMinute    = 0;            // Range Start Minute
 input int                 InpRangeEndHour        = 7;            // Range End Hour
@@ -197,12 +197,20 @@ void RecoverState(datetime currentTime, MqlDateTime &dt) {
         }
     }
 
-    // 2. Recover RangeBox from chart objects
+    // 2. Recover RangeBox from chart objects (cross-day aware)
     MqlDateTime startDt = dt;
     startDt.hour = InpRangeStartHour;
     startDt.min  = InpRangeStartMinute;
     startDt.sec  = 0;
+    MqlDateTime endDt = dt;
+    endDt.hour = InpRangeEndHour;
+    endDt.min  = InpRangeEndMinute;
+    endDt.sec  = 0;
     datetime startTime = StructToTime(startDt);
+    datetime endTime   = StructToTime(endDt);
+    // Cross-day: if end <= start on same calendar day, range started yesterday
+    if(endTime <= startTime) startTime -= 86400;
+    
     string objName = "RangeBox_" + TimeToString(startTime, TIME_DATE);
     
     if(ObjectFind(0, objName) >= 0) {
@@ -297,11 +305,11 @@ void OnTick() {
         eaStateStr         = "Waiting for Range";
     }
 
-    // Build time references
+    // Build time references (Cross-Day Aware)
     MqlDateTime startDt = dt; startDt.hour = InpRangeStartHour;    startDt.min = InpRangeStartMinute;    startDt.sec = 0;
     MqlDateTime endDt   = dt; endDt.hour   = InpRangeEndHour;      endDt.min   = InpRangeEndMinute;      endDt.sec   = 0;
     MqlDateTime delDt   = dt; delDt.hour   = InpDeleteOrderHour;   delDt.min   = InpDeleteOrderMinute;   delDt.sec   = 0;
-    MqlDateTime closLongDt = dt; closLongDt.hour = InpCloseLongHour; closLongDt.min = InpCloseLongMinute; closLongDt.sec = 0;
+    MqlDateTime closLongDt  = dt; closLongDt.hour  = InpCloseLongHour;  closLongDt.min  = InpCloseLongMinute;  closLongDt.sec  = 0;
     MqlDateTime closShortDt = dt; closShortDt.hour = InpCloseShortHour; closShortDt.min = InpCloseShortMinute; closShortDt.sec = 0;
 
     datetime startTime  = StructToTime(startDt);
@@ -309,6 +317,14 @@ void OnTick() {
     datetime deleteTime = StructToTime(delDt);
     datetime closeLongTime  = StructToTime(closLongDt);
     datetime closeShortTime = StructToTime(closShortDt);
+
+    // [Cross-Day] Range: if end <= start on same date, start was yesterday
+    if(endTime <= startTime) startTime -= 86400;
+
+    // [Cross-Day] Delete/Close: if time is before range end, it belongs to the next day
+    if(deleteTime    < endTime) deleteTime    += 86400;
+    if(closeLongTime  < endTime) closeLongTime  += 86400;
+    if(closeShortTime < endTime) closeShortTime += 86400;
 
     // Update state display
     if(currentTime < endTime) {
@@ -555,7 +571,7 @@ void CheckBreakoutAndTrade() {
     }
 
     // --- SELL LOGIC ---
-    if(canSell) {
+    if(canSell && !dayFullyTraded) {
         double lotSell = CalculateLotSize(preSlDistSell);
         if(lotSell > 0) {
             if(bid < preSellEntry) {
@@ -716,11 +732,19 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                     if(orderTicket > 0) {
                         // Re-sync trade count from history to avoid double-counting
                         ResyncTradeCount();
+                        if(InpMaxTotalTrades == 1) {
+                            DeletePendingOrdersType(ORDER_TYPE_SELL_STOP);
+                            Print("Buy Order filled. Removed SellStop because InpMaxTotalTrades = 1 (OCO Mode)");
+                        }
                     }
                 } else if(dtype == DEAL_TYPE_SELL) {
                     long orderTicket = (long)HistoryDealGetInteger(dealTicket, DEAL_ORDER);
                     if(orderTicket > 0) {
                         ResyncTradeCount();
+                        if(InpMaxTotalTrades == 1) {
+                            DeletePendingOrdersType(ORDER_TYPE_BUY_STOP);
+                            Print("Sell Order filled. Removed BuyStop because InpMaxTotalTrades = 1 (OCO Mode)");
+                        }
                     }
                 }
             }

@@ -1,0 +1,88 @@
+//@version=5
+indicator("Exponential Moving Median (EMM)", shorttitle="EMM vs EMA", overlay=true, max_bars_back=500)
+
+// ------------------------------------------------------------------------------------------------ //
+// KHÁI NIỆM:
+// Đường EMA chuẩn (Exponential Moving Average) tính "giá trị trung bình" có trọng số giảm dần.
+// Bản code này thay thế bằng cách tính "giá trị trung vị" (Median) có trọng số giảm dần theo hàm mũ.
+// Lợi ích: Vẫn bám sát giá ở hiện tại như EMA nhờ lấy trọng số cao cho nến gần nhất, 
+// nhưng ít bị méo mó/nhiễu bởi các nến rút râu giật mạnh (outliers) nhờ bản chất của Trung Vị.
+// ------------------------------------------------------------------------------------------------ //
+
+length = input.int(20, "Chiều dài thuật toán (Length)", minval=1)
+src = input.source(close, "Nguồn dữ liệu (Source)")
+
+// Vì đặc tính của thuật toán EMA là lấy dữ liệu tiến dần về vô cực trong quá khứ,
+// nên để tính trung vị, chúng ta cần một "cửa sổ lưu trữ" những nến gần nhất chiếm trọng số lớn nhất.
+// 100 nến là đủ để chứa gần 99% tổng trọng số của EMA cho các chiều dài từ 50 trở xuống.
+window = input.int(100, "Cửa số Lookback (Window)", minval=10, maxval=500, tooltip="Số lượng nến lưu trữ để tính toán trung vị. Không nên đặt quá lớn có thể gây trễ thuật toán xử lý.")
+
+// Hàm tính Exponential Moving Median (EMM)
+f_emm(source, len, win) =>
+    float median_val = source
+    if bar_index >= 1
+        alpha = 2.0 / (len + 1.0)
+        
+        float[] p = array.new_float()
+        float[] w = array.new_float()
+        float total_w = 0.0
+        
+        int actual_win = math.min(win, bar_index + 1)
+        
+        // Bước 1: Thu thập dữ liệu và gán trọng số hàm mũ
+        for i = 0 to actual_win - 1
+            float val = source[i]
+            float weight = math.pow(1.0 - alpha, i) // Nến càng xa, trọng số càng phân rã theo hàm mũ
+            array.push(p, val)
+            array.push(w, weight)
+            total_w += weight
+            
+        // Bước 2: Sắp xếp mảng Giá tăng dần, đồng thời giữ nguyên thứ tự Trọng số tương ứng 
+        // Thay vì dùng and trong while (không short-circuit ở Pine Script), ta ngắt dòng an toàn.
+        if actual_win > 1
+            for i = 1 to actual_win - 1
+                float key_p = array.get(p, i)
+                float key_w = array.get(w, i)
+                int j = i - 1
+                bool loop = true
+                while loop
+                    if j < 0
+                        loop := false
+                    else if array.get(p, j) <= key_p
+                        loop := false
+                    else
+                        array.set(p, j + 1, array.get(p, j))
+                        array.set(w, j + 1, array.get(w, j))
+                        j := j - 1
+                array.set(p, j + 1, key_p)
+                array.set(w, j + 1, key_w)
+            
+        // Bước 3: Tìm mức giá Trung vị (Median) dựa trên mốc tích lũy 50% tổng trọng số
+        float cum_w = 0.0
+        float target_w = total_w / 2.0
+        
+        for i = 0 to actual_win - 1
+            cum_w += array.get(w, i)
+            if cum_w >= target_w
+                median_val := array.get(p, i)
+                break
+                
+    median_val
+
+// Tính toán các đường line để hiển thị
+emm_val = f_emm(src, length, window)
+ema_val = ta.ema(src, length)
+
+// Vẽ lên biểu đồ
+plot(emm_val, title="Exponential Moving Median (EMM)", color=color.yellow, linewidth=2)
+plot(ema_val, title="Standard EMA", color=color.new(color.white, 70), linewidth=1, style=plot.style_line)
+
+// ==================================================================================================== //
+// ------ CHÚ THÍCH PHỤ THÊM NẾU BẠN CÓ Ý KHÁC ------ 
+// ==================================================================================================== //
+
+// 1. NẾU Ý BẠN LÀ: "Tính đường EMA của giá Trung Vị (High+Low)/2", thì dùng dòng sau:
+// plot(ta.ema(hl2, length), title="EMA của Median Price = hl2", color=color.red, display=display.none)
+
+// 2. NẾU Ý BẠN LÀ: "Tính đường Trung vị chạy đơn giản không có hàm mũ (Rolling Median)", thì dùng dòng sau:
+// plot(ta.median(src, length), title="Simple Moving Median", color=color.orange, display=display.none)

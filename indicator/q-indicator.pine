@@ -1,0 +1,35 @@
+//@version=5
+indicator("Trend-Quality Indicator", overlay=false)
+
+// Get user input
+bool   showQ            = input(true, "Q-INDICATOR")
+bool   showB            = input(true, "B-INDICATOR")
+int    lenFast          = input.int(7, "Fast Length", 1)
+int    lenSlow          = input.int(15, "Slow Length", 2)
+int    lenTrend         = input.int(4, "Trend Length", 2)
+string typeNoise        = input.string("LINEAR", "Noise Type", ["LINEAR", "SQUARED"])
+int    lenNoise         = input.int(250, "Noise Length", 2)
+int    correctionFactor = input.int(2, "Correction Factor", 1, 50)
+
+// Components
+float  emaFast          = ta.ema(close, lenFast)
+float  emaSlow          = ta.ema(close, lenSlow)
+float  smf              = 2.0 / (1.0 + lenTrend)
+float  reversal         = math.sign(emaFast - emaSlow)
+float  cpc              = 0, cpc := reversal == reversal[1] ? cpc[1] + close - close[1] : 0
+float  trend            = 0, trend := reversal == reversal[1] ? trend[1] * (1 - smf) + cpc * smf : 0
+float  diff             = math.abs(cpc - trend)
+float  noise            = correctionFactor * (typeNoise == "LINEAR" ? ta.sma(diff, lenNoise) : math.sqrt(ta.sma(math.pow(diff, 2), lenNoise)))
+float  indicatorQ       = trend / noise
+float  indicatorB       = (math.abs(trend) / (math.abs(trend) + noise)) * 100
+
+// Colors
+color  invisible        = color.new(color.white, 100)
+color  colorQ           = indicatorQ >= 5 ? color.green : indicatorQ < 5 and indicatorQ >= 2 ? color.blue : indicatorQ < 2 and indicatorQ >= 1 ? color.yellow : indicatorQ <= -1 and indicatorQ > -2 ? color.yellow : indicatorQ <= -2 and indicatorQ > -5 ? color.orange : indicatorQ <= -5 ? color.red : color.gray
+color  colorB           = indicatorB >= 50 and indicatorB < 65 ? color.yellow : indicatorB >= 65 and indicatorB < 80 ? color.blue : indicatorB >= 80 ? color.green : color.gray
+
+// Plots
+plot(showQ ? indicatorQ : 50, "TQ", showQ ? colorQ : invisible, 2, plot.style_columns)
+hline(showQ ? 0 : 50, "Zero Line", showQ ? color.red : invisible, hline.style_solid)
+plot(showB ? indicatorB : 0, "TNB", showB ? colorB : invisible, 2)
+hline(showB ? 50 : 0, "Half Line", showB ? color.red : invisible, hline.style_solid)

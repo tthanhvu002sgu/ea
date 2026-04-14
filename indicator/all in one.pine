@@ -1,0 +1,139 @@
+// 4. Lấy giá cao nhất/thấp nhất cho Volume Profile
+// --- NHÓM INPUT: CÀI ĐẶT VOLUME PROFILE ---
+vp_bbars = input.int(title='Number of Bars', defval=50, minval=1, maxval=500, group="Volume Profile Settings")
+vp_bbars2 = input.int(title='Number of Bars', defval=100, minval=1, maxval=500, group="Volume Profile Settings")
+vp_bbars3 = input.int(title='Number of Bars', defval=150, minval=1, maxval=500, group="Volume Profile Settings")
+vp_cnum = input.int(title='Row Size', defval=24, minval=5, maxval=100, group="Volume Profile Settings")
+
+vp_top = ta.highest(vp_bbars)
+vp_bot = ta.lowest(vp_bbars)
+vp_top2 = ta.highest(vp_bbars2)
+vp_bot2 = ta.lowest(vp_bbars2)
+vp_top3 = ta.highest(vp_bbars3)
+vp_bot3 = ta.lowest(vp_bbars3)
+// Hàm tính volume giao cắt
+get_vol(y11, y12, y21, y22, height, vol) => nz(math.max(math.min(math.max(y11, y12), math.max(y21, y22)) - math.max(math.min(y11, y12), math.min(y21, y22)), 0) * vol / height)
+float poc_level = na
+float poc_level2 = na
+float poc_level3 = na
+var float plot_poc_level1 = na
+var float plot_poc_level2 = na
+var float plot_poc_level3 = na
+
+// Dùng 'var' để các biến này không bị reset giá trị sau mỗi nến
+var line poc_line1 = na
+var line poc_line2 = na
+var line poc_line3 = na
+// --- HIỂN THỊ BẢNG ---
+// Chỉ thực hiện trên thanh nến cuối cùng để tối ưu hiệu suất
+if barstate.islast
+    // --- PHẦN 1: TÍNH TOÁN VOLUME PROFILE ĐỂ LẤY POC ---
+    
+    
+    vp_step = (vp_top - vp_bot) / vp_cnum
+    vp_step2 = (vp_top2 - vp_bot2) / vp_cnum
+    vp_step3 = (vp_top3 - vp_bot3) / vp_cnum
+
+    if vp_step > 0
+        // Tạo các mức giá
+        levels = array.new_float(vp_cnum + 1)
+        for x = 0 to vp_cnum by 1
+            array.set(levels, x, vp_bot + vp_step * x)
+
+        
+
+        // Tính toán volume cho từng mức giá
+        volumes = array.new_float(vp_cnum, 0.)
+        for bars = 0 to vp_bbars - 1 by 1
+            range_ = high[bars] - low[bars]
+            if range_ > 0
+                for x = 0 to vp_cnum - 1 by 1
+                    vol_at_level = get_vol(array.get(levels, x), array.get(levels, x + 1), low[bars], high[bars], range_, volume[bars])
+                    array.set(volumes, x, array.get(volumes, x) + vol_at_level)
+
+        // Tìm index của mức giá có volume cao nhất (POC)
+        int poc_index = array.indexof(volumes, array.max(volumes))
+        if poc_index > -1
+            poc_level := (array.get(levels, poc_index) + array.get(levels, poc_index + 1)) / 2
+    if vp_step2 > 0
+        // Tạo các mức giá
+        levels = array.new_float(vp_cnum + 1)
+        for x = 0 to vp_cnum by 1
+            array.set(levels, x, vp_bot2 + vp_step2 * x)
+
+        
+
+        // Tính toán volume cho từng mức giá
+        volumes = array.new_float(vp_cnum, 0.)
+        for bars = 0 to vp_bbars2 - 1 by 1
+            range_ = high[bars] - low[bars]
+            if range_ > 0
+                for x = 0 to vp_cnum - 1 by 1
+                    vol_at_level = get_vol(array.get(levels, x), array.get(levels, x + 1), low[bars], high[bars], range_, volume[bars])
+                    array.set(volumes, x, array.get(volumes, x) + vol_at_level)
+
+        // Tìm index của mức giá có volume cao nhất (POC)
+        int poc_index2 = array.indexof(volumes, array.max(volumes))
+        if poc_index2 > -1
+            poc_level2 := (array.get(levels, poc_index2) + array.get(levels, poc_index2 + 1)) / 2
+    if vp_step3 > 0
+        // Tạo các mức giá
+        levels = array.new_float(vp_cnum + 1)
+        for x = 0 to vp_cnum by 1
+            array.set(levels, x, vp_bot3 + vp_step3 * x)
+
+        
+
+        // Tính toán volume cho từng mức giá
+        volumes = array.new_float(vp_cnum, 0.)
+        for bars = 0 to vp_bbars3 - 1 by 1
+            range_ = high[bars] - low[bars]
+            if range_ > 0
+                for x = 0 to vp_cnum - 1 by 1
+                    vol_at_level = get_vol(array.get(levels, x), array.get(levels, x + 1), low[bars], high[bars], range_, volume[bars])
+                    array.set(volumes, x, array.get(volumes, x) + vol_at_level)
+
+        // Tìm index của mức giá có volume cao nhất (POC)
+        int poc_index3 = array.indexof(volumes, array.max(volumes))
+        if poc_index3 > -1
+            poc_level3 := (array.get(levels, poc_index3) + array.get(levels, poc_index3 + 1)) / 2
+
+    // // Tính toán giá trị POC dựa trên N nến gần nhất
+    // float poc_level1 = calculatePOC(poc1_len)
+    // float poc_level2 = calculatePOC(poc2_len)
+    // float poc_level3 = calculatePOC(poc3_len)
+    
+    // Xóa các đường cũ đi trước khi vẽ đường mới
+    line.delete(poc_line1)
+    line.delete(poc_line2)
+    line.delete(poc_line3)
+    
+    // Vẽ các đường ngang mới kéo dài về bên phải
+    if not na(poc_level)
+        poc_line1 := line.new(bar_index - vp_bbars, poc_level, bar_index + 1, poc_level, color = color.red, width = 2, extend = extend.right)
+        plot_poc_level1 := poc_level
+    if not na(poc_level2)
+        poc_line2 := line.new(bar_index - vp_bbars2, poc_level2, bar_index + 1, poc_level2, color = color.blue, width = 2, extend = extend.right)
+        plot_poc_level2 := poc_level2
+    if not na(poc_level3)
+        poc_line3 := line.new(bar_index - vp_bbars3, poc_level3, bar_index + 1, poc_level3, color = color.green, width = 2, extend = extend.right)
+        plot_poc_level3 := poc_level3
+    float percentDiff1 = na
+    float percentDiff2 = na
+    float percentDiff3 = na
+
+    percentDiff1 := (( close - poc_level) / close) * 100
+    percentDiff2 := (( close - poc_level2 ) / close) * 100
+    percentDiff3 := ((close - poc_level3 ) / close) * 100
+
+    // Định nghĩa các màu sắc để dễ đọc
+    color headerBg = color.new(color.blue, 80)
+    color whiteText = color.white
+    color blackText = color.black
+    color greenText = color.new(color.green, 0)
+    color redText = color.new(color.red, 0)
+
+    
+plot(plot_poc_level1, "POC 1", color.red, trackprice = true, display = display.data_window + display.price_scale)
+plot(plot_poc_level2, "POC 2", color.blue, trackprice = true, display = display.data_window + display.price_scale)
+plot(plot_poc_level3, "POC 3", color.green, trackprice = true, display = display.data_window + display.price_scale)

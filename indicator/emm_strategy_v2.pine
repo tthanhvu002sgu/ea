@@ -1,0 +1,103 @@
+//@version=5
+strategy("EMM Strategy V2 - Pine Engine", overlay = true, calc_on_every_tick = false, initial_capital = 10000)
+
+// --- Inputs ---
+grp_mm = "Money Management"
+mm_mode = input.string("Fixed", "MM Mode", options=["Fixed", "Risk % (Loss to 0)"], group=grp_mm)
+risk_pct = input.float(1.0, "Risk % (Loss to 0)", minval=0.1, step=0.5, group=grp_mm)
+fixed_qty = input.float(0.1, "Fixed Lot Size", minval=0.01, step=0.01, group=grp_mm)
+
+grp_strat = "Strategy Settings"
+trade_dir = input.string("Both", "Trade Direction", options=["Both", "Long Only", "Short Only"], group=grp_strat)
+
+grp_emm = "EMM Settings"
+len_emm = input.int(20, "EMM Length", minval=1, group=grp_emm)
+win_emm = input.int(100, "EMM Window (Lookback)", minval=10, group=grp_emm)
+
+grp_htf = "HTF Filter"
+use_htf = input.bool(true, "Use HTF Filter", group=grp_htf)
+tf_htf  = input.timeframe("240", "HTF Timeframe", group=grp_htf)
+len_htf = input.int(50, "HTF EMM Length", minval=1, group=grp_htf)
+
+// --- MQL5 Native Exponential Moving Median Function ---
+f_emm(src, length, window) =>
+    float alpha = 2.0 / (length + 1.0)
+    
+    float[] prices = array.new_float(window, 0.0)
+    float[] weights = array.new_float(window, 0.0)
+    
+    float total_w = 0.0
+    for i = 0 to window - 1
+        float val = src[i]
+        float w = math.pow(1.0 - alpha, i)
+        array.set(prices, i, nz(val, 0.0))
+        array.set(weights, i, w)
+        total_w += w
+        
+    // Fast sort using index indirection
+    int[] indices = array.sort_indices(prices)
+    
+    float target_w = total_w / 2.0
+    float cum_w = 0.0
+    float median = na
+    for i = 0 to window - 1
+        int idx = array.get(indices, i)
+        cum_w += array.get(weights, idx)
+        if cum_w >= target_w
+            median := array.get(prices, idx)
+            break
+            
+    median
+
+// --- Indicators Calc ---
+float curr_emm = f_emm(close, len_emm, win_emm)
+float htf_emm  = request.security(syminfo.tickerid, tf_htf, f_emm(close, len_htf, win_emm), barmerge.gaps_off, barmerge.lookahead_off)
+
+// --- HTF Filter ---
+bool long_ok  = not use_htf or (close > htf_emm)
+bool short_ok = not use_htf or (close < htf_emm)
+
+// --- Crossover Relaxed Logic (Same as MT5 update) ---
+float prev_close = close[1]
+float prev_emm   = curr_emm[1]
+
+bool cross_up   = (prev_close <= prev_emm and close > curr_emm) or (prev_close < prev_emm and close == curr_emm)
+bool cross_down = (prev_close >= prev_emm and close < curr_emm) or (prev_close > prev_emm and close == curr_emm)
+
+bool buy_signal  = cross_up   and long_ok
+bool sell_signal = cross_down and short_ok
+
+// --- Determine Volume ---
+float vol = fixed_qty
+if mm_mode == "Risk % (Loss to 0)"
+    float risk_amount = strategy.equity * (risk_pct / 100.0)
+    vol := risk_amount / close // Nominal Value equation assuming Base matched
+
+// --- Execution ---
+bool can_long  = trade_dir == "Both" or trade_dir == "Long Only"
+bool can_short = trade_dir == "Both" or trade_dir == "Short Only"
+
+bool has_long = strategy.position_size > 0
+bool has_short = strategy.position_size < 0
+
+if cross_down
+    strategy.close("EMM Long", comment="Close Buy: cross_down")
+    has_long := false // update flag immediately to prevent same-bar re-entry
+
+if cross_up
+    strategy.close("EMM Short", comment="Close Sell: cross_up")
+    has_short := false
+
+if buy_signal and can_long and not has_long
+    strategy.entry("EMM Long", strategy.long, qty=vol)
+
+if sell_signal and can_short and not has_short
+    strategy.entry("EMM Short", strategy.short, qty=vol)
+
+// --- Visuals ---
+plot(curr_emm, color=color.yellow, linewidth=2, title="EMM")
+plot(use_htf ? htf_emm : na, color=color.fuchsia, linewidth=2, title="HTF EMM")
+
+plotshape(cross_up ? 1 : na, style=shape.uparrow, location=location.belowbar, color=color.lime, size=size.small, title="Buy Arrow")
+plotshape(cross_down ? 1 : na, style=shape.downarrow, location=location.abovebar, color=color.red, size=size.small, title="Sell Arrow")
+
