@@ -12,6 +12,14 @@ from plotly.subplots import make_subplots
 from scipy import stats
 import os, warnings, glob, io
 
+# Monkeypatch openpyxl's CellRange row limit (1,048,576) to allow loading files with larger dimensions or merged cell ranges.
+try:
+    from openpyxl.worksheet.cell_range import CellRange
+    CellRange.min_row.max = 100000000
+    CellRange.max_row.max = 100000000
+except ImportError:
+    pass
+
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -23,12 +31,21 @@ except ImportError:
 # ============================================================
 # GOOGLE DRIVE SYNC
 # ============================================================
+def get_secret(key, default=None):
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return default
+
 def get_drive_service():
     if not GOOGLE_DRIVE_AVAILABLE: return None
     try:
-        if "gcp_service_account" in st.secrets:
+        gcp_account = get_secret("gcp_service_account")
+        if gcp_account:
             creds = service_account.Credentials.from_service_account_info(
-                st.secrets["gcp_service_account"], scopes=['https://www.googleapis.com/auth/drive']
+                gcp_account, scopes=['https://www.googleapis.com/auth/drive']
             )
             return build('drive', 'v3', credentials=creds)
     except Exception as e:
@@ -80,21 +97,52 @@ def get_mt5_metric(raw_df, label_str, header_idx):
 
 @st.cache_data
 def load_backtest(file_path):
+    import pickle
+    cache_path = file_path + ".cache.pkl"
+    if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(file_path):
+        try:
+            with open(cache_path, "rb") as f:
+                trades, metrics = pickle.load(f)
+            return trades, metrics, None
+        except Exception:
+            pass
+
+    # Cache missed, start progress display
+    status = None
+    if hasattr(st, "status"):
+        status = st.status(f"🔍 Đang phân tích file: {os.path.basename(file_path)}", expanded=True)
+    else:
+        status_placeholder = st.empty()
+
+    def log_progress(msg):
+        if status:
+            status.write(msg)
+        else:
+            status_placeholder.text(msg)
+
+    log_progress("📥 Bước 1: Đang nạp tệp dữ liệu vào bộ nhớ...")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if file_path.lower().endswith('.csv'):
             try: raw = pd.read_csv(file_path, header=None, encoding='utf-16le', sep='\t')
             except: raw = pd.read_csv(file_path, header=None)
         else:
-            raw = pd.read_excel(file_path, engine='openpyxl', header=None)
+            try:
+                raw = pd.read_excel(file_path, engine='calamine', header=None)
+            except Exception:
+                raw = pd.read_excel(file_path, engine='openpyxl', header=None)
 
+    log_progress("🔎 Bước 2: Đang quét cấu trúc báo cáo MT5 để tìm bảng Deals...")
     # Find Deals table
     deals_mask = raw[0].astype(str).str.strip() == 'Deals'
     if deals_mask.any():
         deals_start = raw[deals_mask].index[0]
     else:
+        if status:
+            status.update(label="❌ Lỗi: Không tìm thấy bảng Deals trong tệp!", state="error")
         return None, None, None
 
+    log_progress("📊 Bước 3: Đang trích xuất và làm sạch dữ liệu giao dịch...")
     header_idx = deals_start + 1
     df = raw.iloc[header_idx + 1:].copy()
     df.columns = raw.iloc[header_idx].values
@@ -131,6 +179,7 @@ def load_backtest(file_path):
     else:
         trades = df[df['Profit'].notna() & (df['Profit'] != 0)].copy()
 
+    log_progress("🔗 Bước 4: Đang đối chiếu các vị thế In/Out (khớp lệnh vào/ra)...")
     # Build entry info: match each "out" deal to its "in" deal via Order
     if 'Direction' in df.columns and 'Order' in df.columns:
         entries = df[df['Direction'].astype(str).str.strip().str.lower() == 'in'].copy()
@@ -145,6 +194,7 @@ def load_backtest(file_path):
         trades['Duration'] = (trades['Time'] - trades['OpenTime']).dt.total_seconds() / 3600.0
     trades.reset_index(drop=True, inplace=True)
 
+    log_progress("📈 Bước 5: Đang tổng hợp các chỉ số hiệu suất từ Header...")
     # Extract header metrics
     metrics = {}
     for label, key in [('Total Net Profit:', 'net_profit'), ('Initial Deposit:', 'init_deposit'),
@@ -166,6 +216,18 @@ def load_backtest(file_path):
     if wr_str and '(' in wr_str:
         try: metrics['win_rate'] = float(wr_str.split('(')[1].split('%')[0])
         except: pass
+
+    log_progress("💾 Bước 6: Đang lưu trữ dữ liệu đã phân giải vào bộ nhớ đệm (Cache)...")
+    try:
+        with open(cache_path, "wb") as f:
+            pickle.dump((trades, metrics), f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+
+    if status:
+        status.update(label="✅ Hoàn tất phân tích dữ liệu!", state="complete", expanded=False)
+    else:
+        status_placeholder.empty()
 
     return trades, metrics, raw
 
@@ -190,6 +252,152 @@ def compute_metrics(trades, mt5_metrics):
     m['Sharpe Ratio'] = mt5_metrics.get('sharpe', 0)
     m['Recovery Factor'] = mt5_metrics.get('recovery_factor', 0)
     return m
+
+# ============================================================
+# STREAK AND MONTHLY ANALYSIS COMPUTATIONS
+# ============================================================
+def get_streaks(profits):
+    win_streaks = []
+    loss_streaks = []
+    
+    current_win = 0
+    current_loss = 0
+    
+    for p in profits:
+        if p > 0:
+            if current_loss > 0:
+                loss_streaks.append(current_loss)
+                current_loss = 0
+            current_win += 1
+        elif p < 0:
+            if current_win > 0:
+                win_streaks.append(current_win)
+                current_win = 0
+            current_loss += 1
+        else: # p == 0
+            # Treat exactly 0 profit as loss/flat to be conservative
+            if current_win > 0:
+                win_streaks.append(current_win)
+                current_win = 0
+            current_loss += 1
+            
+    if current_win > 0:
+        win_streaks.append(current_win)
+    if current_loss > 0:
+        loss_streaks.append(current_loss)
+        
+    avg_win_streak = np.mean(win_streaks) if win_streaks else 0.0
+    max_win_streak = np.max(win_streaks) if win_streaks else 0
+    avg_loss_streak = np.mean(loss_streaks) if loss_streaks else 0.0
+    max_loss_streak = np.max(loss_streaks) if loss_streaks else 0
+    
+    return avg_win_streak, max_win_streak, avg_loss_streak, max_loss_streak
+
+def get_daily_streaks(trades):
+    if 'Time' not in trades.columns or trades.empty:
+        return 0.0, 0, 0.0, 0
+    df_daily = trades.groupby(trades['Time'].dt.date)['Profit'].sum().reset_index()
+    df_daily = df_daily.sort_values('Time')
+    daily_profits = df_daily['Profit'].values
+    
+    win_days_streaks = []
+    loss_days_streaks = []
+    
+    current_win = 0
+    current_loss = 0
+    
+    for p in daily_profits:
+        if p > 0:
+            if current_loss > 0:
+                loss_days_streaks.append(current_loss)
+                current_loss = 0
+            current_win += 1
+        else: # p <= 0
+            if current_win > 0:
+                win_days_streaks.append(current_win)
+                current_win = 0
+            current_loss += 1
+            
+    if current_win > 0:
+        win_days_streaks.append(current_win)
+    if current_loss > 0:
+        loss_days_streaks.append(current_loss)
+        
+    avg_win_days = np.mean(win_days_streaks) if win_days_streaks else 0.0
+    max_win_days = np.max(win_days_streaks) if win_days_streaks else 0
+    avg_loss_days = np.mean(loss_days_streaks) if loss_days_streaks else 0.0
+    max_loss_days = np.max(loss_days_streaks) if loss_days_streaks else 0
+    
+    return avg_win_days, max_win_days, avg_loss_days, max_loss_days
+
+def get_monthly_win_loss_ratio(trades):
+    if 'Time' not in trades.columns or trades.empty:
+        return 0, 0, 0.0
+    df_monthly = trades.groupby(trades['Time'].dt.to_period('M'))['Profit'].sum().reset_index()
+    win_months = (df_monthly['Profit'] > 0).sum()
+    loss_months = (df_monthly['Profit'] < 0).sum()
+    
+    total_months = win_months + loss_months
+    win_ratio = (win_months / total_months * 100) if total_months > 0 else 0.0
+    
+    return win_months, loss_months, win_ratio
+
+def generate_markdown_report(file_name, m, streaks, daily_streaks, monthly, loss_insights, general_insights):
+    avg_win_streak, max_win_streak, avg_loss_streak, max_loss_streak = streaks
+    avg_win_days, max_win_days, avg_loss_days, max_loss_days = daily_streaks
+    win_months, loss_months, win_month_ratio = monthly
+    
+    md = f"""# Báo Cáo Phân Tích Chiến Lược Giao Dịch
+
+- **Tệp phân tích**: {file_name}
+
+## 1️⃣ Chỉ Số Cơ Bản (Core Metrics)
+- **Tổng số lệnh (Total Trades)**: {m['Total Trades']}
+- **Lợi nhuận ròng (Net Profit)**: ${m['Net Profit ($)']:,.2f}
+- **Tỷ lệ thắng (Win Rate)**: {m['Win Rate (%)']:.1f}%
+- **Yếu tố lợi nhuận (Profit Factor)**: {m['Profit Factor']:.2f}
+- **Sụt giảm vốn lớn nhất (Max DD)**: {m['Max DD (%)']:.2f}%
+- **Hệ số Sharpe (Sharpe Ratio)**: {m['Sharpe Ratio']:.2f}
+- **Kỳ vọng lệnh (Expectancy)**: ${m['Expectancy ($)']:.2f}
+- **Lợi nhuận TB lệnh thắng (Avg Win)**: ${m['Avg Win ($)']:.2f}
+- **Thua lỗ TB lệnh thua (Avg Loss)**: ${m['Avg Loss ($)']:.2f}
+- **Tỷ lệ R:R trung bình (Avg R:R)**: {m['Avg R:R']:.2f}
+
+## 2️⃣ Phân Tích Chuỗi Giao Dịch & Chu Kỳ Tháng
+### Chuỗi lệnh liên tiếp (Trade Streaks)
+- **Lãi liên tiếp trung bình**: {avg_win_streak:.1f} lệnh (Cực đại: {max_win_streak} lệnh)
+- **Lỗ liên tiếp trung bình**: {avg_loss_streak:.1f} lệnh (Cực đại: {max_loss_streak} lệnh)
+
+### Chuỗi ngày liên tiếp (Daily Streaks)
+- **Ngày lãi liên tiếp trung bình**: {avg_win_days:.1f} ngày (Cực đại: {max_win_days} ngày)
+- **Ngày lỗ liên tiếp trung bình**: {avg_loss_days:.1f} ngày (Cực đại: {max_loss_days} ngày)
+
+### Kỳ tháng (Monthly Ratio)
+- **Tỉ lệ tháng Lãi / Lỗ**: {win_months} tháng lãi / {loss_months} tháng lỗ
+- **Phần trăm số tháng lãi**: {win_month_ratio:.1f}%
+
+## 3️⃣ Phân Tích Cấu Trúc Lỗ (Loss Attribution)
+"""
+    if loss_insights:
+        for ins in loss_insights:
+            # Clean icons/emojis for standard markdown readability
+            clean_ins = ins.replace('🔍 ', '').replace('👉 ', '').replace('📌 ', '')
+            md += f"- {clean_ins}\n"
+    else:
+        md += "- Không phát hiện điểm yếu rõ rệt ở các chiều hoặc cấu trúc dữ liệu không đủ phân tích.\n"
+        
+    md += """
+## 4️⃣ Phân Tích Chuyên Sâu & Tổng Kết (Quant Insights)
+"""
+    for ins in general_insights:
+        clean_ins = ins.replace('✅ ', '').replace('❌ ', '').replace('⚠️ ', '').replace('🔴 ', '').replace('🟢 ', '')
+        md += f"- {clean_ins}\n"
+        
+    md += f"""
+---
+*Báo cáo được xuất tự động bởi Strategy Analyzer Dashboard.*
+"""
+    return md
 
 # ============================================================
 # CHARTS
@@ -346,7 +554,7 @@ def main():
     
     # ── GOOGLE DRIVE SYNC ──
     service = get_drive_service()
-    drive_folder_id = st.secrets.get("drive_folder_id", "") if "drive_folder_id" in st.secrets else None
+    drive_folder_id = get_secret("drive_folder_id")
     
     if service and drive_folder_id:
         if st.sidebar.button("🔄 Đồng bộ dữ liệu với Drive"):
@@ -424,20 +632,58 @@ def main():
     for col, (label, value) in zip(cols2, items2):
         col.metric(label, value)
 
+    # ── Phân tích chuỗi lệnh & ngày liên tiếp ──
+    st.markdown("### 📈 Phân Tích Chuỗi Giao Gịch & Chu Kỳ Tháng")
+    
+    # Calculate streaks
+    avg_win_streak, max_win_streak, avg_loss_streak, max_loss_streak = get_streaks(profits)
+    avg_win_days, max_win_days, avg_loss_days, max_loss_days = get_daily_streaks(trades)
+    win_months, loss_months, win_month_ratio = get_monthly_win_loss_ratio(trades)
+    
+    cols3 = st.columns(3)
+    with cols3[0]:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="font-size: 14px; color: #888; font-weight: bold; margin-bottom: 8px;">Chuỗi Lệnh Liên Tiếp (Avg / Max)</div>
+            <div style="font-size: 18px; font-weight: bold; color: #00d4aa; text-align: left;">🟢 Lãi liên tiếp: {avg_win_streak:.1f} lệnh <span style="font-size: 12px; color: #888;">(Cực đại: {max_win_streak})</span></div>
+            <div style="font-size: 18px; font-weight: bold; color: #ff4757; text-align: left; margin-top: 4px;">🔴 Lỗ liên tiếp: {avg_loss_streak:.1f} lệnh <span style="font-size: 12px; color: #888;">(Cực đại: {max_loss_streak})</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with cols3[1]:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="font-size: 14px; color: #888; font-weight: bold; margin-bottom: 8px;">Chuỗi Ngày Liên Tiếp (Avg / Max)</div>
+            <div style="font-size: 18px; font-weight: bold; color: #00d4aa; text-align: left;">🟢 Ngày lãi liên tiếp: {avg_win_days:.1f} ngày <span style="font-size: 12px; color: #888;">(Cực đại: {max_win_days})</span></div>
+            <div style="font-size: 18px; font-weight: bold; color: #ff4757; text-align: left; margin-top: 4px;">🔴 Ngày lỗ liên tiếp: {avg_loss_days:.1f} ngày <span style="font-size: 12px; color: #888;">(Cực đại: {max_loss_days})</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with cols3[2]:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="font-size: 14px; color: #888; font-weight: bold; margin-bottom: 8px;">Tỉ Lệ Tháng Lãi / Lỗ</div>
+            <div style="font-size: 20px; font-weight: bold; color: #ffa502; text-align: left; margin-top: 4px;">📅 {win_months} tháng Lãi / {loss_months} tháng Lỗ</div>
+            <div style="font-size: 16px; font-weight: bold; color: #888; text-align: left; margin-top: 4px;">Tỷ lệ: {win_month_ratio:.1f}% tháng lãi</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    st.markdown("<br>", unsafe_allow_html=True)
+
     # ── STEP 2: EQUITY & DRAWDOWN ────────────────────────────
     st.header("2️⃣ Đường Cong Vốn & Drawdown")
     fig_eq = chart_equity_dd(trades)
-    if fig_eq: st.plotly_chart(fig_eq, use_container_width=True)
+    if fig_eq: st.plotly_chart(fig_eq, width='stretch')
 
     # ── Monthly Heatmap + Scatter ─────────────────────────────
     st.header("3️⃣ Trực Quan Hóa (Visualization)")
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("📅 Heatmap Lợi Nhuận Tháng/Năm")
-        st.plotly_chart(chart_monthly_heatmap(trades), use_container_width=True)
+        st.plotly_chart(chart_monthly_heatmap(trades), width='stretch')
     with c2:
         st.subheader("🎯 Scatter Plot Lệnh")
-        st.plotly_chart(chart_scatter_rr(trades), use_container_width=True)
+        st.plotly_chart(chart_scatter_rr(trades), width='stretch')
 
     # ── Time Analysis ─────────────────────────────────────────
     st.header("4️⃣ Phân Tích Thời Gian (Time-Series)")
@@ -445,17 +691,17 @@ def main():
     with c1:
         st.subheader("⏰ Lợi nhuận theo Giờ")
         fig_h = chart_hourly(trades)
-        if fig_h: st.plotly_chart(fig_h, use_container_width=True)
+        if fig_h: st.plotly_chart(fig_h, width='stretch')
     with c2:
         st.subheader("📆 Lợi nhuận theo Thứ")
         fig_d = chart_dow(trades)
-        if fig_d: st.plotly_chart(fig_d, use_container_width=True)
+        if fig_d: st.plotly_chart(fig_d, width='stretch')
 
     # ── Duration Analysis ─────────────────────────────────────
     fig_dur = chart_duration(trades)
     if fig_dur:
         st.subheader("⏱️ Thời gian giữ lệnh vs Profit")
-        st.plotly_chart(fig_dur, use_container_width=True)
+        st.plotly_chart(fig_dur, width='stretch')
 
     # ── STEP 3: ADVANCED QUANT ────────────────────────────────
     st.header("5️⃣ Phân Tích Chuyên Sâu (Quant Insights)")
@@ -464,7 +710,7 @@ def main():
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("📊 Phân Phối Lợi Nhuận & KS Test")
-        st.plotly_chart(chart_profit_distribution(profits), use_container_width=True)
+        st.plotly_chart(chart_profit_distribution(profits), width='stretch')
         ks_stat, ks_pval = run_ks_test(profits)
         if ks_pval < 0.05:
             st.warning(f"**KS Test**: D={ks_stat:.4f}, p={ks_pval:.4e} → Phân phối **KHÔNG phải Normal**. "
@@ -486,7 +732,7 @@ def main():
         fig_mc.update_layout(height=350, template='plotly_dark',
                              xaxis_title='Final Equity ($)', yaxis_title='Count',
                              margin=dict(l=50, r=20, t=30, b=30))
-        st.plotly_chart(fig_mc, use_container_width=True)
+        st.plotly_chart(fig_mc, width='stretch')
 
         risk_of_ruin = (mc['final_equity'] <= init_bal * 0.5).mean() * 100
         median_eq = mc['final_equity'].median()
@@ -528,7 +774,7 @@ def main():
         fig_dir.update_layout(height=350, template='plotly_dark', barmode='group',
                               title='Lợi Nhuận Theo Hướng Giao Dịch', margin=dict(l=50, r=20, t=40, b=30))
         with c1:
-            st.plotly_chart(fig_dir, use_container_width=True)
+            st.plotly_chart(fig_dir, width='stretch')
             
         # Monthly Regime Analysis
         df_monthly = trades.copy()
@@ -719,6 +965,35 @@ def main():
 
     for ins in insights:
         st.markdown(ins)
+
+    # ── SIDEBAR EXPORT BUTTON ──
+    st.sidebar.markdown("---")
+    st.sidebar.header("📤 Xuất Báo Cáo Markdown")
+    
+    streaks = (avg_win_streak, max_win_streak, avg_loss_streak, max_loss_streak)
+    daily_streaks = (avg_win_days, max_win_days, avg_loss_days, max_loss_days)
+    monthly = (win_months, loss_months, win_month_ratio)
+    
+    report_md = generate_markdown_report(selected, m, streaks, daily_streaks, monthly, insights_loss, insights)
+    
+    # Download button for browser download
+    st.sidebar.download_button(
+        label="📥 Tải Báo Cáo (.md)",
+        data=report_md,
+        file_name=f"{os.path.splitext(selected)[0]}_report.md",
+        mime="text/markdown"
+    )
+    
+    # Save button to write directly to workspace backtest result folder
+    if st.sidebar.button("💾 Lưu báo cáo vào thư mục"):
+        report_filename = f"{os.path.splitext(selected)[0]}_report.md"
+        report_path = os.path.join(BACKTEST_DIR, report_filename)
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(report_md)
+            st.sidebar.success(f"Đã lưu báo cáo tại: `backtest result/{report_filename}`")
+        except Exception as e:
+            st.sidebar.error(f"Lỗi khi lưu báo cáo: {e}")
 
 if __name__ == '__main__':
     from streamlit.runtime import exists
