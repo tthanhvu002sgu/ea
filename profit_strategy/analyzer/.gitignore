@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 backtest result/
 .env
+*.csv
+*.cache.pkl
