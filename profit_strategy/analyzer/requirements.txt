@@ -5,6 +5,6 @@ scipy
 openpyxl
 google-api-python-client
 google-auth
-g o o g l e - a u t h - o a u t h l i b  
+google-auth-oauthlib
 scikit-learn>=1.0
- 
+yfinance
