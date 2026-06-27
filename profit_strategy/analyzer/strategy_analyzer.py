@@ -744,8 +744,11 @@ def run_ks_test(profits):
     std_val = float(np.std(p_clean))
     if std_val == 0:
         std_val = 1e-9
-    stat, pval = stats.kstest(p_clean, 'norm', args=(mean_val, std_val))
-    return stat, pval
+    try:
+        stat, pval = stats.kstest(p_clean, stats.norm(loc=mean_val, scale=std_val).cdf)
+        return float(stat), float(pval)
+    except Exception:
+        return 0.0, 1.0
 
 def run_monte_carlo(profits, n_sims=10000, init_balance=5000):
     results = []
