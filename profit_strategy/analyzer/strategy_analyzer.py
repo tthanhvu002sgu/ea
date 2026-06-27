@@ -1411,74 +1411,103 @@ def main():
                     st.info("Chưa có dữ liệu phân vùng cho chiến lược này. Vui lòng chạy lại huấn luyện DNA bên dưới để cập nhật.")
 
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
-    ohlc_files = sorted(glob.glob(os.path.join(workspace_dir, "*M1*.csv")) + glob.glob(os.path.join(workspace_dir, "*H1*.csv")))
+    
+    ohlc_upload = st.file_uploader("📥 Tải lên file dữ liệu giá OHLC (.csv) từ máy của bạn:", type=["csv"])
+    if ohlc_upload is not None:
+        save_ohlc_path = os.path.join(workspace_dir, ohlc_upload.name)
+        with open(save_ohlc_path, "wb") as f:
+            f.write(ohlc_upload.getbuffer())
+        st.success(f"Đã lưu file OHLC lên server: `{ohlc_upload.name}`")
+        
+    ohlc_files = sorted(glob.glob(os.path.join(workspace_dir, "*M1*.csv")) + glob.glob(os.path.join(workspace_dir, "*H1*.csv")) + glob.glob(os.path.join(workspace_dir, "XAUUSD*.csv")))
     ohlc_names = [os.path.basename(f) for f in ohlc_files]
-
-    if not ohlc_names:
-        st.warning("⚠️ Không tìm thấy tệp dữ liệu giá OHLC (M1/H1 CSV) nào trong Thư mục dự án để soi bối cảnh.")
+    
+    ohlc_source_mode = st.radio("🔌 Nguồn lấy lịch sử giá OHLC để soi bối cảnh:", ["🌐 Tải từ Yahoo Finance API (Tự động & Khuyên dùng)", "📂 Chọn file CSV (Đã tải lên hoặc có sẵn)"], horizontal=True)
+    
+    ohlc_ref_name = ""
+    sel_ohlc = None
+    
+    if ohlc_source_mode == "🌐 Tải từ Yahoo Finance API (Tự động & Khuyên dùng)":
+        col_ps1, col_ps2 = st.columns([2, 1])
+        prof_symbol = col_ps1.text_input("Nhập mã giao dịch (Symbol trên Yahoo Finance):", value="GC=F", help="Ví dụ: GC=F (Vàng Futures), EURUSD=X (Forex EURUSD), BTC-USD")
+        prof_period = col_ps2.selectbox("Thời gian lịch sử:", ["2y", "1y", "5y", "60d"], index=0, help="Nên chọn 2y hoặc 5y để khớp tốt nhất với lịch sử backtest")
+        ohlc_ref_name = f"Yahoo_{prof_symbol}_{prof_period}"
     else:
-        sel_ohlc = st.selectbox("📥 Chọn tệp lịch sử giá OHLC tương ứng để giải mã (hoặc làm mới) DNA:", ohlc_names)
-        ohlc_path = ohlc_files[ohlc_names.index(sel_ohlc)]
-        
-        prof_col1, prof_col2 = st.columns([1, 3])
-        max_depth_input = prof_col1.number_input("Độ sâu cây AI (Max Depth)", min_value=1, max_value=5, value=3)
-        timeframe_sel = prof_col1.selectbox("Khung thời gian soi bối cảnh", ["1h", "4h"], index=0)
-        
-        if st.button("🚀 Huấn luyện AI & Bốc tách Luật Regime DNA", type="primary"):
-            with st.spinner(f"Đang nạp OHLC & tính toán 12+ chỉ số bối cảnh trên khung {timeframe_sel} (sử dụng Cache nếu có)..."):
-                try:
-                    cache_p = os.path.join(BACKTEST_DIR, f"{os.path.splitext(sel_ohlc)[0]}_{timeframe_sel}_indicators.cache.pkl")
+        if not ohlc_names:
+            st.warning("⚠️ Chưa có file CSV nào trên server. Vui lòng sử dụng tính năng tải lên file CSV ở trên.")
+        else:
+            sel_ohlc = st.selectbox("📥 Chọn file CSV có sẵn trên hệ thống:", ohlc_names)
+            ohlc_ref_name = sel_ohlc
+            
+    prof_col3, prof_col4 = st.columns([1, 2])
+    max_depth_input = prof_col3.number_input("Độ sâu cây AI (Max Depth)", min_value=1, max_value=5, value=3)
+    timeframe_sel = prof_col4.selectbox("Khung thời gian soi bối cảnh", ["1h", "4h"], index=0)
+    
+    if st.button("🚀 Huấn luyện AI & Bốc tách Luật Regime DNA", type="primary"):
+        with st.spinner("Đang chuẩn bị dữ liệu lịch sử giá & tính toán 12+ chỉ số bối cảnh..."):
+            try:
+                if ohlc_source_mode == "🌐 Tải từ Yahoo Finance API (Tự động & Khuyên dùng)":
+                    df_tf, err_msg = regime_analyzer.fetch_historical_ohlc(prof_symbol, timeframe=timeframe_sel, period=prof_period)
+                    if err_msg or df_tf is None or df_tf.empty:
+                        st.error(f"❌ Lỗi tải dữ liệu từ Yahoo Finance: {err_msg or 'Không có dữ liệu.'}")
+                        return
+                else:
+                    if not sel_ohlc:
+                        st.error("❌ Vui lòng chọn hoặc tải lên file CSV trước.")
+                        return
+                    ohlc_path = ohlc_files[ohlc_names.index(sel_ohlc)]
                     df_m1 = regime_analyzer.load_ohlc(ohlc_path)
                     df_tf = regime_analyzer.resample_ohlc(df_m1, timeframe_sel)
-                    dna_res = regime_analyzer.extract_strategy_dna(df_tf, trades, max_depth=max_depth_input, cache_path=cache_p, strategy_name=selected)
+                
+                cache_p = os.path.join(BACKTEST_DIR, f"{ohlc_ref_name}_{timeframe_sel}_indicators.cache.pkl")
+                dna_res = regime_analyzer.extract_strategy_dna(df_tf, trades, max_depth=max_depth_input, cache_path=cache_p, strategy_name=selected)
+                
+                if "error" in dna_res:
+                    st.error(dna_res["error"])
+                else:
+                    regime_analyzer.save_regime_registry(selected, dna_res, ohlc_ref_name, timeframe_sel)
+                    st.success(f"✅ Giải mã thành công & đã tự động lưu vào Registry! Độ chính xác Train: **{dna_res['accuracy']*100:.1f}%** | Cross-Validation: **{dna_res.get('cv_accuracy', 0)*100:.1f}%** (Dựa trên {dna_res['sample_count']} nến giao dịch).")
+                    if dna_res.get('cv_accuracy', 0) >= 0.65:
+                        st.info("🛡️ **Anti-Overfitting Verified**: Điểm kiểm định chéo K-Fold đạt mức cao và ổn định, bộ lọc đảm bảo không bị overfit vào dữ liệu nhiễu ngẫu nhiên.")
+                    if dna_res.get("features_csv_path"):
+                        st.info(f"💾 Đã xuất toàn bộ bảng chỉ số bối cảnh cho từng lệnh ra file CSV: `{dna_res['features_csv_path']}`")
                     
-                    if "error" in dna_res:
-                        st.error(dna_res["error"])
-                    else:
-                        regime_analyzer.save_regime_registry(selected, dna_res, sel_ohlc, timeframe_sel)
-                        st.success(f"✅ Giải mã thành công & đã tự động lưu vào Registry! Độ chính xác Train: **{dna_res['accuracy']*100:.1f}%** | Cross-Validation: **{dna_res.get('cv_accuracy', 0)*100:.1f}%** (Dựa trên {dna_res['sample_count']} nến giao dịch).")
-                        if dna_res.get('cv_accuracy', 0) >= 0.65:
-                            st.info("🛡️ **Anti-Overfitting Verified**: Điểm kiểm định chéo K-Fold đạt mức cao và ổn định, bộ lọc đảm bảo không bị overfit vào dữ liệu nhiễu ngẫu nhiên.")
-                        if dna_res.get("features_csv_path"):
-                            st.info(f"💾 Đã xuất toàn bộ bảng chỉ số bối cảnh cho từng lệnh ra file CSV: `{dna_res['features_csv_path']}`")
+                    dna_tab1, dna_tab2, dna_tab3, dna_tab4 = st.tabs(["💻 Code MQL5 Bộ Lọc", "📊 Cây Quyết Định (Text)", "⚖️ Đối Chiếu Thắng vs Thua", "📏 Phân Vùng Lãi/Lỗ (Range Analysis)"])
+                    
+                    with dna_tab1:
+                        st.markdown("Copy toàn bộ câu lệnh điều kiện dưới đây gắn vào đầu hàm `OnTick()` của EA trên MT5:")
+                        st.code(dna_res["mql5_code"], language="mql5")
                         
-                        dna_tab1, dna_tab2, dna_tab3, dna_tab4 = st.tabs(["💻 Code MQL5 Bộ Lọc", "📊 Cây Quyết Định (Text)", "⚖️ Đối Chiếu Thắng vs Thua", "📏 Phân Vùng Lãi/Lỗ (Range Analysis)"])
+                    with dna_tab2:
+                        st.text(dna_res["tree_text"])
+                        if dna_res.get("top_features"):
+                            st.markdown("**Các Đặc Trưng Quan Trọng Nhất (Feature Importances):**")
+                            imp_df = pd.DataFrame(list(dna_res["top_features"].items()), columns=["Chỉ số", "Tầm quan trọng"]).sort_values("Tầm quan trọng", ascending=False)
+                            st.dataframe(imp_df, hide_index=True)
+                            
+                    with dna_tab3:
+                        st.markdown("**Bảng Đối Chiếu Trung Bình Đặc Trưng Thị Trường:**")
+                        contrast_df = pd.DataFrame({
+                            "Chỉ số Bối Cảnh": list(dna_res["win_context"].keys()),
+                            "Khi EA THẮNG (Mean)": list(dna_res["win_context"].values()),
+                            "Khi EA THUA (Mean)": [dna_res["loss_context"].get(k, 0) for k in dna_res["win_context"].keys()]
+                        })
+                        contrast_df["Chênh Lệch"] = contrast_df["Khi EA THẮNG (Mean)"] - contrast_df["Khi EA THUA (Mean)"]
+                        st.dataframe(contrast_df.style.background_gradient(subset=["Chênh Lệch"], cmap="RdYlGn"), hide_index=True)
                         
-                        with dna_tab1:
-                            st.markdown("Copy toàn bộ câu lệnh điều kiện dưới đây gắn vào đầu hàm `OnTick()` của EA trên MT5:")
-                            st.code(dna_res["mql5_code"], language="mql5")
-                            
-                        with dna_tab2:
-                            st.text(dna_res["tree_text"])
-                            if dna_res.get("top_features"):
-                                st.markdown("**Các Đặc Trưng Quan Trọng Nhất (Feature Importances):**")
-                                imp_df = pd.DataFrame(list(dna_res["top_features"].items()), columns=["Chỉ số", "Tầm quan trọng"]).sort_values("Tầm quan trọng", ascending=False)
-                                st.dataframe(imp_df, hide_index=True)
-                                
-                        with dna_tab3:
-                            st.markdown("**Bảng Đối Chiếu Trung Bình Đặc Trưng Thị Trường:**")
-                            contrast_df = pd.DataFrame({
-                                "Chỉ số Bối Cảnh": list(dna_res["win_context"].keys()),
-                                "Khi EA THẮNG (Mean)": list(dna_res["win_context"].values()),
-                                "Khi EA THUA (Mean)": [dna_res["loss_context"].get(k, 0) for k in dna_res["win_context"].keys()]
-                            })
-                            contrast_df["Chênh Lệch"] = contrast_df["Khi EA THẮNG (Mean)"] - contrast_df["Khi EA THUA (Mean)"]
-                            st.dataframe(contrast_df.style.background_gradient(subset=["Chênh Lệch"], cmap="RdYlGn"), hide_index=True)
-                            
-                        with dna_tab4:
-                            range_data = dna_res.get("range_analysis", {})
-                            if range_data:
-                                st.markdown("Phân rã các chỉ số quan trọng thành từng vùng (Range/Bin) để tránh overfit vào một ngưỡng cắt duy nhất:")
-                                for feat_name, zones in range_data.items():
-                                    st.markdown(f"**🔹 Chỉ số: `{feat_name}`**")
-                                    z_df = pd.DataFrame(zones)
-                                    z_df = z_df.rename(columns={"range": "Vùng giá trị (Bin)", "total_trades": "Tổng số lệnh", "win_count": "Số lệnh Thắng", "win_rate": "Tỷ lệ Thắng (%)"})
-                                    st.dataframe(z_df.style.background_gradient(subset=["Tỷ lệ Thắng (%)"], cmap="RdYlGn"), hide_index=True)
-                            else:
-                                st.info("Không có thông tin phân vùng cho chiến lược này.")
-                                
-                except Exception as e:
-                    st.error(f"Lỗi khi giải mã DNA: {e}")
+                    with dna_tab4:
+                        range_data = dna_res.get("range_analysis", {})
+                        if range_data:
+                            st.markdown("Phân rã các chỉ số quan trọng thành từng vùng (Range/Bin) để tránh overfit vào một ngưỡng cắt duy nhất:")
+                            for feat_name, zones in range_data.items():
+                                st.markdown(f"**🔹 Chỉ số: `{feat_name}`**")
+                                z_df = pd.DataFrame(zones)
+                                z_df = z_df.rename(columns={"range": "Vùng giá trị (Bin)", "total_trades": "Tổng số lệnh", "win_count": "Số lệnh Thắng", "win_rate": "Tỷ lệ Thắng (%)"})
+                                st.dataframe(z_df.style.background_gradient(subset=["Tỷ lệ Thắng (%)"], cmap="RdYlGn"), hide_index=True)
+                        else:
+                            st.info("Không có thông tin phân vùng cho chiến lược này.")
+            except Exception as e:
+                st.error(f"Lỗi khi giải mã DNA: {e}")
 
     # ── SIDEBAR EXPORT BUTTON ──
     st.sidebar.markdown("---")

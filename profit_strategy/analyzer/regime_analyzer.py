@@ -537,6 +537,40 @@ def fetch_live_ohlc(source_type, symbol="XAUUSD=X", timeframe="1h", limit=500):
     return None, "Nguồn dữ liệu không hợp lệ."
 
 
+def fetch_historical_ohlc(symbol="XAUUSD=X", timeframe="1h", period="2y"):
+    """
+    Fetches historical OHLC data from Yahoo Finance for strategy profiling.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None, "Thiếu gói yfinance."
+    
+    interval_map = {"1h": "1h", "4h": "1h", "15m": "15m", "5m": "5m", "1d": "1d"}
+    yf_interval = interval_map.get(timeframe, "1h")
+    
+    if yf_interval in ["15m", "5m"]:
+        period = "60d"
+        
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval=yf_interval)
+        if df.empty:
+            return None, f"Không lấy được dữ liệu từ Yahoo Finance cho mã {symbol}."
+        
+        df = df.rename(columns={"Volume": "TickVol"})
+        df.index.name = "Time"
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        
+        if timeframe == "4h" and yf_interval == "1h":
+            df = resample_ohlc(df, "4h")
+        return df, None
+    except Exception as e:
+        return None, f"Lỗi Yahoo Finance: {str(e)}"
+
+
+
 def evaluate_live_market(df_h1, registry_data):
     """
     Evaluates current live market regime (latest candle) against saved strategies in registry.
