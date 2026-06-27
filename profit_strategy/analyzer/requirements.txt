@@ -8,3 +8,4 @@ google-auth
 google-auth-oauthlib
 scikit-learn>=1.0
 yfinance
+matplotlib
