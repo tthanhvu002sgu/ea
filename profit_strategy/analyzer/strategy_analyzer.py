@@ -737,7 +737,14 @@ def chart_duration(trades):
 # ADVANCED ANALYSIS
 # ============================================================
 def run_ks_test(profits):
-    stat, pval = stats.kstest(profits, 'norm', args=(profits.mean(), profits.std()))
+    p_clean = np.asarray(profits.dropna(), dtype=float)
+    if len(p_clean) < 3:
+        return 0.0, 1.0
+    mean_val = float(np.mean(p_clean))
+    std_val = float(np.std(p_clean))
+    if std_val == 0:
+        std_val = 1e-9
+    stat, pval = stats.kstest(p_clean, 'norm', args=(mean_val, std_val))
     return stat, pval
 
 def run_monte_carlo(profits, n_sims=10000, init_balance=5000):
