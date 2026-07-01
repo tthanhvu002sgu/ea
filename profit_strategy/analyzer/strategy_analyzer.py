@@ -942,6 +942,8 @@ def main():
                 sync_drive(service, drive_folder_id, BACKTEST_DIR)
             st.sidebar.success("Đồng bộ hoàn tất!")
             st.rerun()
+    else:
+        st.sidebar.warning("☁️ Google Drive chưa được cấu hình. Vui lòng thêm drive_folder_id và gcp_service_account vào Streamlit Secrets để đồng bộ dữ liệu.")
     
     st.sidebar.header("📥 Thêm Dữ Liệu Mới")
     uploaded_file = st.sidebar.file_uploader("Tải lên file Backtest (CSV, XLSX)", type=['csv', 'xlsx', 'xls'])
