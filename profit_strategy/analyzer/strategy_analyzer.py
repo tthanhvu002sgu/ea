@@ -79,9 +79,10 @@ def get_drive_service():
         
     return None
 
-def sync_drive(service, folder_id, local_dir):
+def sync_drive(service, folder_id, local_dir, force_upload_file=None):
     try:
-        # Download from Drive
+        os.makedirs(local_dir, exist_ok=True)
+        # Download từ Drive danh sách file hiện có
         results = service.files().list(
             q=f"'{folder_id}' in parents and trashed=false", 
             fields="files(id, name)",
@@ -89,6 +90,27 @@ def sync_drive(service, folder_id, local_dir):
             includeItemsFromAllDrives=True
         ).execute()
         drive_files = {item['name']: item['id'] for item in results.get('files', [])}
+        
+        # Ưu tiên đẩy file vừa tải lên (hoặc cập nhật nếu đã tồn tại tên file)
+        if force_upload_file and os.path.exists(force_upload_file):
+            name = os.path.basename(force_upload_file)
+            media = MediaFileUpload(force_upload_file, resumable=True)
+            if name in drive_files:
+                service.files().update(
+                    fileId=drive_files[name],
+                    media_body=media,
+                    supportsAllDrives=True
+                ).execute()
+            else:
+                res = service.files().create(
+                    body={'name': name, 'parents': [folder_id]}, 
+                    media_body=media, 
+                    fields='id',
+                    supportsAllDrives=True
+                ).execute()
+                drive_files[name] = res.get('id')
+        
+        # Download từ Drive về local nếu chưa có
         for name, file_id in drive_files.items():
             local_path = os.path.join(local_dir, name)
             if not os.path.exists(local_path):
@@ -98,10 +120,10 @@ def sync_drive(service, folder_id, local_dir):
                     done = False
                     while not done: _, done = downloader.next_chunk()
         
-        # Upload new local files to Drive
+        # Upload các file local mới chưa có trên Drive (loại trừ file cache tạm thời)
         for f in glob.glob(os.path.join(local_dir, "*.*")):
             name = os.path.basename(f)
-            if name not in drive_files:
+            if name not in drive_files and not name.endswith(".cache.pkl"):
                 media = MediaFileUpload(f, resumable=True)
                 service.files().create(
                     body={'name': name, 'parents': [folder_id]}, 
@@ -909,24 +931,32 @@ def main():
     drive_folder_id = get_secret("drive_folder_id")
     
     if service and drive_folder_id:
+        # Tự động đồng bộ từ Google Drive về local container ngay lần đầu khởi động phiên
+        if not st.session_state.get("auto_synced_drive", False):
+            with st.spinner("☁️ Đang tự động đồng bộ dữ liệu từ Google Drive..."):
+                sync_drive(service, drive_folder_id, BACKTEST_DIR)
+            st.session_state["auto_synced_drive"] = True
+
         if st.sidebar.button("🔄 Đồng bộ dữ liệu với Drive"):
-            with st.spinner("Đang đồng bộ..."):
+            with st.spinner("Đang đồng bộ 2 chiều..."):
                 sync_drive(service, drive_folder_id, BACKTEST_DIR)
             st.sidebar.success("Đồng bộ hoàn tất!")
-            
-        # Optional: Auto-sync on startup could be added here, but button is safer
+            st.rerun()
     
     st.sidebar.header("📥 Thêm Dữ Liệu Mới")
     uploaded_file = st.sidebar.file_uploader("Tải lên file Backtest (CSV, XLSX)", type=['csv', 'xlsx', 'xls'])
     if uploaded_file is not None:
-        save_path = os.path.join(BACKTEST_DIR, uploaded_file.name)
-        with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.sidebar.success(f"Đã lưu thành công: {uploaded_file.name}")
-        # Auto-upload to Drive if available
-        if service and drive_folder_id:
-            with st.spinner("Đang lưu trữ đám mây..."):
-                sync_drive(service, drive_folder_id, BACKTEST_DIR)
+        file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.get("last_uploaded_key") != file_key:
+            save_path = os.path.join(BACKTEST_DIR, uploaded_file.name)
+            with open(save_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.sidebar.success(f"Đã lưu thành công: {uploaded_file.name}")
+            # Tự động đẩy file vừa tải lên sang Google Drive (cập nhật nếu đã có)
+            if service and drive_folder_id:
+                with st.spinner("☁️ Đang lưu trữ lên Google Drive..."):
+                    sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=save_path)
+            st.session_state["last_uploaded_key"] = file_key
 
     st.sidebar.markdown("---")
     st.sidebar.header("⚙️ Bộ Lọc Giai Đoạn Đi Ngang")
