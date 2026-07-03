@@ -584,9 +584,14 @@ def fetch_live_ohlc(source_type, symbol="XAUUSD=X", timeframe="1h", limit=500):
         return df, None
 
     elif source_type.startswith("File CSV"):
-        if not os.path.exists(symbol):
-            return None, f"File {symbol} không tồn tại."
-        df_m1 = load_ohlc(symbol)
+        target = symbol
+        if not os.path.exists(target):
+            alt_target = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest result", os.path.basename(symbol))
+            if os.path.exists(alt_target):
+                target = alt_target
+            else:
+                return None, f"File {symbol} không tồn tại."
+        df_m1 = load_ohlc(target)
         df = resample_ohlc(df_m1, timeframe)
         return df.tail(limit), None
         

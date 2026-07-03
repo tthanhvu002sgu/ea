@@ -839,7 +839,8 @@ def main():
             
         watchlist = regime_analyzer.load_live_watchlist()
         workspace_dir = os.path.dirname(os.path.abspath(__file__))
-        ohlc_files = sorted(glob.glob(os.path.join(workspace_dir, "*M1*.csv")) + glob.glob(os.path.join(workspace_dir, "*H1*.csv")))
+        raw_ohlc = sorted(list(set(glob.glob(os.path.join(workspace_dir, "*.csv")) + glob.glob(os.path.join(BACKTEST_DIR, "*.csv")))))
+        ohlc_files = [f for f in raw_ohlc if not f.endswith("_regime_features.csv")]
         ohlc_names = [f"File CSV: {os.path.basename(f)}" for f in ohlc_files]
         src_options = ["Yahoo Finance API (REST API)", "MetaTrader 5 (Direct Terminal Bridge)"] + ohlc_names
         
@@ -898,7 +899,11 @@ def main():
             
             with st.container():
                 st.markdown(f"### 📡 Mã: `{sym}` | Khung: `{tf}` | Nguồn: `{src}`")
-                target_sym = os.path.join(workspace_dir, sym) if src.startswith("File CSV") else sym
+                target_sym = sym
+                if src.startswith("File CSV"):
+                    p_work = os.path.join(workspace_dir, sym)
+                    p_back = os.path.join(BACKTEST_DIR, sym)
+                    target_sym = p_work if os.path.exists(p_work) else p_back
                 with st.spinner(f"Đang kéo dữ liệu live & tính toán bối cảnh cho {sym}..."):
                     df_live, err_msg = regime_analyzer.fetch_live_ohlc(src, target_sym, tf)
                 
@@ -1481,12 +1486,22 @@ def main():
     
     ohlc_upload = st.file_uploader("📥 Tải lên file dữ liệu giá OHLC (.csv) từ máy của bạn:", type=["csv"])
     if ohlc_upload is not None:
-        save_ohlc_path = os.path.join(workspace_dir, ohlc_upload.name)
-        with open(save_ohlc_path, "wb") as f:
-            f.write(ohlc_upload.getbuffer())
-        st.success(f"Đã lưu file OHLC lên server: `{ohlc_upload.name}`")
+        file_key_ohlc = f"{ohlc_upload.name}_{ohlc_upload.size}"
+        if st.session_state.get("last_ohlc_key") != file_key_ohlc:
+            save_ohlc_path = os.path.join(BACKTEST_DIR, ohlc_upload.name)
+            with open(save_ohlc_path, "wb") as f:
+                f.write(ohlc_upload.getbuffer())
+            with open(os.path.join(workspace_dir, ohlc_upload.name), "wb") as f:
+                f.write(ohlc_upload.getbuffer())
+            st.success(f"Đã lưu file OHLC lên server: `{ohlc_upload.name}`")
+            if service and drive_folder_id:
+                with st.spinner("☁️ Đang đồng bộ file OHLC sang Google Drive..."):
+                    sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=save_ohlc_path)
+            st.session_state["last_ohlc_key"] = file_key_ohlc
         
-    ohlc_files = sorted(glob.glob(os.path.join(workspace_dir, "*M1*.csv")) + glob.glob(os.path.join(workspace_dir, "*H1*.csv")) + glob.glob(os.path.join(workspace_dir, "XAUUSD*.csv")))
+    raw_ohlc = sorted(list(set(glob.glob(os.path.join(workspace_dir, "*.csv")) + glob.glob(os.path.join(BACKTEST_DIR, "*.csv")))))
+    exclude_csvs = set(files)
+    ohlc_files = [f for f in raw_ohlc if f not in exclude_csvs and not f.endswith("_regime_features.csv")]
     ohlc_names = [os.path.basename(f) for f in ohlc_files]
     
     ohlc_source_mode = st.radio("🔌 Nguồn lấy lịch sử giá OHLC để soi bối cảnh:", ["🌐 Tải từ Yahoo Finance API (Tự động & Khuyên dùng)", "📂 Chọn file CSV (Đã tải lên hoặc có sẵn)"], horizontal=True)
