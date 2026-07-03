@@ -82,22 +82,39 @@ def get_drive_service():
 def sync_drive(service, folder_id, local_dir, force_upload_file=None):
     try:
         os.makedirs(local_dir, exist_ok=True)
-        # Download từ Drive danh sách file hiện có
-        results = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false", 
-            fields="files(id, name)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
-        drive_files = {item['name']: item['id'] for item in results.get('files', [])}
+        # Download từ Drive danh sách file hiện có (xử lý phân trang nextPageToken và chọn file mới nhất nếu trùng tên)
+        drive_files = {}
+        page_token = None
+        while True:
+            results = service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false", 
+                fields="nextPageToken, files(id, name, modifiedTime)",
+                pageSize=1000,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
+            ).execute()
+            for item in results.get('files', []):
+                name = item.get('name')
+                if not name:
+                    continue
+                mod_time = item.get('modifiedTime', '')
+                # Nếu có nhiều file trùng tên trên Drive, ưu tiên lấy bản có modifiedTime mới nhất
+                if name not in drive_files or mod_time > drive_files[name].get('modifiedTime', ''):
+                    drive_files[name] = {'id': item['id'], 'modifiedTime': mod_time}
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
         
-        # Ưu tiên đẩy file vừa tải lên (hoặc cập nhật nếu đã tồn tại tên file)
+        file_id_map = {name: info['id'] for name, info in drive_files.items()}
+        
+        # Ưu tiên đẩy file vừa tải lên/lưu mới (hoặc cập nhật nếu đã tồn tại tên file)
         if force_upload_file and os.path.exists(force_upload_file):
             name = os.path.basename(force_upload_file)
             media = MediaFileUpload(force_upload_file, resumable=True)
-            if name in drive_files:
+            if name in file_id_map:
                 service.files().update(
-                    fileId=drive_files[name],
+                    fileId=file_id_map[name],
                     media_body=media,
                     supportsAllDrives=True
                 ).execute()
@@ -108,12 +125,18 @@ def sync_drive(service, folder_id, local_dir, force_upload_file=None):
                     fields='id',
                     supportsAllDrives=True
                 ).execute()
-                drive_files[name] = res.get('id')
+                file_id_map[name] = res.get('id')
         
-        # Download từ Drive về local nếu chưa có
-        for name, file_id in drive_files.items():
+        # Download từ Drive về local
+        critical_json_files = {"strategy_regime_registry.json", "live_watchlist.json", "live_monitor_history.json"}
+        for name, file_id in file_id_map.items():
             local_path = os.path.join(local_dir, name)
-            if not os.path.exists(local_path):
+            should_download = not os.path.exists(local_path) or os.path.getsize(local_path) == 0
+            # Khi đồng bộ chung (force_upload_file is None), luôn tải các file cấu hình JSON quan trọng từ Drive nếu trên Drive có
+            if not force_upload_file and name in critical_json_files:
+                should_download = True
+                
+            if should_download:
                 request = service.files().get_media(fileId=file_id)
                 with io.FileIO(local_path, 'wb') as fh:
                     downloader = MediaIoBaseDownload(fh, request)
@@ -123,7 +146,7 @@ def sync_drive(service, folder_id, local_dir, force_upload_file=None):
         # Upload các file local mới chưa có trên Drive (loại trừ file cache tạm thời)
         for f in glob.glob(os.path.join(local_dir, "*.*")):
             name = os.path.basename(f)
-            if name not in drive_files and not name.endswith(".cache.pkl"):
+            if name not in file_id_map and not name.endswith(".cache.pkl"):
                 media = MediaFileUpload(f, resumable=True)
                 service.files().create(
                     body={'name': name, 'parents': [folder_id]}, 
