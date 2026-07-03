@@ -49,28 +49,49 @@ def get_drive_service():
     creds = None
 
     try:
-        # Phương án 1: OAuth 2.0 User Flow (Dùng cho Google Drive cá nhân)
-        if os.path.exists('token.pickle'):
+        from google.oauth2.credentials import Credentials as OAuthCredentials
+        
+        # Phương án 1: OAuth 2.0 User Flow từ Streamlit Cloud Secrets [google_oauth_token]
+        oauth_secret = get_secret("google_oauth_token")
+        if oauth_secret:
+            creds = OAuthCredentials.from_authorized_user_info(dict(oauth_secret), SCOPES)
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            if creds and creds.valid:
+                return build('drive', 'v3', credentials=creds)
+
+        # Phương án 2: OAuth 2.0 User Flow từ file local (token.json hoặc token.pickle)
+        if os.path.exists('token.json'):
+            creds = OAuthCredentials.from_authorized_user_file('token.json', SCOPES)
+        elif os.path.exists('token.pickle'):
             with open('token.pickle', 'rb') as token:
                 creds = pickle.load(token)
                 
-        if os.path.exists('credentials.json') and (not creds or not creds.valid):
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            if os.path.exists('token.json'):
+                with open('token.json', 'w', encoding='utf-8') as f:
+                    f.write(creds.to_json())
+            elif os.path.exists('token.pickle'):
+                with open('token.pickle', 'wb') as token:
+                    pickle.dump(creds, token)
+        elif not creds or not creds.valid:
+            if os.path.exists('credentials.json'):
                 flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
                 creds = flow.run_local_server(port=0)
-            with open('token.pickle', 'wb') as token:
-                pickle.dump(creds, token)
+                with open('token.json', 'w', encoding='utf-8') as f:
+                    f.write(creds.to_json())
+                with open('token.pickle', 'wb') as token:
+                    pickle.dump(creds, token)
                 
         if creds and creds.valid:
             return build('drive', 'v3', credentials=creds)
             
-        # Phương án 2: Service Account (Dành cho Shared Drives)
+        # Phương án 3: Service Account (Dành cho Shared Drives)
         gcp_account = get_secret("gcp_service_account")
         if gcp_account:
             creds = service_account.Credentials.from_service_account_info(
-                gcp_account, scopes=SCOPES
+                dict(gcp_account), scopes=SCOPES
             )
             return build('drive', 'v3', credentials=creds)
             
@@ -175,6 +196,19 @@ st.set_page_config(page_title="Strategy Analyzer", layout="wide", page_icon="�
 # ============================================================
 # DATA LOADING
 # ============================================================
+def is_ohlc_file(filepath):
+    if not str(filepath).lower().endswith('.csv') or str(filepath).endswith("_regime_features.csv"):
+        return False
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = [f.readline().lower() for _ in range(5)]
+            content = " ".join(lines)
+            if '<open>' in content or '\topen\t' in content or 'open,' in content or ',open' in content:
+                return True
+    except Exception:
+        pass
+    return False
+
 def get_mt5_metric(raw_df, label_str, header_idx):
     limit = min(header_idx, 80)
     for r in range(limit):
@@ -863,7 +897,7 @@ def main():
         watchlist = regime_analyzer.load_live_watchlist()
         workspace_dir = os.path.dirname(os.path.abspath(__file__))
         raw_ohlc = sorted(list(set(glob.glob(os.path.join(workspace_dir, "*.csv")) + glob.glob(os.path.join(BACKTEST_DIR, "*.csv")))))
-        ohlc_files = [f for f in raw_ohlc if not f.endswith("_regime_features.csv")]
+        ohlc_files = [f for f in raw_ohlc if is_ohlc_file(f)]
         ohlc_names = [f"File CSV: {os.path.basename(f)}" for f in ohlc_files]
         src_options = ["Yahoo Finance API (REST API)", "MetaTrader 5 (Direct Terminal Bridge)"] + ohlc_names
         
@@ -1031,9 +1065,10 @@ def main():
     st.sidebar.markdown("---")
 
     # File selector
-    files = sorted(glob.glob(os.path.join(BACKTEST_DIR, "*.xlsx")) +
-                   glob.glob(os.path.join(BACKTEST_DIR, "*.xls")) +
-                   glob.glob(os.path.join(BACKTEST_DIR, "*.csv")), reverse=True)
+    raw_files = sorted(glob.glob(os.path.join(BACKTEST_DIR, "*.xlsx")) +
+                       glob.glob(os.path.join(BACKTEST_DIR, "*.xls")) +
+                       glob.glob(os.path.join(BACKTEST_DIR, "*.csv")), reverse=True)
+    files = [f for f in raw_files if not is_ohlc_file(f) and not f.endswith("_regime_features.csv")]
     
     if not files:
         st.info("👋 Chào mừng bạn! Hệ thống chưa có dữ liệu.\n\n👉 Vui lòng sử dụng thanh công cụ bên trái (Sidebar) để **Tải lên file Backtest** (MT5 Report dạng Excel/CSV) và bắt đầu phân tích.")
@@ -1523,8 +1558,7 @@ def main():
             st.session_state["last_ohlc_key"] = file_key_ohlc
         
     raw_ohlc = sorted(list(set(glob.glob(os.path.join(workspace_dir, "*.csv")) + glob.glob(os.path.join(BACKTEST_DIR, "*.csv")))))
-    exclude_csvs = set(files)
-    ohlc_files = [f for f in raw_ohlc if f not in exclude_csvs and not f.endswith("_regime_features.csv")]
+    ohlc_files = [f for f in raw_ohlc if is_ohlc_file(f)]
     ohlc_names = [os.path.basename(f) for f in ohlc_files]
     
     ohlc_source_mode = st.radio("🔌 Nguồn lấy lịch sử giá OHLC để soi bối cảnh:", ["🌐 Tải từ Yahoo Finance API (Tự động & Khuyên dùng)", "📂 Chọn file CSV (Đã tải lên hoặc có sẵn)"], horizontal=True)

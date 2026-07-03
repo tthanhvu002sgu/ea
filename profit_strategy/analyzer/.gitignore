@@ -5,3 +5,6 @@ backtest result/
 .env
 *.csv
 *.cache.pkl
+credentials.json
+token.json
+token.pickle
