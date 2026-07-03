@@ -806,6 +806,25 @@ def main():
     # Ensure the directory exists
     os.makedirs(BACKTEST_DIR, exist_ok=True)
     
+    # ── GOOGLE DRIVE SYNC (Tự động tải về ngay khi khởi động) ──
+    service = get_drive_service()
+    drive_folder_id = get_secret("drive_folder_id")
+    
+    if service and drive_folder_id:
+        if not st.session_state.get("auto_synced_drive", False):
+            with st.spinner("☁️ Đang tự động đồng bộ dữ liệu từ Google Drive..."):
+                sync_drive(service, drive_folder_id, BACKTEST_DIR)
+            st.session_state["auto_synced_drive"] = True
+
+        if st.sidebar.button("🔄 Đồng bộ dữ liệu với Drive"):
+            with st.spinner("Đang đồng bộ 2 chiều..."):
+                sync_drive(service, drive_folder_id, BACKTEST_DIR)
+            st.sidebar.success("Đồng bộ hoàn tất!")
+            st.rerun()
+    else:
+        st.sidebar.warning("☁️ Google Drive chưa được cấu hình. Vui lòng thêm drive_folder_id và gcp_service_account vào Streamlit Secrets để đồng bộ dữ liệu.")
+
+    
     app_mode = st.sidebar.radio("🧭 Chế độ hiển thị", ["📊 Phân Tích & Tối Ưu DNA", "📡 Giám Sát Bối Cảnh Realtime (Live Monitor)"])
     if app_mode == "📡 Giám Sát Bối Cảnh Realtime (Live Monitor)":
         st.header("📡 Live Regime Monitor (Giám Sát Bối Cảnh Thời Gian Thực)")
@@ -840,6 +859,8 @@ def main():
                     if not any(w['symbol'] == sym_val and w['source'] == new_src and w['timeframe'] == new_tf for w in watchlist):
                         watchlist.append({"symbol": sym_val, "source": new_src, "timeframe": new_tf})
                         regime_analyzer.save_live_watchlist(watchlist)
+                        if service and drive_folder_id:
+                            sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.WATCHLIST_FILE)
                         st.success(f"Đã thêm `{sym_val}` ({new_tf}) vào Watchlist!")
                         st.rerun()
                     else:
@@ -854,6 +875,8 @@ def main():
                         if st.button(f"🗑️ Xóa {w_item['symbol']} ({w_item['timeframe']})", key=f"del_{idx}"):
                             watchlist.pop(idx)
                             regime_analyzer.save_live_watchlist(watchlist)
+                            if service and drive_folder_id:
+                                sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.WATCHLIST_FILE)
                             st.rerun()
 
         st.markdown("---")
@@ -885,6 +908,9 @@ def main():
                     continue
                     
                 eval_res = regime_analyzer.evaluate_live_market(df_live, registry_data)
+                logged = regime_analyzer.log_live_monitor_eval(sym, tf, eval_res)
+                if logged and service and drive_folder_id:
+                    sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.MONITOR_HISTORY_FILE)
                 latest_bar = eval_res.get("latest_bar", {})
                 latest_time = eval_res.get("latest_time", "N/A")
                 
@@ -920,30 +946,39 @@ def main():
                             st.markdown(f"- {r}")
                 st.markdown("---")
                 
+        history_records = regime_analyzer.load_live_monitor_history(limit=100)
+        if history_records:
+            with st.expander("📜 Lịch Sử Quét & Cảnh Báo Bối Cảnh (100 Lần Quét Gần Nhất)", expanded=False):
+                h_rows = []
+                for rec in reversed(history_records):
+                    row_dict = {
+                        "Thời gian nến": rec.get("latest_time", ""),
+                        "Thời gian quét": rec.get("timestamp_logged", ""),
+                        "Mã": rec.get("symbol", ""),
+                        "Khung": rec.get("timeframe", ""),
+                        "ADX": f"{rec.get('adx', 0):.1f}",
+                        "Hurst": f"{rec.get('hurst', 0.5):.2f}",
+                        "Choppiness": f"{rec.get('choppiness', 50):.1f}",
+                        "BB Width": f"{rec.get('bb_width', 0):.3f}"
+                    }
+                    for ea_name, ea_data in rec.get("evaluations", {}).items():
+                        st_icon = "🟢" if ea_data.get("status") == "PASS" else ("🟡" if ea_data.get("status") == "CAUTION" else "🔴")
+                        row_dict[f"EA {ea_name}"] = f"{st_icon} {ea_data.get('status')} ({ea_data.get('match_pct', 0)}%)"
+                    h_rows.append(row_dict)
+                st.dataframe(pd.DataFrame(h_rows), use_container_width=True)
+                
+                col_h1, _ = st.columns([1, 4])
+                if col_h1.button("🗑️ Xóa lịch sử Monitor"):
+                    regime_analyzer.save_live_monitor_history([])
+                    if service and drive_folder_id:
+                        sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.MONITOR_HISTORY_FILE)
+                    st.rerun()
+
         if auto_refresh:
             import time
             time.sleep(60)
             st.rerun()
         return
-    
-    # ── GOOGLE DRIVE SYNC ──
-    service = get_drive_service()
-    drive_folder_id = get_secret("drive_folder_id")
-    
-    if service and drive_folder_id:
-        # Tự động đồng bộ từ Google Drive về local container ngay lần đầu khởi động phiên
-        if not st.session_state.get("auto_synced_drive", False):
-            with st.spinner("☁️ Đang tự động đồng bộ dữ liệu từ Google Drive..."):
-                sync_drive(service, drive_folder_id, BACKTEST_DIR)
-            st.session_state["auto_synced_drive"] = True
-
-        if st.sidebar.button("🔄 Đồng bộ dữ liệu với Drive"):
-            with st.spinner("Đang đồng bộ 2 chiều..."):
-                sync_drive(service, drive_folder_id, BACKTEST_DIR)
-            st.sidebar.success("Đồng bộ hoàn tất!")
-            st.rerun()
-    else:
-        st.sidebar.warning("☁️ Google Drive chưa được cấu hình. Vui lòng thêm drive_folder_id và gcp_service_account vào Streamlit Secrets để đồng bộ dữ liệu.")
     
     st.sidebar.header("📥 Thêm Dữ Liệu Mới")
     uploaded_file = st.sidebar.file_uploader("Tải lên file Backtest (CSV, XLSX)", type=['csv', 'xlsx', 'xls'])
@@ -1498,6 +1533,8 @@ def main():
                     st.error(dna_res["error"])
                 else:
                     regime_analyzer.save_regime_registry(selected, dna_res, ohlc_ref_name, timeframe_sel)
+                    if service and drive_folder_id:
+                        sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.REGISTRY_FILE)
                     st.success(f"✅ Giải mã thành công & đã tự động lưu vào Registry! Độ chính xác Train: **{dna_res['accuracy']*100:.1f}%** | Cross-Validation: **{dna_res.get('cv_accuracy', 0)*100:.1f}%** (Dựa trên {dna_res['sample_count']} nến giao dịch).")
                     if dna_res.get('cv_accuracy', 0) >= 0.65:
                         st.info("🛡️ **Anti-Overfitting Verified**: Điểm kiểm định chéo K-Fold đạt mức cao và ổn định, bộ lọc đảm bảo không bị overfit vào dữ liệu nhiễu ngẫu nhiên.")

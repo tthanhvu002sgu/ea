@@ -471,6 +471,62 @@ def save_live_watchlist(watchlist):
         return False
 
 
+MONITOR_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest result", "live_monitor_history.json")
+
+def load_live_monitor_history(limit=100):
+    try:
+        if os.path.exists(MONITOR_HISTORY_FILE):
+            with open(MONITOR_HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+                return history[-limit:] if isinstance(history, list) else []
+    except Exception:
+        pass
+    return []
+
+def save_live_monitor_history(history):
+    try:
+        os.makedirs(os.path.dirname(MONITOR_HISTORY_FILE), exist_ok=True)
+        if len(history) > 1000:
+            history = history[-1000:]
+        with open(MONITOR_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print("Error saving monitor history:", e)
+        return False
+
+def log_live_monitor_eval(symbol, timeframe, eval_res):
+    try:
+        import datetime
+        history = load_live_monitor_history(limit=1000)
+        latest_time = eval_res.get("latest_time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        
+        if history and history[-1].get("symbol") == symbol and history[-1].get("timeframe") == timeframe and history[-1].get("latest_time") == latest_time:
+            return False
+            
+        record = {
+            "timestamp_logged": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "latest_time": latest_time,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "adx": eval_res.get("latest_bar", {}).get("ADX", 0),
+            "hurst": eval_res.get("latest_bar", {}).get("Hurst", 0.5),
+            "choppiness": eval_res.get("latest_bar", {}).get("Choppiness", 50),
+            "bb_width": eval_res.get("latest_bar", {}).get("BB_Width", 0),
+            "evaluations": {
+                k: {"status": v["status"], "match_pct": v["match_pct"]}
+                for k, v in eval_res.get("evaluations", {}).items()
+            }
+        }
+        history.append(record)
+        save_live_monitor_history(history)
+        return True
+    except Exception as e:
+        print("Error logging monitor eval:", e)
+        return False
+
+
+
 def fetch_live_ohlc(source_type, symbol="XAUUSD=X", timeframe="1h", limit=500):
     """
     Fetches real-time OHLC data from live APIs or MetaTrader 5 terminal.
