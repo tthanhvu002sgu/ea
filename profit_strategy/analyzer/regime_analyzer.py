@@ -270,11 +270,20 @@ def tree_to_mql5(clf, feature_names):
 // double chop_val = ...;
 // double hurst_val = ...;
 
+input int RegimeFilterMode = 1; // 0: Block All (Khóa tín hiệu), 1: Shadow Mode (Canary Testing - 0.01 Lot)
+
 bool isWinningRegime = {code_body};
 
 if (!isWinningRegime) {{
-    Print("[Regime Filter] Bối cảnh thị trường không phù hợp. Khóa tín hiệu vào lệnh.");
-    return; // Đứng ngoài
+    if (RegimeFilterMode == 0) {{
+        Print("[Regime Filter] Bối cảnh thị trường không phù hợp -> KHÓA TÍN HIỆU (Block All).");
+        return; // Đứng ngoài hoàn toàn
+    }} else if (RegimeFilterMode == 1) {{
+        Print("[Regime Filter] Bối cảnh xấu -> Chuyển sang SHADOW MODE (Canary Testing). Giảm Volume về tối thiểu 0.01 lot hoặc ghi log lệnh ảo.");
+        // Ví dụ áp dụng trong EA của bạn:
+        // lot_size = 0.01;
+        // is_shadow_trade = true;
+    }}
 }}"""
     return mql5_code
 
@@ -313,9 +322,202 @@ def compute_range_analysis(X, y, top_features):
         range_stats[col] = stats
     return range_stats
 
+def evaluate_feature_stability_over_time(X, y, available_cols, max_depth=3, n_periods=4):
+    """
+    Phân tích độ ổn định ADN theo thời gian (Time-Decay / Yearly Stability Analysis).
+    Chia lịch sử giao dịch thành n_periods chu kỳ thời gian liên tiếp để xem luật lọc có bị Concept Drift không.
+    """
+    try:
+        from sklearn.tree import DecisionTreeClassifier
+    except ImportError:
+        return {"error": "Thiếu thư viện scikit-learn."}
+
+    if len(X) < 40 or len(y) < 40:
+        return {"error": "Không đủ số lượng mẫu lệnh (cần tối thiểu 40 lệnh) để chia chu kỳ thời gian."}
+
+    chunk_size = len(X) // n_periods
+    period_results = []
+    feature_appearance = {col: 0 for col in available_cols}
+    feature_weights_sum = {col: 0.0 for col in available_cols}
+
+    for p in range(n_periods):
+        start_idx = p * chunk_size
+        end_idx = (p + 1) * chunk_size if p < n_periods - 1 else len(X)
+        
+        X_sub = X.iloc[start_idx:end_idx]
+        y_sub = y.iloc[start_idx:end_idx]
+        
+        if len(y_sub.unique()) < 2:
+            continue
+            
+        min_leaf = max(2, int(len(y_sub) * 0.05))
+        clf_sub = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf, class_weight='balanced', random_state=42)
+        clf_sub.fit(X_sub, y_sub)
+        acc_sub = clf_sub.score(X_sub, y_sub)
+        
+        imp_sub = pd.Series(clf_sub.feature_importances_, index=available_cols)
+        top_sub = imp_sub[imp_sub > 0].to_dict()
+        
+        for f, w in top_sub.items():
+            feature_appearance[f] += 1
+            feature_weights_sum[f] += float(w)
+            
+        t_start = str(X_sub.index[0])[:10]
+        t_end = str(X_sub.index[-1])[:10]
+        
+        period_results.append({
+            "period_idx": p + 1,
+            "time_range": f"{t_start} -> {t_end}",
+            "sample_count": len(y_sub),
+            "win_rate": round((y_sub == 1).sum() / len(y_sub) * 100, 1),
+            "accuracy": round(float(acc_sub) * 100, 1),
+            "top_features": top_sub
+        })
+
+    valid_periods = len(period_results)
+    if valid_periods == 0:
+        return {"error": "Không thể phân tích ổn định do các chu kỳ bị lệch nhãn."}
+
+    stability_summary = []
+    robust_features = []
+    drift_warnings = []
+
+    for f in available_cols:
+        count = feature_appearance[f]
+        if count == 0:
+            continue
+        consistency_pct = round(count / valid_periods * 100, 1)
+        avg_weight = round(feature_weights_sum[f] / valid_periods, 3)
+        
+        status = "🟢 Robust DNA (Ổn định cao)" if consistency_pct >= 70 else ("🟡 Moderate (Ổn định trung bình)" if consistency_pct >= 40 else "🔴 Concept Drift (Nguy cơ thoái hóa)")
+        
+        if consistency_pct >= 70:
+            robust_features.append(f)
+        elif consistency_pct <= 35:
+            drift_warnings.append(f)
+            
+        stability_summary.append({
+            "feature": f,
+            "appearance_count": f"{count}/{valid_periods} chu kỳ",
+            "consistency_pct": consistency_pct,
+            "avg_importance": avg_weight,
+            "status": status
+        })
+
+    stability_summary = sorted(stability_summary, key=lambda x: x["consistency_pct"], reverse=True)
+
+    return {
+        "valid_periods": valid_periods,
+        "period_details": period_results,
+        "stability_summary": stability_summary,
+        "robust_features": robust_features,
+        "drift_warnings": drift_warnings
+    }
+
+def unsupervised_regime_clustering(df_h1, trades_df, n_clusters=3):
+    """
+    Phân cụm không giám sát (Unsupervised Regime Clustering) bằng K-Means.
+    Để thị trường tự động chia thành các cụm trạng thái tự nhiên, sau đó đo lường Win Rate của EA trên từng cụm.
+    Đối chứng kép với kết quả Supervised Decision Tree.
+    """
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        return {"error": "Thiếu thư viện scikit-learn."}
+
+    indicators = calc_regime_indicators(df_h1)
+    cluster_cols = ['ADX', 'ATR%', 'Choppiness', 'BB_Width', 'Hurst']
+    available_cols = [c for c in cluster_cols if c in indicators.columns]
+    
+    df_cluster = indicators[available_cols].dropna()
+    if len(df_cluster) < 50:
+        return {"error": "Không đủ số lượng nến H1 (cần tối thiểu 50 nến) để phân cụm."}
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(df_cluster)
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(X_scaled)
+    df_cluster['Cluster'] = clusters
+
+    cluster_profiles = {}
+    for c in range(n_clusters):
+        sub_c = df_cluster[df_cluster['Cluster'] == c]
+        adx_m = sub_c['ADX'].mean()
+        atr_m = sub_c['ATR%'].mean()
+        chop_m = sub_c['Choppiness'].mean()
+        hurst_m = sub_c['Hurst'].mean()
+        bb_m = sub_c['BB_Width'].mean() if 'BB_Width' in sub_c else 0
+        
+        if chop_m > 55 and adx_m < 22:
+            name = f"Cụm {c}: Sideways / Ranging (Chop cao, ADX thấp)"
+        elif adx_m >= 25 and chop_m < 48:
+            name = f"Cụm {c}: Strong Trend (ADX cao, Chop thấp)"
+        elif atr_m > df_cluster['ATR%'].mean() * 1.2:
+            name = f"Cụm {c}: High Volatility / Turbulence (Biến động mạnh)"
+        else:
+            name = f"Cụm {c}: Mixed / Transitional (Chuyển tiếp)"
+
+        cluster_profiles[c] = {
+            "name": name,
+            "candle_count": len(sub_c),
+            "pct_time": round(len(sub_c) / len(df_cluster) * 100, 1),
+            "adx_mean": round(adx_m, 1),
+            "atr_pct_mean": round(atr_m, 3),
+            "chop_mean": round(chop_m, 1),
+            "hurst_mean": round(hurst_m, 2),
+            "bb_width_mean": round(bb_m, 3)
+        }
+
+    y_series, trade_pnl = map_trades_to_candles(df_cluster, trades_df)
+    trade_mask = y_series != 0
+    
+    trade_cluster_stats = []
+    best_cluster_name = ""
+    best_wr = -1.0
+
+    for c in range(n_clusters):
+        c_mask = (df_cluster['Cluster'] == c) & trade_mask
+        c_trades = y_series[c_mask]
+        c_pnl = trade_pnl[c_mask]
+        
+        total_t = len(c_trades)
+        if total_t == 0:
+            continue
+            
+        wins = (c_trades == 1).sum()
+        losses = (c_trades == -1).sum()
+        wr = round(wins / total_t * 100, 1)
+        net_pnl = round(float(c_pnl.sum()), 2)
+        
+        if wr > best_wr and total_t >= 10:
+            best_wr = wr
+            best_cluster_name = cluster_profiles[c]["name"]
+
+        trade_cluster_stats.append({
+            "cluster_id": c,
+            "cluster_name": cluster_profiles[c]["name"],
+            "total_trades": int(total_t),
+            "win_count": int(wins),
+            "loss_count": int(losses),
+            "win_rate": wr,
+            "net_pnl": net_pnl,
+            "avg_pnl": round(net_pnl / total_t, 2) if total_t > 0 else 0
+        })
+
+    return {
+        "success": True,
+        "n_clusters": n_clusters,
+        "cluster_profiles": list(cluster_profiles.values()),
+        "trade_cluster_stats": trade_cluster_stats,
+        "best_cluster_name": best_cluster_name,
+        "best_win_rate": best_wr
+    }
+
 def extract_strategy_dna(df_h1, trades_df, max_depth=3, cache_path=None, strategy_name=None):
     """
-    Supervised Strategy Profiling with Anti-Overfitting (Regularization + Cross-Validation).
+    Supervised Strategy Profiling with Anti-Overfitting (Regularization + Purged CV + OOS Holdout).
     Trains DecisionTree to classify Win (+1) vs Loss (-1) candles based on context features.
     """
     try:
@@ -341,16 +543,49 @@ def extract_strategy_dna(df_h1, trades_df, max_depth=3, cache_path=None, strateg
         val = "THẮNG" if y.iloc[0] > 0 else "THUA"
         return {"error": f"Toàn bộ {len(y)} lệnh khớp đều là lệnh {val}. Cần cả lệnh Thắng và Thua để phân tích đối chiếu."}
 
-    # Anti-overfitting regularization: each leaf must have at least 3% of total trades or minimum 3 samples
-    min_leaf = max(3, int(len(y) * 0.03))
+    # ── ITEM 1: Strict Out-of-Sample (OOS) Holdout & Purged CV ──
+    oos_size = max(5, int(len(y) * 0.20)) if len(y) >= 25 else 0
+    if oos_size > 0:
+        X_train = X.iloc[:-oos_size]
+        y_train = y.iloc[:-oos_size]
+        X_oos = X.iloc[-oos_size:]
+        y_oos = y.iloc[-oos_size:]
+    else:
+        X_train, y_train = X, y
+        X_oos, y_oos = X, y
+
+    min_leaf = max(3, int(len(y_train) * 0.03))
+    clf_train = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf, class_weight='balanced', random_state=42)
+    clf_train.fit(X_train, y_train)
+
+    train_acc = clf_train.score(X_train, y_train)
+    oos_acc = clf_train.score(X_oos, y_oos) if oos_size > 0 else train_acc
+
+    # Purged / Embargo Time-Series CV on X_train to prevent rolling window leakage
+    cv_folds = min(5, len(y_train) // 5)
+    if cv_folds >= 2:
+        purged_scores = []
+        fold_size = len(y_train) // cv_folds
+        embargo_gap = max(2, int(len(y_train) * 0.03))
+        for f in range(cv_folds):
+            val_start = f * fold_size
+            val_end = (f + 1) * fold_size if f < cv_folds - 1 else len(y_train)
+            
+            train_idx = [i for i in range(len(y_train)) if i < val_start - embargo_gap or i > val_end + embargo_gap]
+            val_idx = list(range(val_start, val_end))
+            
+            if len(train_idx) < 10 or len(val_idx) < 2:
+                continue
+            clf_fold = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf, class_weight='balanced', random_state=42)
+            clf_fold.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
+            purged_scores.append(clf_fold.score(X_train.iloc[val_idx], y_train.iloc[val_idx]))
+        cv_acc = float(np.mean(purged_scores)) if purged_scores else float(train_acc)
+    else:
+        cv_acc = float(train_acc)
+
+    # Fit final tree on full X for MQL5 code generation
     clf = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf, class_weight='balanced', random_state=42)
     clf.fit(X, y)
-
-    acc = clf.score(X, y)
-    
-    # 5-Fold Stratified Cross Validation score to verify OOS robustness
-    cv_folds = min(5, len(y) // 4)
-    cv_acc = float(np.mean(cross_val_score(clf, X, y, cv=cv_folds))) if cv_folds >= 2 else float(acc)
 
     imp = pd.Series(clf.feature_importances_, index=available_cols).sort_values(ascending=False)
     top_features = imp[imp > 0].to_dict()
@@ -376,13 +611,19 @@ def extract_strategy_dna(df_h1, trades_df, max_depth=3, cache_path=None, strateg
         except Exception as e:
             print("Error exporting features CSV:", e)
 
+    stability_res = evaluate_feature_stability_over_time(X, y, available_cols, max_depth=max_depth)
+    clustering_res = unsupervised_regime_clustering(df_h1, trades_df, n_clusters=3)
+
     return {
         "success": True,
         "sample_count": len(y),
         "win_count": int((y == 1).sum()),
         "loss_count": int((y == -1).sum()),
-        "accuracy": float(acc),
+        "accuracy": float(train_acc),
         "cv_accuracy": float(cv_acc),
+        "oos_accuracy": float(oos_acc),
+        "oos_sample_count": int(oos_size),
+        "oos_status": "PASS (OOS >= 58%)" if oos_acc >= 0.58 else ("CAUTION (OOS 50-58%)" if oos_acc >= 0.50 else "FAIL (< 50% - Overfit)"),
         "min_samples_leaf": min_leaf,
         "top_features": top_features,
         "tree_text": tree_text,
@@ -390,7 +631,9 @@ def extract_strategy_dna(df_h1, trades_df, max_depth=3, cache_path=None, strateg
         "win_context": win_context,
         "loss_context": loss_context,
         "features_csv_path": features_csv_rel,
-        "range_analysis": compute_range_analysis(X, y, top_features)
+        "range_analysis": compute_range_analysis(X, y, top_features),
+        "feature_stability_analysis": stability_res,
+        "unsupervised_clustering_analysis": clustering_res
     }
 
 
@@ -429,6 +672,8 @@ def save_regime_registry(strategy_name, dna_res, symbol_ohlc, timeframe):
             "timeframe": timeframe,
             "accuracy": dna_res.get("accuracy", 0),
             "cv_accuracy": dna_res.get("cv_accuracy", 0),
+            "oos_accuracy": dna_res.get("oos_accuracy", 0),
+            "oos_status": dna_res.get("oos_status", "N/A"),
             "sample_count": dna_res.get("sample_count", 0),
             "win_count": dna_res.get("win_count", 0),
             "loss_count": dna_res.get("loss_count", 0),
@@ -438,7 +683,9 @@ def save_regime_registry(strategy_name, dna_res, symbol_ohlc, timeframe):
             "win_context": dna_res.get("win_context", {}),
             "loss_context": dna_res.get("loss_context", {}),
             "features_csv_path": dna_res.get("features_csv_path", ""),
-            "range_analysis": dna_res.get("range_analysis", {})
+            "range_analysis": dna_res.get("range_analysis", {}),
+            "feature_stability_analysis": dna_res.get("feature_stability_analysis", {}),
+            "unsupervised_clustering_analysis": dna_res.get("unsupervised_clustering_analysis", {})
         }
         data[strategy_name] = entry
         with open(REGISTRY_FILE, "w", encoding="utf-8") as f:

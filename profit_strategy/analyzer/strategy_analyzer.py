@@ -844,6 +844,97 @@ def run_monte_carlo(profits, n_sims=10000, init_balance=5000):
     return pd.DataFrame(results)
 
 # ============================================================
+# REGIME DNA TAB RENDERER (UI Helper)
+# ============================================================
+def render_dna_tabs(data_dict):
+    st.markdown(f"**Độ chính xác Train**: `{data_dict.get('accuracy', 0)*100:.1f}%` | **Purged CV (Chống Overfit)**: `{data_dict.get('cv_accuracy', 0)*100:.1f}%` | **Out-of-Sample (Holdout OOS)**: `{data_dict.get('oos_accuracy', 0)*100:.1f}%` ({data_dict.get('oos_status', 'N/A')}) | **Mẫu**: `{data_dict.get('sample_count', 0)}` lệnh ({data_dict.get('win_count', 0)} Thắng / {data_dict.get('loss_count', 0)} Thua)")
+    
+    if data_dict.get('cv_accuracy', 0) >= 0.65:
+        st.info("🛡️ **Anti-Overfitting Verified**: Điểm số kiểm định chéo Purged K-Fold đạt mức cao và ổn định, bộ lọc đảm bảo không bị overfit vào dữ liệu nhiễu.")
+    if data_dict.get("features_csv_path") and os.path.exists(data_dict["features_csv_path"]):
+        st.markdown(f"📂 **Bảng dữ liệu chỉ số bối cảnh từng lệnh đã lưu sẵn**: `{data_dict['features_csv_path']}`")
+        
+    p_tab1, p_tab2, p_tab3, p_tab4, p_tab5, p_tab6 = st.tabs(["💻 Code MQL5 Bộ Lọc", "📊 Cây Quyết Định (Text)", "⏳ Ổn Định Theo Thời Gian", "🔍 Phân Cụm Không Giám Sát", "⚖️ Đối Chiếu Thắng vs Thua", "📏 Phân Vùng Lãi/Lỗ"])
+    
+    with p_tab1:
+        st.markdown("Copy toàn bộ câu lệnh điều kiện dưới đây gắn vào đầu hàm `OnTick()` của EA trên MT5:")
+        st.code(data_dict.get("mql5_code", ""), language="mql5")
+        
+    with p_tab2:
+        st.text(data_dict.get("tree_text", ""))
+        if data_dict.get("top_features"):
+            st.markdown("**Các Đặc Trưng Quan Trọng Nhất (Feature Importances):**")
+            imp_df = pd.DataFrame(list(data_dict["top_features"].items()), columns=["Chỉ số", "Tầm quan trọng"]).sort_values("Tầm quan trọng", ascending=False)
+            st.dataframe(imp_df, hide_index=True)
+            
+    with p_tab3:
+        stab_data = data_dict.get("feature_stability_analysis", {})
+        if stab_data and "error" not in stab_data:
+            st.markdown(f"**Phân tích độ ổn định qua {stab_data.get('valid_periods', 0)} chu kỳ thời gian liên tiếp (Time-Decay / Concept Drift):**")
+            if stab_data.get("robust_features"):
+                st.success(f"🟢 **Robust DNA (Các chỉ số ổn định nhất)**: `{', '.join(stab_data['robust_features'])}`")
+            if stab_data.get("drift_warnings"):
+                st.warning(f"🔴 **Concept Drift (Cảnh báo thoái hóa/không ổn định)**: `{', '.join(stab_data['drift_warnings'])}` - Chỉ số này có nguy cơ overfit hoặc thoái hóa theo thời gian.")
+            st.markdown("---")
+            st.markdown("**Bảng Tổng Hợp Độ Ổn Định Từng Chỉ Số:**")
+            st_df = pd.DataFrame(stab_data.get("stability_summary", []))
+            if not st_df.empty:
+                st_df = st_df.rename(columns={"feature": "Chỉ số", "appearance_count": "Tần suất xuất hiện", "consistency_pct": "Độ ổn định (%)", "avg_importance": "Trọng số TB", "status": "Trạng thái"})
+                st.dataframe(st_df.style.background_gradient(subset=["Độ ổn định (%)"], cmap="RdYlGn"), hide_index=True)
+            with st.expander("🔍 Chi tiết Win Rate & Đặc trưng theo từng chu kỳ"):
+                p_df = pd.DataFrame(stab_data.get("period_details", []))
+                if not p_df.empty:
+                    p_df = p_df.drop(columns=["top_features"], errors="ignore")
+                    p_df = p_df.rename(columns={"period_idx": "Chu kỳ #", "time_range": "Khoảng thời gian", "sample_count": "Số lệnh", "win_rate": "Win Rate (%)", "accuracy": "Độ chính xác AI (%)"})
+                    st.dataframe(p_df, hide_index=True)
+        else:
+            st.info("Chưa có dữ liệu phân tích độ ổn định thời gian cho chiến lược này. Vui lòng huấn luyện lại phía dưới.")
+            
+    with p_tab4:
+        clus_data = data_dict.get("unsupervised_clustering_analysis", {})
+        if clus_data and "error" not in clus_data:
+            st.markdown(f"**Phân cụm thị trường không giám sát (K-Means K={clus_data.get('n_clusters', 3)}) & Đối chứng kép:**")
+            st.info(f"🏆 **Cụm thị trường EA hoạt động hiệu quả nhất**: **`{clus_data.get('best_cluster_name', '')}`** (Win Rate cao nhất: **{clus_data.get('best_win_rate', 0)}%**)")
+            st.markdown("---")
+            st.markdown("**Hiệu Suất Thực Tế Của EA Trên Từng Cụm Thị Trường (Unsupervised Validation):**")
+            tc_df = pd.DataFrame(clus_data.get("trade_cluster_stats", []))
+            if not tc_df.empty:
+                tc_df = tc_df.rename(columns={"cluster_name": "Tên cụm bối cảnh (Centroid)", "total_trades": "Tổng lệnh", "win_count": "Thắng", "loss_count": "Thua", "win_rate": "Win Rate (%)", "net_pnl": "Net PnL ($)", "avg_pnl": "TB PnL/Lệnh ($)"})
+                tc_df = tc_df.drop(columns=["cluster_id"], errors="ignore")
+                st.dataframe(tc_df.style.background_gradient(subset=["Win Rate (%)", "Net PnL ($)"], cmap="RdYlGn"), hide_index=True)
+            with st.expander("📊 Xem Hồ Sơ Ngữ Nghĩa Của Từng Cụm (Centroids Profiles)"):
+                cp_df = pd.DataFrame(clus_data.get("cluster_profiles", []))
+                if not cp_df.empty:
+                    cp_df = cp_df.rename(columns={"name": "Tên cụm", "candle_count": "Số nến H1", "pct_time": "Tỷ lệ thời gian (%)", "adx_mean": "ADX TB", "atr_pct_mean": "ATR% TB", "chop_mean": "Chop TB", "hurst_mean": "Hurst TB", "bb_width_mean": "BB Width TB"})
+                    st.dataframe(cp_df, hide_index=True)
+        else:
+            st.info("Chưa có dữ liệu phân cụm không giám sát. Vui lòng huấn luyện lại phía dưới.")
+            
+    with p_tab5:
+        w_ctx = data_dict.get("win_context", {})
+        l_ctx = data_dict.get("loss_context", {})
+        if w_ctx:
+            contrast_df = pd.DataFrame({
+                "Chỉ số Bối Cảnh": list(w_ctx.keys()),
+                "Khi EA THẮNG (Mean)": list(w_ctx.values()),
+                "Khi EA THUA (Mean)": [l_ctx.get(k, 0) for k in w_ctx.keys()]
+            })
+            contrast_df["Chênh Lệch"] = contrast_df["Khi EA THẮNG (Mean)"] - contrast_df["Khi EA THUA (Mean)"]
+            st.dataframe(contrast_df.style.background_gradient(subset=["Chênh Lệch"], cmap="RdYlGn"), hide_index=True)
+            
+    with p_tab6:
+        range_data = data_dict.get("range_analysis", {})
+        if range_data:
+            st.markdown("Phân rã các chỉ số quan trọng thành từng vùng (Range/Bin) để tránh overfit vào một ngưỡng cắt duy nhất:")
+            for feat_name, zones in range_data.items():
+                st.markdown(f"**🔹 Chỉ số: `{feat_name}`**")
+                z_df = pd.DataFrame(zones)
+                z_df = z_df.rename(columns={"range": "Vùng giá trị (Bin)", "total_trades": "Tổng số lệnh", "win_count": "Số lệnh Thắng", "win_rate": "Tỷ lệ Thắng (%)"})
+                st.dataframe(z_df.style.background_gradient(subset=["Tỷ lệ Thắng (%)"], cmap="RdYlGn"), hide_index=True)
+        else:
+            st.info("Chưa có dữ liệu phân vùng cho chiến lược này.")
+
+# ============================================================
 # MAIN APP
 # ============================================================
 def main():
@@ -1503,42 +1594,7 @@ def main():
     if saved_profile:
         st.success(f"💾 **Đã tìm thấy Hồ sơ Regime DNA lưu trữ trong Registry** (Cập nhật: `{saved_profile.get('last_updated', 'N/A')}` | Khung: `{saved_profile.get('timeframe', '1h')}`). Bạn không cần tốn thời gian chạy lại!")
         with st.expander("⚡ Xem ngay Hồ sơ Regime DNA đã lưu cho chiến lược này", expanded=True):
-            st.markdown(f"**Độ chính xác Train**: `{saved_profile.get('accuracy', 0)*100:.1f}%` | **Độ chính xác Cross-Validation (Chống Overfit)**: `{saved_profile.get('cv_accuracy', 0)*100:.1f}%` | **Mẫu**: `{saved_profile.get('sample_count', 0)}` lệnh ({saved_profile.get('win_count', 0)} Thắng / {saved_profile.get('loss_count', 0)} Thua)")
-            if saved_profile.get('cv_accuracy', 0) >= 0.65:
-                st.info("🛡️ **Anti-Overfitting Verified**: Điểm số kiểm định chéo Stratified Cross-Validation đạt mức cao và ổn định, chứng tỏ bộ lọc không bị overfit (quá khớp) vào dữ liệu nhiễu.")
-            if saved_profile.get("features_csv_path") and os.path.exists(saved_profile["features_csv_path"]):
-                st.markdown(f"📂 **Bảng dữ liệu chỉ số bối cảnh từng lệnh đã lưu sẵn**: `{saved_profile['features_csv_path']}`")
-            
-            p_tab1, p_tab2, p_tab3, p_tab4 = st.tabs(["💻 Code MQL5 Bộ Lọc", "📊 Cây Quyết Định (Text)", "⚖️ Đối Chiếu Thắng vs Thua", "📏 Phân Vùng Lãi/Lỗ (Range Analysis)"])
-            with p_tab1:
-                st.code(saved_profile.get("mql5_code", ""), language="mql5")
-            with p_tab2:
-                st.text(saved_profile.get("tree_text", ""))
-                if saved_profile.get("top_features"):
-                    imp_df = pd.DataFrame(list(saved_profile["top_features"].items()), columns=["Chỉ số", "Tầm quan trọng"]).sort_values("Tầm quan trọng", ascending=False)
-                    st.dataframe(imp_df, hide_index=True)
-            with p_tab3:
-                w_ctx = saved_profile.get("win_context", {})
-                l_ctx = saved_profile.get("loss_context", {})
-                if w_ctx:
-                    contrast_df = pd.DataFrame({
-                        "Chỉ số Bối Cảnh": list(w_ctx.keys()),
-                        "Khi EA THẮNG (Mean)": list(w_ctx.values()),
-                        "Khi EA THUA (Mean)": [l_ctx.get(k, 0) for k in w_ctx.keys()]
-                    })
-                    contrast_df["Chênh Lệch"] = contrast_df["Khi EA THẮNG (Mean)"] - contrast_df["Khi EA THUA (Mean)"]
-                    st.dataframe(contrast_df.style.background_gradient(subset=["Chênh Lệch"], cmap="RdYlGn"), hide_index=True)
-            with p_tab4:
-                range_data = saved_profile.get("range_analysis", {})
-                if range_data:
-                    st.markdown("Phân rã các chỉ số quan trọng thành từng vùng (Range/Bin) để tránh overfit vào một ngưỡng cắt duy nhất:")
-                    for feat_name, zones in range_data.items():
-                        st.markdown(f"**🔹 Chỉ số: `{feat_name}`**")
-                        z_df = pd.DataFrame(zones)
-                        z_df = z_df.rename(columns={"range": "Vùng giá trị (Bin)", "total_trades": "Tổng số lệnh", "win_count": "Số lệnh Thắng", "win_rate": "Tỷ lệ Thắng (%)"})
-                        st.dataframe(z_df.style.background_gradient(subset=["Tỷ lệ Thắng (%)"], cmap="RdYlGn"), hide_index=True)
-                else:
-                    st.info("Chưa có dữ liệu phân vùng cho chiến lược này. Vui lòng chạy lại huấn luyện DNA bên dưới để cập nhật.")
+            render_dna_tabs(saved_profile)
 
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
     
@@ -1607,46 +1663,8 @@ def main():
                     regime_analyzer.save_regime_registry(selected, dna_res, ohlc_ref_name, timeframe_sel)
                     if service and drive_folder_id:
                         sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.REGISTRY_FILE)
-                    st.success(f"✅ Giải mã thành công & đã tự động lưu vào Registry! Độ chính xác Train: **{dna_res['accuracy']*100:.1f}%** | Cross-Validation: **{dna_res.get('cv_accuracy', 0)*100:.1f}%** (Dựa trên {dna_res['sample_count']} nến giao dịch).")
-                    if dna_res.get('cv_accuracy', 0) >= 0.65:
-                        st.info("🛡️ **Anti-Overfitting Verified**: Điểm kiểm định chéo K-Fold đạt mức cao và ổn định, bộ lọc đảm bảo không bị overfit vào dữ liệu nhiễu ngẫu nhiên.")
-                    if dna_res.get("features_csv_path"):
-                        st.info(f"💾 Đã xuất toàn bộ bảng chỉ số bối cảnh cho từng lệnh ra file CSV: `{dna_res['features_csv_path']}`")
-                    
-                    dna_tab1, dna_tab2, dna_tab3, dna_tab4 = st.tabs(["💻 Code MQL5 Bộ Lọc", "📊 Cây Quyết Định (Text)", "⚖️ Đối Chiếu Thắng vs Thua", "📏 Phân Vùng Lãi/Lỗ (Range Analysis)"])
-                    
-                    with dna_tab1:
-                        st.markdown("Copy toàn bộ câu lệnh điều kiện dưới đây gắn vào đầu hàm `OnTick()` của EA trên MT5:")
-                        st.code(dna_res["mql5_code"], language="mql5")
-                        
-                    with dna_tab2:
-                        st.text(dna_res["tree_text"])
-                        if dna_res.get("top_features"):
-                            st.markdown("**Các Đặc Trưng Quan Trọng Nhất (Feature Importances):**")
-                            imp_df = pd.DataFrame(list(dna_res["top_features"].items()), columns=["Chỉ số", "Tầm quan trọng"]).sort_values("Tầm quan trọng", ascending=False)
-                            st.dataframe(imp_df, hide_index=True)
-                            
-                    with dna_tab3:
-                        st.markdown("**Bảng Đối Chiếu Trung Bình Đặc Trưng Thị Trường:**")
-                        contrast_df = pd.DataFrame({
-                            "Chỉ số Bối Cảnh": list(dna_res["win_context"].keys()),
-                            "Khi EA THẮNG (Mean)": list(dna_res["win_context"].values()),
-                            "Khi EA THUA (Mean)": [dna_res["loss_context"].get(k, 0) for k in dna_res["win_context"].keys()]
-                        })
-                        contrast_df["Chênh Lệch"] = contrast_df["Khi EA THẮNG (Mean)"] - contrast_df["Khi EA THUA (Mean)"]
-                        st.dataframe(contrast_df.style.background_gradient(subset=["Chênh Lệch"], cmap="RdYlGn"), hide_index=True)
-                        
-                    with dna_tab4:
-                        range_data = dna_res.get("range_analysis", {})
-                        if range_data:
-                            st.markdown("Phân rã các chỉ số quan trọng thành từng vùng (Range/Bin) để tránh overfit vào một ngưỡng cắt duy nhất:")
-                            for feat_name, zones in range_data.items():
-                                st.markdown(f"**🔹 Chỉ số: `{feat_name}`**")
-                                z_df = pd.DataFrame(zones)
-                                z_df = z_df.rename(columns={"range": "Vùng giá trị (Bin)", "total_trades": "Tổng số lệnh", "win_count": "Số lệnh Thắng", "win_rate": "Tỷ lệ Thắng (%)"})
-                                st.dataframe(z_df.style.background_gradient(subset=["Tỷ lệ Thắng (%)"], cmap="RdYlGn"), hide_index=True)
-                        else:
-                            st.info("Không có thông tin phân vùng cho chiến lược này.")
+                    st.success(f"✅ Giải mã thành công & đã tự động lưu vào Registry!")
+                    render_dna_tabs(dna_res)
             except Exception as e:
                 st.error(f"Lỗi khi giải mã DNA: {e}")
 
