@@ -131,11 +131,16 @@ def calc_autocorr(returns, lag=1):
     return returns.autocorr(lag=lag)
 
 # Bump when indicator formulas change — invalidates stale .cache.pkl automatically.
-INDICATOR_CACHE_VERSION = 2
+INDICATOR_CACHE_VERSION = 3
 
 
 def calc_regime_indicators(df_h1, cache_path=None):
     """Calculate all regime indicators on H1 data (Extended 12+ Features) with Caching."""
+    if df_h1 is not None and not df_h1.empty:
+        if df_h1.index.name == 'Time' or isinstance(df_h1.index, pd.DatetimeIndex):
+            # Only keep weekday bars (Monday=0 to Friday=4). Drop Saturday=5, Sunday=6 to prevent weekend gaps skewing indicators.
+            df_h1 = df_h1[df_h1.index.dayofweek < 5].copy()
+
     if cache_path and os.path.exists(cache_path):
         try:
             obj = pd.read_pickle(cache_path)
@@ -162,9 +167,10 @@ def calc_regime_indicators(df_h1, cache_path=None):
     ema200 = df_h1['Close'].ewm(span=200, adjust=False).mean()
     ema_dist = (ema50 - ema200) / ema200.replace(0, np.nan) * 100
 
-    vol_mean = df_h1['TickVol'].rolling(20).mean() if 'TickVol' in df_h1 else pd.Series(0, index=df_h1.index)
-    vol_std = df_h1['TickVol'].rolling(20).std() if 'TickVol' in df_h1 else pd.Series(1, index=df_h1.index)
-    vol_zscore = (df_h1['TickVol'] - vol_mean) / vol_std.replace(0, np.nan) if 'TickVol' in df_h1 else pd.Series(0, index=df_h1.index)
+    vol_mean = df_h1['TickVol'].rolling(20).mean() if 'TickVol' in df_h1 else pd.Series(0.0, index=df_h1.index)
+    vol_std = df_h1['TickVol'].rolling(20).std() if 'TickVol' in df_h1 else pd.Series(1.0, index=df_h1.index)
+    vol_zscore = (df_h1['TickVol'] - vol_mean) / vol_std.replace(0, np.nan) if 'TickVol' in df_h1 else pd.Series(0.0, index=df_h1.index)
+    vol_zscore = vol_zscore.fillna(0.0)
 
     autocorr = returns.rolling(20).apply(lambda x: pd.Series(x).autocorr(lag=1), raw=False)
 
