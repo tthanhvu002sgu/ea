@@ -26,20 +26,62 @@ if sys.platform == 'win32':
 # OHLC DATA LOADING
 # ============================================================
 def load_ohlc(file_path):
-    """Load MT5 exported OHLC CSV (tab-separated)."""
-    df = pd.read_csv(file_path, sep='\t')
-    df.columns = [c.strip('<>') for c in df.columns]
-    df['Datetime'] = pd.to_datetime(df['DATE'] + ' ' + df['TIME'], format='%Y.%m.%d %H:%M:%S')
-    df = df.rename(columns={'OPEN': 'Open', 'HIGH': 'High', 'LOW': 'Low', 'CLOSE': 'Close',
-                            'TICKVOL': 'TickVol', 'VOL': 'Vol', 'SPREAD': 'Spread'})
-    df = df.set_index('Datetime').sort_index()
+    """Load MT5 exported OHLC CSV (tab-separated) or Comma-separated Live CSV."""
+    # Detect separator
+    sep = '\t'
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            first_line = f.readline()
+            if ',' in first_line and '\t' not in first_line:
+                sep = ','
+    except Exception:
+        pass
+
+    df = pd.read_csv(file_path, sep=sep)
+    df.columns = [c.strip('<> ') for c in df.columns]
+
+    # Check if we have 'DATE' and 'TIME' (raw MT5 export format)
+    if 'DATE' in df.columns and 'TIME' in df.columns:
+        df['Datetime'] = pd.to_datetime(df['DATE'] + ' ' + df['TIME'], format='%Y.%m.%d %H:%M:%S', errors='coerce')
+        df = df.dropna(subset=['Datetime'])
+        df = df.rename(columns={'OPEN': 'Open', 'HIGH': 'High', 'LOW': 'Low', 'CLOSE': 'Close',
+                                'TICKVOL': 'TickVol', 'VOL': 'Vol', 'SPREAD': 'Spread'})
+        df = df.set_index('Datetime').sort_index()
+    # Check if we have 'Time' or 'time'
+    elif 'Time' in df.columns:
+        df['Time'] = pd.to_datetime(df['Time'], errors='coerce')
+        df = df.dropna(subset=['Time'])
+        df = df.set_index('Time').sort_index()
+    elif 'time' in df.columns:
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+        df = df.dropna(subset=['time'])
+        df = df.set_index('time').sort_index()
+    else:
+        # Fallback if first column is the datetime index
+        first_col = df.columns[0]
+        df[first_col] = pd.to_datetime(df[first_col], errors='coerce')
+        df = df.dropna(subset=[first_col])
+        df = df.set_index(first_col).sort_index()
+
+    # Normalize column casing
+    col_map = {}
+    for c in df.columns:
+        cl = c.lower()
+        if cl == 'open': col_map[c] = 'Open'
+        elif cl == 'high': col_map[c] = 'High'
+        elif cl == 'low': col_map[c] = 'Low'
+        elif cl == 'close': col_map[c] = 'Close'
+        elif cl in ('tickvol', 'tick_volume'): col_map[c] = 'TickVol'
+        elif cl in ('vol', 'volume', 'real_volume'): col_map[c] = 'Vol'
+    df = df.rename(columns=col_map)
+
     keep = ['Open', 'High', 'Low', 'Close']
     for c in ('TickVol', 'Vol'):
         if c in df.columns:
             keep.append(c)
     df = df[keep].astype(float)
-    # Prefer tick volume; if empty/zero fall back to real Vol (exchange/spot/futures)
     return ensure_activity_volume(df)
+
 
 def resample_ohlc(df, timeframe='1h'):
     """Resample M1 data to higher timeframe."""
