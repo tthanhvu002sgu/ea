@@ -1354,7 +1354,13 @@ def main():
                 f"(registry cũ). Hãy **huấn luyện lại DNA v2** để Live Monitor dùng đúng cây: "
                 f"`{', '.join(missing_rules[:5])}`" + ("…" if len(missing_rules) > 5 else "")
             )
-            
+        # Auto-pull updates from Google Drive (e.g. live CSVs from VPS MT5)
+        if service and drive_folder_id:
+            try:
+                sync_drive(service, drive_folder_id, BACKTEST_DIR)
+            except Exception:
+                pass
+
         watchlist = regime_analyzer.load_live_watchlist()
         workspace_dir = os.path.dirname(os.path.abspath(__file__))
         raw_ohlc = sorted(list(set(glob.glob(os.path.join(workspace_dir, "*.csv")) + glob.glob(os.path.join(BACKTEST_DIR, "*.csv")))))
@@ -1482,17 +1488,44 @@ def main():
                 logged = regime_analyzer.log_live_monitor_eval(sym, tf, eval_res)
                 if logged and service and drive_folder_id:
                     sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.MONITOR_HISTORY_FILE)
-                latest_bar = eval_res.get("latest_bar", {})
+                latest_bar = eval_res.get("latest_bar", {}) or {}
                 latest_time = eval_res.get("latest_time", "N/A")
-                
+                dna_ok = bool(eval_res.get("dna_features_ok", False))
+                dna_err = eval_res.get("error")
+
                 st.caption(f"⏱️ Nến đã đóng gần nhất (DNA features): `{latest_time}`")
+                if not dna_ok:
+                    st.error(
+                        "⛔ DNA features chưa đủ dữ liệu — không hiển thị 0 giả. "
+                        + (str(dna_err) if dna_err else
+                           "Cần OHLC đủ warm-up + volume (tick hoặc real/spot/futures từ feed).")
+                    )
+                vol_src = getattr(df_live, "attrs", {}).get("volume_source")
+                if vol_src:
+                    st.caption(f"📊 Volume source cho Vol_Z: **`{vol_src}`**")
+                else:
+                    st.caption("📊 Volume source: *(không có — TickVol/Vol/RealVolume đều trống hoặc = 0)*")
+
+                def _fmt_dna(key, nd):
+                    v = latest_bar.get(key)
+                    try:
+                        fv = float(v)
+                    except (TypeError, ValueError):
+                        return "N/A"
+                    if fv != fv:  # NaN
+                        return "N/A"
+                    # Strict-positive DNA: 0 = empty placeholder
+                    if key in getattr(regime_analyzer, "DNA_STRICT_POSITIVE", set()) and fv <= 0:
+                        return "N/A"
+                    return f"{fv:.{nd}f}"
+
                 g_cols = st.columns(6)
-                g_cols[0].metric("ADX", f"{latest_bar.get('ADX', 0):.1f}")
-                g_cols[1].metric("ATR%", f"{latest_bar.get('ATR%', 0):.3f}")
-                g_cols[2].metric("Vol_Z", f"{latest_bar.get('Vol_ZScore', 0):.2f}")
-                g_cols[3].metric("Chop", f"{latest_bar.get('Choppiness', 50):.1f}")
-                g_cols[4].metric("BB Width", f"{latest_bar.get('BB_Width', 0):.3f}")
-                g_cols[5].metric("EMA_Dist%", f"{latest_bar.get('EMA_Dist%', 0):.3f}")
+                g_cols[0].metric("ADX", _fmt_dna("ADX", 1))
+                g_cols[1].metric("ATR%", _fmt_dna("ATR%", 3))
+                g_cols[2].metric("Vol_Z", _fmt_dna("Vol_ZScore", 2))
+                g_cols[3].metric("Chop", _fmt_dna("Choppiness", 1))
+                g_cols[4].metric("BB Width", _fmt_dna("BB_Width", 3))
+                g_cols[5].metric("EMA_Dist%", _fmt_dna("EMA_Dist%", 3))
                 
                 evals = eval_res.get("evaluations", {})
                 for s_name, s_info in evals.items():
@@ -1505,6 +1538,9 @@ def main():
                     elif st_code == "CAUTION":
                         badge = "🟡 CẨN TRỌNG"
                         border_color = "#ffa502"
+                    elif st_code == "NO_DATA":
+                        badge = "⛔ THIẾU DỮ LIỆU DNA"
+                        border_color = "#747d8c"
                     else:
                         badge = "🔴 KHÓA LỆNH (TOXIC)"
                         border_color = "#ff4757"

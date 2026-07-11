@@ -33,18 +33,30 @@ def load_ohlc(file_path):
     df = df.rename(columns={'OPEN': 'Open', 'HIGH': 'High', 'LOW': 'Low', 'CLOSE': 'Close',
                             'TICKVOL': 'TickVol', 'VOL': 'Vol', 'SPREAD': 'Spread'})
     df = df.set_index('Datetime').sort_index()
-    df = df[['Open', 'High', 'Low', 'Close', 'TickVol']].astype(float)
-    return df
+    keep = ['Open', 'High', 'Low', 'Close']
+    for c in ('TickVol', 'Vol'):
+        if c in df.columns:
+            keep.append(c)
+    df = df[keep].astype(float)
+    # Prefer tick volume; if empty/zero fall back to real Vol (exchange/spot/futures)
+    return ensure_activity_volume(df)
 
 def resample_ohlc(df, timeframe='1h'):
     """Resample M1 data to higher timeframe."""
-    return df.resample(timeframe).agg({
+    df = ensure_activity_volume(df)
+    agg = {
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
         'Close': 'last',
-        'TickVol': 'sum'
-    }).dropna()
+        'TickVol': 'sum',
+    }
+    # Keep secondary volume cols if present (sum) for later re-resolve
+    for c in ('Vol', 'RealVolume', 'Volume'):
+        if c in df.columns and c not in agg:
+            agg[c] = 'sum'
+    out = df.resample(timeframe).agg({k: v for k, v in agg.items() if k in df.columns}).dropna(subset=['Open', 'High', 'Low', 'Close'])
+    return ensure_activity_volume(out)
 
 # ============================================================
 # REGIME INDICATORS
@@ -131,15 +143,183 @@ def calc_autocorr(returns, lag=1):
     return returns.autocorr(lag=lag)
 
 # Bump when indicator formulas change — invalidates stale .cache.pkl automatically.
-INDICATOR_CACHE_VERSION = 3
+INDICATOR_CACHE_VERSION = 5
+
+# Warm-up bars before DNA features are trusted (EMA200 horizon).
+DNA_WARMUP_BARS = 200
+
+# Features used for DNA (declared early so calc_regime_indicators can warm-up/invalidate them).
+# - Excludes same-bar Returns (noise / leakage).
+# - Excludes Hurst by default: Python multi-lag R/S ≠ simplified MQL5 Hurst → threshold không portable.
+DNA_FEATURE_COLS = ['ADX', 'ATR%', 'Choppiness', 'BB_Width', 'EMA_Dist%', 'Vol_ZScore', 'AutoCorr']
+
+# Core DNA features that MUST be present (finite, real market data — never empty placeholders).
+DNA_CORE_FEATURES = ['ADX', 'ATR%', 'Choppiness', 'BB_Width', 'EMA_Dist%', 'Vol_ZScore']
+
+# Scale-positive features: after warm-up, value ≤ 0 means incomplete/degenerate bar (not usable).
+# EMA_Dist% and Vol_ZScore may legitimately be ~0 (EMA cross / volume at mean) → only require finite.
+DNA_STRICT_POSITIVE = frozenset({'ADX', 'ATR%', 'Choppiness', 'BB_Width'})
+
+# Volume column priority for Vol_ZScore:
+# 1) tick volume (MT5 tick_volume / CSV TICKVOL)
+# 2) real / exchange volume (spot, futures COMEX, crypto exchange volume, Yahoo Volume, …)
+_VOLUME_COL_PRIORITY = (
+    'TickVol', 'tick_volume', 'TickVolume', 'TICKVOL',
+    'real_volume', 'RealVolume', 'REAL_VOLUME',
+    'Vol', 'Volume', 'volume', 'VOL',
+)
+
+
+def _series_usable_volume(s, min_nonzero=20):
+    """True if series has enough non-zero finite values for rolling z-score."""
+    if s is None:
+        return False
+    s = pd.to_numeric(s, errors='coerce')
+    if int(s.notna().sum()) < min_nonzero:
+        return False
+    return bool((s.fillna(0.0) > 0).sum() >= min_nonzero)
+
+
+def resolve_activity_volume(df):
+    """
+    Pick best usable activity/volume series from a frame.
+
+    Prefer tick volume; if missing/all-zero, fall back to real/exchange volume
+    from the data source (spot, futures, crypto, Yahoo/Twelve Volume, MT5 real_volume, …).
+
+    Returns (series, source_col_name) or (None, None).
+    """
+    if df is None or df.empty:
+        return None, None
+
+    cols_lower = {str(c).lower(): c for c in df.columns}
+    ordered, seen = [], set()
+
+    for name in _VOLUME_COL_PRIORITY:
+        actual = name if name in df.columns else cols_lower.get(name.lower())
+        if actual is not None and actual not in seen:
+            ordered.append(actual)
+            seen.add(actual)
+
+    # Any other *vol* column (exclude volatility-like names)
+    for c in df.columns:
+        if c in seen:
+            continue
+        cl = str(c).lower()
+        if 'vol' in cl and 'volatility' not in cl and cl not in ('vix',):
+            ordered.append(c)
+            seen.add(c)
+
+    for c in ordered:
+        s = pd.to_numeric(df[c], errors='coerce')
+        if _series_usable_volume(s):
+            return s.astype(float), str(c)
+    return None, None
+
+
+def ensure_activity_volume(df):
+    """
+    Ensure df has usable `TickVol` for Vol_ZScore.
+
+    If TickVol is empty/zero, fill from the best available volume column
+    (real volume of spot/futures/crypto from the feed). Sets
+    df.attrs['volume_source'] to the column name used (or None).
+    """
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        return df
+    out = df.copy()
+    # Preserve attrs (pandas copy usually keeps them; re-apply to be safe)
+    try:
+        out.attrs.update(getattr(df, 'attrs', {}) or {})
+    except Exception:
+        pass
+
+    series, src = resolve_activity_volume(out)
+    if series is not None:
+        if series.index.equals(out.index):
+            out['TickVol'] = series
+        else:
+            out['TickVol'] = series.reindex(out.index)
+        try:
+            out.attrs['volume_source'] = src
+        except Exception:
+            pass
+    else:
+        if 'TickVol' not in out.columns:
+            out['TickVol'] = np.nan
+        try:
+            out.attrs['volume_source'] = None
+        except Exception:
+            pass
+    return out
+
+
+def _has_usable_tickvol(df):
+    """True if any usable activity volume exists (tick or real/spot/futures)."""
+    if df is None or df.empty:
+        return False
+    # Fast path: TickVol already good
+    if 'TickVol' in df.columns and _series_usable_volume(df['TickVol']):
+        return True
+    series, _src = resolve_activity_volume(df)
+    return series is not None
+
+
+def dna_features_valid_mask(df):
+    """
+    Boolean mask: True where core DNA features are usable.
+    - All DNA_CORE_FEATURES must be finite (no NaN/Inf empty stand-ins).
+    - DNA_STRICT_POSITIVE must be > 0 (0 = missing/degenerate, not allowed).
+    - EMA_Dist% / Vol_ZScore: 0 is allowed if finite.
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    mask = pd.Series(True, index=df.index)
+    for col in DNA_CORE_FEATURES:
+        if col not in df.columns:
+            return pd.Series(False, index=df.index)
+        s = pd.to_numeric(df[col], errors='coerce')
+        col_ok = s.notna() & np.isfinite(s)
+        if col in DNA_STRICT_POSITIVE:
+            col_ok = col_ok & (s > 0)
+        mask = mask & col_ok
+    return mask
+
+
+def validate_dna_feature_row(feat_dict):
+    """
+    Validate one bar/trade feature dict.
+    Returns (ok: bool, issues: list[str]).
+    """
+    issues = []
+    if not feat_dict:
+        return False, ["Thiếu toàn bộ feature dict"]
+    for col in DNA_CORE_FEATURES:
+        if col not in feat_dict:
+            issues.append(f"{col}: thiếu cột")
+            continue
+        try:
+            val = float(feat_dict[col])
+        except (TypeError, ValueError):
+            issues.append(f"{col}: không phải số")
+            continue
+        if val != val or not np.isfinite(val):  # NaN / Inf
+            issues.append(f"{col}: trống/NaN/Inf (không được dùng placeholder)")
+            continue
+        if col in DNA_STRICT_POSITIVE and val <= 0:
+            issues.append(f"{col}={val}: ≤0 coi như chưa có dữ liệu hợp lệ")
+    return (len(issues) == 0), issues
 
 
 def calc_regime_indicators(df_h1, cache_path=None):
     """Calculate all regime indicators on H1 data (Extended 12+ Features) with Caching."""
     if df_h1 is not None and not df_h1.empty:
+        # Resolve volume first: tick → real/spot/futures from feed
+        df_h1 = ensure_activity_volume(df_h1)
         if df_h1.index.name == 'Time' or isinstance(df_h1.index, pd.DatetimeIndex):
             # Only keep weekday bars (Monday=0 to Friday=4). Drop Saturday=5, Sunday=6 to prevent weekend gaps skewing indicators.
             df_h1 = df_h1[df_h1.index.dayofweek < 5].copy()
+            df_h1 = ensure_activity_volume(df_h1)
 
     if cache_path and os.path.exists(cache_path):
         try:
@@ -154,7 +334,7 @@ def calc_regime_indicators(df_h1, cache_path=None):
 
     adx, plus_di, minus_di = calc_adx(df_h1, 14)
     atr = calc_atr(df_h1, 14)
-    atr_pct = atr / df_h1['Close'] * 100  # Normalized ATR as % of price
+    atr_pct = atr / df_h1['Close'].replace(0, np.nan) * 100  # Normalized ATR as % of price
     chop = calc_choppiness(df_h1, 14)
     returns = df_h1['Close'].pct_change()
 
@@ -167,10 +347,20 @@ def calc_regime_indicators(df_h1, cache_path=None):
     ema200 = df_h1['Close'].ewm(span=200, adjust=False).mean()
     ema_dist = (ema50 - ema200) / ema200.replace(0, np.nan) * 100
 
-    vol_mean = df_h1['TickVol'].rolling(20).mean() if 'TickVol' in df_h1 else pd.Series(0.0, index=df_h1.index)
-    vol_std = df_h1['TickVol'].rolling(20).std() if 'TickVol' in df_h1 else pd.Series(1.0, index=df_h1.index)
-    vol_zscore = (df_h1['TickVol'] - vol_mean) / vol_std.replace(0, np.nan) if 'TickVol' in df_h1 else pd.Series(0.0, index=df_h1.index)
-    vol_zscore = vol_zscore.fillna(0.0)
+    # Vol_ZScore on resolved activity volume (tick OR real/spot/futures).
+    # NEVER fillna(0) — missing volume stays NaN so downstream rejects empty data.
+    vol_src = None
+    try:
+        vol_src = (getattr(df_h1, 'attrs', {}) or {}).get('volume_source')
+    except Exception:
+        vol_src = None
+    if _has_usable_tickvol(df_h1) and 'TickVol' in df_h1.columns and _series_usable_volume(df_h1['TickVol']):
+        vol_mean = df_h1['TickVol'].rolling(20).mean()
+        vol_std = df_h1['TickVol'].rolling(20).std()
+        vol_zscore = (df_h1['TickVol'] - vol_mean) / vol_std.replace(0, np.nan)
+    else:
+        vol_zscore = pd.Series(np.nan, index=df_h1.index)
+        vol_src = None
 
     autocorr = returns.rolling(20).apply(lambda x: pd.Series(x).autocorr(lag=1), raw=False)
 
@@ -201,6 +391,28 @@ def calc_regime_indicators(df_h1, cache_path=None):
         'Hurst': hurst_s,
         'AutoCorr': autocorr,
     }, index=df_h1.index)
+    try:
+        res_df.attrs['volume_source'] = vol_src
+    except Exception:
+        pass
+
+    # Warm-up: first DNA_WARMUP_BARS are not trusted (EMA200 / ADX / roll windows immature).
+    # Mark DNA training features NaN so they cannot leak as 0 placeholders.
+    warmup_n = min(DNA_WARMUP_BARS, max(0, len(res_df) - 1))
+    if warmup_n > 0:
+        for col in DNA_FEATURE_COLS:
+            if col in res_df.columns:
+                res_df.iloc[:warmup_n, res_df.columns.get_loc(col)] = np.nan
+        # Also invalidate strict-positive raw columns used in live snapshot
+        for col in DNA_CORE_FEATURES:
+            if col in res_df.columns:
+                res_df.iloc[:warmup_n, res_df.columns.get_loc(col)] = np.nan
+
+    # Degenerate scale-positive → NaN (never keep 0 as if it were real data)
+    for col in DNA_STRICT_POSITIVE:
+        if col in res_df.columns:
+            s = res_df[col]
+            res_df[col] = s.where(s > 0, np.nan)
 
     if cache_path:
         try:
@@ -215,12 +427,6 @@ def calc_regime_indicators(df_h1, cache_path=None):
 # ============================================================
 # SUPERVISED STRATEGY PROFILING (AI REGIME DNA)
 # ============================================================
-
-# Features used for DNA.
-# - Excludes same-bar Returns (noise / leakage).
-# - Excludes Hurst by default: Python multi-lag R/S ≠ simplified MQL5 Hurst → threshold không portable.
-#   (Hurst vẫn tính trong calc_regime_indicators cho clustering / live contrast.)
-DNA_FEATURE_COLS = ['ADX', 'ATR%', 'Choppiness', 'BB_Width', 'EMA_Dist%', 'Vol_ZScore', 'AutoCorr']
 
 MQL5_VAR_MAP = {
     "ADX": "adx_val", "ATR%": "atr_pct_val", "Choppiness": "chop_val",
@@ -418,7 +624,12 @@ def build_trade_feature_table(df_h1, trades_df, indicators=None, cache_path=None
         return None, "Không còn lệnh nào có OpenTime hợp lệ sau khi làm sạch."
 
     available_cols = [c for c in DNA_FEATURE_COLS if c in indicators.columns]
+    missing_core = [c for c in DNA_CORE_FEATURES if c not in indicators.columns]
+    if missing_core:
+        return None, f"Thiếu cột DNA bắt buộc trong indicators: {missing_core}"
+
     rows = []
+    skipped_empty = 0
     bar_index = indicators.index
     for _, tr in trades.iterrows():
         bar = last_closed_bar_index(bar_index, tr['OpenTime'])
@@ -426,8 +637,14 @@ def build_trade_feature_table(df_h1, trades_df, indicators=None, cache_path=None
             continue
         feat = indicators.loc[bar, available_cols]
         if feat.isna().any():
+            skipped_empty += 1
             continue
         row = feat.to_dict()
+        ok, _issues = validate_dna_feature_row(row)
+        if not ok:
+            # Core feature empty / ≤0 placeholder — never train on blank DNA
+            skipped_empty += 1
+            continue
         row['OpenTime'] = tr['OpenTime']
         row['CloseTime'] = tr.get('Time', pd.NaT)
         row['Profit'] = float(tr.get('Profit', 0.0))
@@ -435,7 +652,13 @@ def build_trade_feature_table(df_h1, trades_df, indicators=None, cache_path=None
         rows.append(row)
 
     if len(rows) < 10:
-        return None, f"Không đủ mẫu trade-level (tìm thấy {len(rows)}, cần ≥ 10)."
+        hint = (
+            f" (đã bỏ {skipped_empty} lệnh vì DNA feature trống/NaN/≤0 — "
+            f"cần OHLC đủ warm-up ≥{DNA_WARMUP_BARS} nến + volume "
+            f"(tick hoặc real/spot/futures từ feed) cho Vol_ZScore)"
+            if skipped_empty else ""
+        )
+        return None, f"Không đủ mẫu trade-level (tìm thấy {len(rows)}, cần ≥ 10).{hint}"
 
     tbl = pd.DataFrame(rows).sort_values('OpenTime').reset_index(drop=True)
     return tbl, None
@@ -1541,17 +1764,30 @@ def log_live_monitor_eval(symbol, timeframe, eval_res):
         if history and history[-1].get("symbol") == symbol and history[-1].get("timeframe") == timeframe and history[-1].get("latest_time") == latest_time:
             return False
             
+        latest_bar = eval_res.get("latest_bar") or {}
+
+        def _finite_or_none(key):
+            v = latest_bar.get(key)
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                return None
+            return fv if np.isfinite(fv) else None
+
         record = {
             "timestamp_logged": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "latest_time": latest_time,
             "symbol": symbol,
             "timeframe": timeframe,
-            "adx": eval_res.get("latest_bar", {}).get("ADX", 0),
-            "hurst": eval_res.get("latest_bar", {}).get("Hurst", 0.5),
-            "choppiness": eval_res.get("latest_bar", {}).get("Choppiness", 50),
-            "bb_width": eval_res.get("latest_bar", {}).get("BB_Width", 0),
-            "atr_pct": eval_res.get("latest_bar", {}).get("ATR%", 0),
-            "vol_zscore": eval_res.get("latest_bar", {}).get("Vol_ZScore", 0),
+            # None when missing — never invent 0/0.5/50 as fake indicator data
+            "adx": _finite_or_none("ADX"),
+            "hurst": _finite_or_none("Hurst"),
+            "choppiness": _finite_or_none("Choppiness"),
+            "bb_width": _finite_or_none("BB_Width"),
+            "atr_pct": _finite_or_none("ATR%"),
+            "vol_zscore": _finite_or_none("Vol_ZScore"),
+            "ema_dist": _finite_or_none("EMA_Dist%"),
+            "dna_features_ok": bool(eval_res.get("dna_features_ok", False)),
             "evaluations": {
                 k: {
                     "status": v.get("status"),
@@ -1743,12 +1979,14 @@ def fetch_twelvedata_ohlc(symbol="XAU/USD", timeframe="1h", outputsize=500,
         "High": df["high"],
         "Low": df["low"],
         "Close": df["close"],
-        "TickVol": df["volume"] if "volume" in df.columns else 0.0,
     })
+    # Keep feed volume as Volume; ensure_activity_volume maps to TickVol if usable
+    if "volume" in df.columns:
+        out["Volume"] = df["volume"]
     out.index = pd.DatetimeIndex(df["datetime"])
     out.index.name = "Time"
-    out["TickVol"] = out["TickVol"].fillna(0.0)
     out = out.dropna(subset=["Open", "High", "Low", "Close"])
+    out = ensure_activity_volume(out)
 
     try:
         out.attrs["twelvedata_symbol"] = td_symbol
@@ -1869,12 +2107,14 @@ def fetch_live_ohlc(source_type, symbol="GC=F", timeframe="1h", limit=500, api_k
                     f"Hoặc dùng **File CSV MT5** cho khớp DNA."
                 )
 
-            df = df.rename(columns={"Volume": "TickVol"})
-            if "TickVol" not in df.columns:
-                df["TickVol"] = 0.0
+            # Keep Yahoo Volume as real/exchange volume (futures GC=F, crypto, equities).
+            # ensure_activity_volume → TickVol if usable (forex =X often has 0 → stays unusable).
+            if "Volume" not in df.columns and "volume" in df.columns:
+                df = df.rename(columns={"volume": "Volume"})
             df.index.name = "Time"
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
+            df = ensure_activity_volume(df)
 
             if timeframe == "4h" and yf_interval == "1h":
                 df = resample_ohlc(df, "4h")
@@ -1921,8 +2161,18 @@ def fetch_live_ohlc(source_type, symbol="GC=F", timeframe="1h", limit=500, api_k
 
         df = pd.DataFrame(rates)
         df['Time'] = pd.to_datetime(df['time'], unit='s')
-        df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'tick_volume': 'TickVol'})
-        df = df.set_index('Time')[['Open', 'High', 'Low', 'Close', 'TickVol']]
+        rename = {
+            'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close',
+            'tick_volume': 'TickVol', 'real_volume': 'RealVolume',
+        }
+        df = df.rename(columns=rename)
+        keep = ['Open', 'High', 'Low', 'Close']
+        for c in ('TickVol', 'RealVolume'):
+            if c in df.columns:
+                keep.append(c)
+        df = df.set_index('Time')[keep]
+        # Prefer tick_volume; if broker fills real_volume only, fall back automatically
+        df = ensure_activity_volume(df)
         try:
             df.attrs["mt5_symbol_used"] = used_sym
         except Exception:
@@ -2010,12 +2260,12 @@ def fetch_historical_ohlc(symbol="GC=F", timeframe="1h", period="2y",
                 f"Thử **Twelve Data** (XAU/USD) hoặc CSV MT5."
             )
 
-        df = df.rename(columns={"Volume": "TickVol"})
-        if "TickVol" not in df.columns:
-            df["TickVol"] = 0.0
+        if "Volume" not in df.columns and "volume" in df.columns:
+            df = df.rename(columns={"volume": "Volume"})
         df.index.name = "Time"
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
+        df = ensure_activity_volume(df)
 
         if timeframe == "4h" and yf_interval == "1h":
             df = resample_ohlc(df, "4h")
@@ -2036,25 +2286,92 @@ def evaluate_live_market(df_h1, registry_data):
     DNA v2: uses serialized rule_paths (same tree as train/OOS deploy) — not win/loss centroids.
     Legacy v1 profiles without rule_paths: fall back to centroid heuristic with a warning.
     Uses iloc[-2] when possible so the bar is fully closed (avoids partial live candle leakage).
+
+    Core DNA features (ADX, ATR%, Chop, BB_Width, EMA_Dist%, Vol_ZScore) MUST be finite
+    and scale-positive where required — never evaluate on empty/0 placeholders.
     """
     if df_h1 is None or (hasattr(df_h1, 'empty') and df_h1.empty) or not registry_data:
         return {}
 
+    tickvol_ok = _has_usable_tickvol(df_h1)
     ind_df = calc_regime_indicators(df_h1)
     if ind_df.empty:
-        return {}
+        return {
+            "latest_bar": {},
+            "latest_time": None,
+            "dna_features_ok": False,
+            "error": "Không tính được indicators (OHLC rỗng).",
+            "evaluations": {},
+        }
 
-    # Prefer last fully closed bar: if feed includes an incomplete current bar, drop it.
-    # With resampled/historical feeds, iloc[-1] is usually closed; still drop NaN rows first.
-    ind_valid = ind_df.dropna(subset=[c for c in DNA_FEATURE_COLS if c in ind_df.columns], how='any')
+    # Only bars with complete core DNA (ADX, ATR%, Chop, BB_Width, EMA_Dist%, Vol_Z)
+    # AutoCorr is optional at live eval time (often sparse); tree paths that need it still check per-condition.
+    valid_mask = dna_features_valid_mask(ind_df)
+    ind_valid = ind_df.loc[valid_mask]
     if ind_valid.empty:
-        ind_valid = ind_df.dropna(how='all')
-    if ind_valid.empty:
-        return {}
+        reason_parts = [
+            f"DNA features không đủ dữ liệu trên nến đóng gần nhất "
+            f"(cần finite; ADX/ATR%/Chop/BB_Width > 0; warm-up ≥{DNA_WARMUP_BARS} nến)."
+        ]
+        if not tickvol_ok:
+            reason_parts.append(
+                "Volume thiếu/toàn 0 → Vol_ZScore = NaN. "
+                "Cần tick volume (MT5) hoặc real volume từ nguồn (futures GC=F, spot/crypto exchange, Twelve/Yahoo Volume)."
+            )
+        err_msg = " ".join(reason_parts)
+        results = {}
+        for strat_name, profile in registry_data.items():
+            results[strat_name] = {
+                "status": "NO_DATA",
+                "match_pct": 0.0,
+                "reasons": [f"⛔ {err_msg}", "Không đánh giá DNA khi feature trống — coi như CHƯA CÓ TÍN HIỆU."],
+                "latest_time": None,
+                "timeframe": profile.get("timeframe", "1h"),
+                "accuracy": profile.get("accuracy", 0),
+                "cv_accuracy": profile.get("cv_accuracy", 0),
+                "pred_expectancy": None,
+                "is_toxic": None,
+                "is_safe": False,
+                "leaf_id": None,
+                "eval_mode": "no_data",
+                "oos_status": profile.get("oos_status", "N/A"),
+                "block_precision": profile.get("block_precision", 0),
+            }
+        return {
+            "latest_bar": {},
+            "latest_time": None,
+            "dna_features_ok": False,
+            "error": err_msg,
+            "evaluations": results,
+        }
 
     # Use last bar with finite DNA features
     latest_bar = ind_valid.iloc[-1].to_dict()
     latest_time = str(ind_valid.index[-1])
+    ok, issues = validate_dna_feature_row(latest_bar)
+    if not ok:
+        err_msg = "Feature không hợp lệ: " + "; ".join(issues)
+        results = {
+            s: {
+                "status": "NO_DATA",
+                "match_pct": 0.0,
+                "reasons": [f"⛔ {err_msg}"],
+                "latest_time": latest_time,
+                "timeframe": (registry_data[s] or {}).get("timeframe", "1h"),
+                "pred_expectancy": None,
+                "is_toxic": None,
+                "is_safe": False,
+                "eval_mode": "no_data",
+            }
+            for s in registry_data
+        }
+        return {
+            "latest_bar": latest_bar,
+            "latest_time": latest_time,
+            "dna_features_ok": False,
+            "error": err_msg,
+            "evaluations": results,
+        }
 
     results = {}
     for strat_name, profile in registry_data.items():
@@ -2137,7 +2454,12 @@ def evaluate_live_market(df_h1, registry_data):
             "block_precision": profile.get("block_precision", 0),
         }
 
-    return {"latest_bar": latest_bar, "latest_time": latest_time, "evaluations": results}
+    return {
+        "latest_bar": latest_bar,
+        "latest_time": latest_time,
+        "dna_features_ok": True,
+        "evaluations": results,
+    }
 
 
 
