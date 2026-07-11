@@ -1,0 +1,426 @@
+﻿diff --git a/profit_strategy/analyzer/strategy_analyzer.py b/profit_strategy/analyzer/strategy_analyzer.py
+index 40b0064..e8e40f6 100644
+--- a/profit_strategy/analyzer/strategy_analyzer.py
++++ b/profit_strategy/analyzer/strategy_analyzer.py
+@@ -50,15 +50,29 @@ def get_drive_service():
+ 
+     try:
+         from google.oauth2.credentials import Credentials as OAuthCredentials
++        from google.auth.exceptions import RefreshError
+         
+         # Phương án 1: OAuth 2.0 User Flow từ Streamlit Cloud Secrets [google_oauth_token]
+         oauth_secret = get_secret("google_oauth_token")
+         if oauth_secret:
+-            creds = OAuthCredentials.from_authorized_user_info(dict(oauth_secret), SCOPES)
+-            if creds and creds.expired and creds.refresh_token:
+-                creds.refresh(Request())
+-            if creds and creds.valid:
+-                return build('drive', 'v3', credentials=creds)
++            try:
++                creds = OAuthCredentials.from_authorized_user_info(dict(oauth_secret), SCOPES)
++                if creds and creds.expired and creds.refresh_token:
++                    creds.refresh(Request())
++                if creds and creds.valid:
++                    return build('drive', 'v3', credentials=creds)
++            except RefreshError as re:
++                st.sidebar.error(
++                    "⚠️ **Token Google Drive trên Streamlit Cloud Secrets đã hết hạn (`invalid_grant`).**\n\n"
++                    "**Nguyên nhân:** OAuth App trên Google Cloud Console đang ở chế độ `Testing` (tự hết hạn sau 7 ngày).\n\n"
++                    "**Cách khắc phục vĩnh viễn:**\n"
++                    "1. Vào Google Cloud Console -> **OAuth consent screen** -> bấm **PUBLISH APP**.\n"
++                    "2. Chạy lại app ở máy Local để đăng nhập cấp lại `token.json` mới.\n"
++                    "3. Copy nội dung `token.json` mới vào `[google_oauth_token]` trong Secrets trên Streamlit Cloud!"
++                )
++                return None
++            except Exception as e:
++                st.sidebar.warning(f"Lỗi khởi tạo Drive từ Secrets: {e}")
+ 
+         # Phương án 2: OAuth 2.0 User Flow từ file local (token.json hoặc token.pickle)
+         if os.path.exists('token.json'):
+@@ -68,14 +82,27 @@ def get_drive_service():
+                 creds = pickle.load(token)
+                 
+         if creds and creds.expired and creds.refresh_token:
+-            creds.refresh(Request())
+-            if os.path.exists('token.json'):
+-                with open('token.json', 'w', encoding='utf-8') as f:
+-                    f.write(creds.to_json())
+-            elif os.path.exists('token.pickle'):
+-                with open('token.pickle', 'wb') as token:
+-                    pickle.dump(creds, token)
++            try:
++                creds.refresh(Request())
++                if os.path.exists('token.json'):
++                    with open('token.json', 'w', encoding='utf-8') as f:
++                        f.write(creds.to_json())
++                elif os.path.exists('token.pickle'):
++                    with open('token.pickle', 'wb') as token:
++                        pickle.dump(creds, token)
++            except Exception as e:
++                # Token hết hạn 7 ngày / thu hồi -> Xóa file cũ để kích hoạt lại quy trình xác thực qua trình duyệt
++                if os.path.exists('token.json'):
++                    try: os.remove('token.json')
++                    except Exception: pass
++                if os.path.exists('token.pickle'):
++                    try: os.remove('token.pickle')
++                    except Exception: pass
++                creds = None
+         elif not creds or not creds.valid:
++            pass
++
++        if not creds or not creds.valid:
+             if os.path.exists('credentials.json'):
+                 flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                 creds = flow.run_local_server(port=0)
+@@ -306,18 +333,44 @@ def load_backtest(file_path):
+         trades = df[df['Profit'].notna() & (df['Profit'] != 0)].copy()
+ 
+     log_progress("🔗 Bước 4: Đang đối chiếu các vị thế In/Out (khớp lệnh vào/ra)...")
+-    # Build entry info: match each "out" deal to its "in" deal via Order
++    # Build entry info: MT5 often uses different Order IDs for IN vs OUT, so Order-join
++    # matches 0 rows. Prefer FIFO volume-aware pairing; fall back to Order join.
++    open_matched = 0
+     if 'Direction' in df.columns and 'Order' in df.columns:
+         entries = df[df['Direction'].astype(str).str.strip().str.lower() == 'in'].copy()
+         entry_map = entries.set_index('Order')[['Time', 'Price', 'Type']].rename(
+             columns={'Time': 'OpenTime', 'Price': 'OpenPrice', 'Type': 'TradeType'})
+-        # Some orders may not exist, use left join
+         if 'Order' in trades.columns:
+             trades = trades.merge(entry_map, left_on='Order', right_index=True, how='left')
++            open_matched = int(trades['OpenTime'].notna().sum()) if 'OpenTime' in trades.columns else 0
++
++    if open_matched < max(1, int(0.5 * len(trades))) and 'Direction' in df.columns:
++        # FIFO volume pairing — critical for Regime DNA (must use entry time, not close time)
++        try:
++            import regime_analyzer as _ra
++            paired = _ra.ensure_trade_open_times_from_deals(df)
++            if paired is not None and not paired.empty and 'OpenTime' in paired.columns:
++                # Align by close Time + Profit
++                key = ['Time', 'Profit'] if 'Profit' in trades.columns and 'Profit' in paired.columns else ['Time']
++                keep_cols = ['OpenTime']
++                if 'OpenPrice' in paired.columns:
++                    keep_cols.append('OpenPrice')
++                if 'TradeType' in paired.columns:
++                    keep_cols.append('TradeType')
++                trades = trades.drop(columns=[c for c in keep_cols if c in trades.columns], errors='ignore')
++                trades = trades.merge(paired[key + keep_cols].drop_duplicates(key), on=key, how='left')
++                open_matched = int(trades['OpenTime'].notna().sum()) if 'OpenTime' in trades.columns else 0
++                log_progress(f"✅ Ghép IN/OUT FIFO: {open_matched}/{len(trades)} lệnh có OpenTime.")
++        except Exception as e:
++            log_progress(f"⚠️ Không ghép được FIFO OpenTime: {e}")
+ 
+-    # Duration
+     if 'OpenTime' in trades.columns:
+         trades['Duration'] = (trades['Time'] - trades['OpenTime']).dt.total_seconds() / 3600.0
++    # Attach raw deals for DNA repair if needed later
++    try:
++        trades.attrs['raw_deals'] = df
++    except Exception:
++        pass
+     trades.reset_index(drop=True, inplace=True)
+ 
+     log_progress("📈 Bước 5: Đang tổng hợp các chỉ số hiệu suất từ Header...")
+@@ -847,92 +900,173 @@ def run_monte_carlo(profits, n_sims=10000, init_balance=5000):
+ # REGIME DNA TAB RENDERER (UI Helper)
+ # ============================================================
+ def render_dna_tabs(data_dict):
+-    st.markdown(f"**Độ chính xác Train**: `{data_dict.get('accuracy', 0)*100:.1f}%` | **Purged CV (Chống Overfit)**: `{data_dict.get('cv_accuracy', 0)*100:.1f}%` | **Out-of-Sample (Holdout OOS)**: `{data_dict.get('oos_accuracy', 0)*100:.1f}%` ({data_dict.get('oos_status', 'N/A')}) | **Mẫu**: `{data_dict.get('sample_count', 0)}` lệnh ({data_dict.get('win_count', 0)} Thắng / {data_dict.get('loss_count', 0)} Thua)")
+-    
+-    if data_dict.get('cv_accuracy', 0) >= 0.65:
+-        st.info("🛡️ **Anti-Overfitting Verified**: Điểm số kiểm định chéo Purged K-Fold đạt mức cao và ổn định, bộ lọc đảm bảo không bị overfit vào dữ liệu nhiễu.")
+-    if data_dict.get("features_csv_path") and os.path.exists(data_dict["features_csv_path"]):
+-        st.markdown(f"📂 **Bảng dữ liệu chỉ số bối cảnh từng lệnh đã lưu sẵn**: `{data_dict['features_csv_path']}`")
+-        
+-    p_tab1, p_tab2, p_tab3, p_tab4, p_tab5, p_tab6 = st.tabs(["💻 Code MQL5 Bộ Lọc", "📊 Cây Quyết Định (Text)", "⏳ Ổn Định Theo Thời Gian", "🔍 Phân Cụm Không Giám Sát", "⚖️ Đối Chiếu Thắng vs Thua", "📏 Phân Vùng Lãi/Lỗ"])
+-    
++    ver = data_dict.get("dna_version", "v1")
++    st.markdown(
++        f"**DNA `{ver}`** | **Mẫu**: `{data_dict.get('sample_count', 0)}` lệnh "
++        f"({data_dict.get('win_count', 0)} Thắng / {data_dict.get('loss_count', 0)} Thua) | "
++        f"**OOS**: `{data_dict.get('oos_status', 'N/A')}` | "
++        f"**exp_threshold**: `{data_dict.get('exp_threshold', 0)}` | "
++        f"**Block precision**: `{data_dict.get('block_precision', 0)}%` "
++        f"(tỷ lệ lệnh bị chặn thực sự ≤ 0$)"
++    )
++
++    # Diagnosis + filter impact (core of v2)
++    if data_dict.get("diagnosis"):
++        st.markdown("### 🩺 Chẩn đoán Filter Impact")
++        for line in data_dict["diagnosis"]:
++            st.markdown(f"- {line}")
++
++    impact = data_dict.get("filter_impact")
++    if impact:
++        c1, c2, c3, c4 = st.columns(4)
++        base, filt = impact["baseline"], impact["filtered"]
++        c1.metric("Net (sau filter)", f"${filt['net']:,.0f}", f"{impact['delta_net']:+.0f}")
++        c2.metric("MaxDD (sau filter)", f"{filt['maxdd']:.1f}%", f"{impact['delta_maxdd']:+.1f}pp")
++        c3.metric("Profit Factor", f"{filt['pf']}", f"{impact['delta_pf']:+.2f}")
++        c4.metric("Tỷ lệ chặn", f"{impact['block_rate_pct']}%", f"blocked net ${impact['blocked_net_pnl']:,.0f}")
++
++    if data_dict.get("legacy_winrate_filter_impact"):
++        leg = data_dict["legacy_winrate_filter_impact"]
++        with st.expander("⚠️ So sánh với filter cũ (Win/Loss Allow-List) — thường là nguyên nhân profit giảm mà DD không giảm"):
++            st.write(leg)
++
++    if data_dict.get("features_csv_path"):
++        st.markdown(f"📂 **Features CSV**: `{data_dict['features_csv_path']}`")
++
++    p_tab1, p_tab2, p_tab3, p_tab4, p_tab5, p_tab6, p_tab7 = st.tabs([
++        "💻 Code MQL5 Bộ Lọc",
++        "📊 Cây Expectancy",
++        "🍃 Leaf Stats",
++        "⏳ Ổn Định Theo Thời Gian",
++        "🔍 Phân Cụm Không Giám Sát",
++        "⚖️ Đối Chiếu Thắng vs Thua",
++        "📏 Phân Vùng Lãi/Lỗ",
++    ])
++
+     with p_tab1:
+-        st.markdown("Copy toàn bộ câu lệnh điều kiện dưới đây gắn vào đầu hàm `OnTick()` của EA trên MT5:")
++        st.markdown(
++            "**DNA v2 = BLOCK-LIST theo expectancy** (chỉ chặn vùng kỳ vọng âm). "
++            "Copy vào EA, tính chỉ số trên nến H1 **đã đóng** (shift=1)."
++        )
+         st.code(data_dict.get("mql5_code", ""), language="mql5")
+-        
++        if data_dict.get("mql5_legacy_code"):
++            with st.expander("Legacy MQL5 (Win-Rate Allow-List — không khuyến nghị)"):
++                st.code(data_dict["mql5_legacy_code"], language="mql5")
++
+     with p_tab2:
++        st.caption("Cây hồi quy PnL (expectancy). Giá trị leaf = $ kỳ vọng / lệnh.")
+         st.text(data_dict.get("tree_text", ""))
+         if data_dict.get("top_features"):
+-            st.markdown("**Các Đặc Trưng Quan Trọng Nhất (Feature Importances):**")
+-            imp_df = pd.DataFrame(list(data_dict["top_features"].items()), columns=["Chỉ số", "Tầm quan trọng"]).sort_values("Tầm quan trọng", ascending=False)
++            st.markdown("**Feature Importances (Expectancy model):**")
++            imp_df = pd.DataFrame(
++                list(data_dict["top_features"].items()), columns=["Chỉ số", "Tầm quan trọng"]
++            ).sort_values("Tầm quan trọng", ascending=False)
+             st.dataframe(imp_df, hide_index=True)
+-            
++
+     with p_tab3:
++        leaves = data_dict.get("leaf_stats") or []
++        if leaves:
++            st.markdown(
++                f"Ngưỡng chặn: **exp ≤ {data_dict.get('exp_threshold', 0)}**. "
++                f"Toxic leaves: **{len(data_dict.get('toxic_leaves') or [])}** | "
++                f"Safe leaves: **{len(data_dict.get('good_leaves') or [])}**"
++            )
++            lf = pd.DataFrame(leaves)
++            st.dataframe(
++                lf.style.background_gradient(subset=["expectancy", "net_pnl"], cmap="RdYlGn"),
++                hide_index=True,
++            )
++        else:
++            st.info("Chưa có leaf stats — hãy huấn luyện lại DNA v2.")
++
++    with p_tab4:
+         stab_data = data_dict.get("feature_stability_analysis", {})
+         if stab_data and "error" not in stab_data:
+-            st.markdown(f"**Phân tích độ ổn định qua {stab_data.get('valid_periods', 0)} chu kỳ thời gian liên tiếp (Time-Decay / Concept Drift):**")
++            st.markdown(
++                f"**Độ ổn định qua {stab_data.get('valid_periods', 0)} chu kỳ "
++                f"(Expectancy regressor):**"
++            )
+             if stab_data.get("robust_features"):
+-                st.success(f"🟢 **Robust DNA (Các chỉ số ổn định nhất)**: `{', '.join(stab_data['robust_features'])}`")
++                st.success(f"🟢 **Robust DNA**: `{', '.join(stab_data['robust_features'])}`")
+             if stab_data.get("drift_warnings"):
+-                st.warning(f"🔴 **Concept Drift (Cảnh báo thoái hóa/không ổn định)**: `{', '.join(stab_data['drift_warnings'])}` - Chỉ số này có nguy cơ overfit hoặc thoái hóa theo thời gian.")
+-            st.markdown("---")
+-            st.markdown("**Bảng Tổng Hợp Độ Ổn Định Từng Chỉ Số:**")
++                st.warning(
++                    f"🔴 **Concept Drift**: `{', '.join(stab_data['drift_warnings'])}`"
++                )
+             st_df = pd.DataFrame(stab_data.get("stability_summary", []))
+             if not st_df.empty:
+-                st_df = st_df.rename(columns={"feature": "Chỉ số", "appearance_count": "Tần suất xuất hiện", "consistency_pct": "Độ ổn định (%)", "avg_importance": "Trọng số TB", "status": "Trạng thái"})
+-                st.dataframe(st_df.style.background_gradient(subset=["Độ ổn định (%)"], cmap="RdYlGn"), hide_index=True)
+-            with st.expander("🔍 Chi tiết Win Rate & Đặc trưng theo từng chu kỳ"):
++                st_df = st_df.rename(columns={
++                    "feature": "Chỉ số", "appearance_count": "Tần suất",
++                    "consistency_pct": "Độ ổn định (%)", "avg_importance": "Trọng số TB",
++                    "status": "Trạng thái",
++                })
++                st.dataframe(
++                    st_df.style.background_gradient(subset=["Độ ổn định (%)"], cmap="RdYlGn"),
++                    hide_index=True,
++                )
++            with st.expander("Chi tiết theo chu kỳ"):
+                 p_df = pd.DataFrame(stab_data.get("period_details", []))
+                 if not p_df.empty:
+                     p_df = p_df.drop(columns=["top_features"], errors="ignore")
+-                    p_df = p_df.rename(columns={"period_idx": "Chu kỳ #", "time_range": "Khoảng thời gian", "sample_count": "Số lệnh", "win_rate": "Win Rate (%)", "accuracy": "Độ chính xác AI (%)"})
+                     st.dataframe(p_df, hide_index=True)
+         else:
+-            st.info("Chưa có dữ liệu phân tích độ ổn định thời gian cho chiến lược này. Vui lòng huấn luyện lại phía dưới.")
+-            
+-    with p_tab4:
++            st.info(stab_data.get("error", "Chưa có dữ liệu ổn định. Huấn luyện lại."))
++
++    with p_tab5:
+         clus_data = data_dict.get("unsupervised_clustering_analysis", {})
+         if clus_data and "error" not in clus_data:
+-            st.markdown(f"**Phân cụm thị trường không giám sát (K-Means K={clus_data.get('n_clusters', 3)}) & Đối chứng kép:**")
+-            st.info(f"🏆 **Cụm thị trường EA hoạt động hiệu quả nhất**: **`{clus_data.get('best_cluster_name', '')}`** (Win Rate cao nhất: **{clus_data.get('best_win_rate', 0)}%**)")
+-            st.markdown("---")
+-            st.markdown("**Hiệu Suất Thực Tế Của EA Trên Từng Cụm Thị Trường (Unsupervised Validation):**")
++            st.info(
++                f"🏆 Cụm tốt nhất: **`{clus_data.get('best_cluster_name', '')}`** "
++                f"(WR {clus_data.get('best_win_rate', 0)}%)"
++            )
+             tc_df = pd.DataFrame(clus_data.get("trade_cluster_stats", []))
+             if not tc_df.empty:
+-                tc_df = tc_df.rename(columns={"cluster_name": "Tên cụm bối cảnh (Centroid)", "total_trades": "Tổng lệnh", "win_count": "Thắng", "loss_count": "Thua", "win_rate": "Win Rate (%)", "net_pnl": "Net PnL ($)", "avg_pnl": "TB PnL/Lệnh ($)"})
+-                tc_df = tc_df.drop(columns=["cluster_id"], errors="ignore")
+-                st.dataframe(tc_df.style.background_gradient(subset=["Win Rate (%)", "Net PnL ($)"], cmap="RdYlGn"), hide_index=True)
+-            with st.expander("📊 Xem Hồ Sơ Ngữ Nghĩa Của Từng Cụm (Centroids Profiles)"):
+-                cp_df = pd.DataFrame(clus_data.get("cluster_profiles", []))
+-                if not cp_df.empty:
+-                    cp_df = cp_df.rename(columns={"name": "Tên cụm", "candle_count": "Số nến H1", "pct_time": "Tỷ lệ thời gian (%)", "adx_mean": "ADX TB", "atr_pct_mean": "ATR% TB", "chop_mean": "Chop TB", "hurst_mean": "Hurst TB", "bb_width_mean": "BB Width TB"})
+-                    st.dataframe(cp_df, hide_index=True)
++                tc_df = tc_df.rename(columns={
++                    "cluster_name": "Cụm", "total_trades": "Tổng lệnh",
++                    "win_count": "Thắng", "loss_count": "Thua", "win_rate": "Win Rate (%)",
++                    "net_pnl": "Net PnL ($)", "avg_pnl": "TB PnL/Lệnh ($)",
++                }).drop(columns=["cluster_id"], errors="ignore")
++                st.dataframe(
++                    tc_df.style.background_gradient(subset=["Win Rate (%)", "Net PnL ($)"], cmap="RdYlGn"),
++                    hide_index=True,
++                )
+         else:
+-            st.info("Chưa có dữ liệu phân cụm không giám sát. Vui lòng huấn luyện lại phía dưới.")
+-            
+-    with p_tab5:
++            st.info("Chưa có dữ liệu phân cụm.")
++
++    with p_tab6:
+         w_ctx = data_dict.get("win_context", {})
+         l_ctx = data_dict.get("loss_context", {})
+         if w_ctx:
+             contrast_df = pd.DataFrame({
+                 "Chỉ số Bối Cảnh": list(w_ctx.keys()),
+                 "Khi EA THẮNG (Mean)": list(w_ctx.values()),
+-                "Khi EA THUA (Mean)": [l_ctx.get(k, 0) for k in w_ctx.keys()]
++                "Khi EA THUA (Mean)": [l_ctx.get(k, 0) for k in w_ctx.keys()],
+             })
+-            contrast_df["Chênh Lệch"] = contrast_df["Khi EA THẮNG (Mean)"] - contrast_df["Khi EA THUA (Mean)"]
+-            st.dataframe(contrast_df.style.background_gradient(subset=["Chênh Lệch"], cmap="RdYlGn"), hide_index=True)
+-            
+-    with p_tab6:
++            contrast_df["Chênh Lệch"] = (
++                contrast_df["Khi EA THẮNG (Mean)"] - contrast_df["Khi EA THUA (Mean)"]
++            )
++            st.dataframe(
++                contrast_df.style.background_gradient(subset=["Chênh Lệch"], cmap="RdYlGn"),
++                hide_index=True,
++            )
++
++    with p_tab7:
+         range_data = data_dict.get("range_analysis", {})
+         if range_data:
+-            st.markdown("Phân rã các chỉ số quan trọng thành từng vùng (Range/Bin) để tránh overfit vào một ngưỡng cắt duy nhất:")
++            st.markdown("Phân vùng theo **Win Rate + Expectancy ($)** — đừng chỉ nhìn WR:")
+             for feat_name, zones in range_data.items():
+-                st.markdown(f"**🔹 Chỉ số: `{feat_name}`**")
+-                z_df = pd.DataFrame(zones)
+-                z_df = z_df.rename(columns={"range": "Vùng giá trị (Bin)", "total_trades": "Tổng số lệnh", "win_count": "Số lệnh Thắng", "win_rate": "Tỷ lệ Thắng (%)"})
+-                st.dataframe(z_df.style.background_gradient(subset=["Tỷ lệ Thắng (%)"], cmap="RdYlGn"), hide_index=True)
++                st.markdown(f"**🔹 `{feat_name}`**")
++                z_df = pd.DataFrame(zones).rename(columns={
++                    "range": "Vùng", "total_trades": "Số lệnh",
++                    "win_count": "Thắng", "win_rate": "WR (%)",
++                    "expectancy": "Expectancy ($)", "net_pnl": "Net ($)",
++                })
++                cols = [c for c in ["WR (%)", "Expectancy ($)", "Net ($)"] if c in z_df.columns]
++                st.dataframe(
++                    z_df.style.background_gradient(subset=cols, cmap="RdYlGn") if cols else z_df,
++                    hide_index=True,
++                )
+         else:
+-            st.info("Chưa có dữ liệu phân vùng cho chiến lược này.")
++            st.info("Chưa có dữ liệu phân vùng.")
+ 
+ # ============================================================
+ # MAIN APP
+@@ -1583,9 +1717,13 @@ def main():
+         st.markdown(ins)
+ 
+     # ── STEP 9: AI STRATEGY PROFILING (REGIME DNA) ────────────────
+-    st.header("9️⃣ 🧬 AI Strategy Profiling (Reverse Regime DNA)")
++    st.header("9️⃣ 🧬 AI Strategy Profiling (Reverse Regime DNA v2)")
+     st.markdown("""
+-    Giải mã "ADN bối cảnh" của chiến lược: Học máy (Decision Tree) đối chiếu bối cảnh lúc Thắng vs Thua để tự động bốc tách ra luật lọc MQL5 gắn ngược lại vào EA.
++    **DNA v2 (Expectancy Block-List)** — sửa 2 lỗi chính của filter cũ:
++    1. Map bối cảnh tại **thời điểm vào lệnh** (OpenTime), không dùng lúc đóng lệnh (lookahead).
++    2. Học **expectancy ($/lệnh)** thay vì Win/Loss — chiến lược R:R cao (WR ~30%) vẫn lãi ở vùng WR 25%; allow-list theo WR sẽ cắt lệnh lãi lớn → **profit giảm, DD không giảm**.
++
++    Filter chỉ **chặn leaf toxic** (kỳ vọng ≤ 0), giữ phần lớn lệnh.
+     """)
+ 
+     import regime_analyzer
+@@ -1634,12 +1772,17 @@ def main():
+             sel_ohlc = st.selectbox("📥 Chọn file CSV có sẵn trên hệ thống:", ohlc_names)
+             ohlc_ref_name = sel_ohlc
+             
+-    prof_col3, prof_col4 = st.columns([1, 2])
++    prof_col3, prof_col4, prof_col5 = st.columns([1, 1, 1])
+     max_depth_input = prof_col3.number_input("Độ sâu cây AI (Max Depth)", min_value=1, max_value=5, value=3)
+     timeframe_sel = prof_col4.selectbox("Khung thời gian soi bối cảnh", ["1h", "4h"], index=0)
+-    
++    exp_thr_input = prof_col5.number_input(
++        "Ngưỡng expectancy chặn ($)",
++        min_value=-20.0, max_value=20.0, value=0.0, step=1.0,
++        help="Chặn leaf có kỳ vọng ≤ ngưỡng. 0 = chặn vùng âm. Nới -2/-5 nếu filter quá chặt.",
++    )
++
+     if st.button("🚀 Huấn luyện AI & Bốc tách Luật Regime DNA", type="primary"):
+-        with st.spinner("Đang chuẩn bị dữ liệu lịch sử giá & tính toán 12+ chỉ số bối cảnh..."):
++        with st.spinner("Đang map OpenTime + tính chỉ số bối cảnh tại ENTRY + train expectancy tree..."):
+             try:
+                 if ohlc_source_mode == "🌐 Tải từ Yahoo Finance API (Tự động & Khuyên dùng)":
+                     df_tf, err_msg = regime_analyzer.fetch_historical_ohlc(prof_symbol, timeframe=timeframe_sel, period=prof_period)
+@@ -1653,20 +1796,36 @@ def main():
+                     ohlc_path = ohlc_files[ohlc_names.index(sel_ohlc)]
+                     df_m1 = regime_analyzer.load_ohlc(ohlc_path)
+                     df_tf = regime_analyzer.resample_ohlc(df_m1, timeframe_sel)
+-                
++
++                # Invalidate stale cache if OpenTime was missing historically
++                if 'OpenTime' not in trades.columns or trades['OpenTime'].isna().mean() > 0.5:
++                    st.warning(
++                        "⚠️ Nhiều lệnh thiếu OpenTime. DNA v2 sẽ cố ghép FIFO IN/OUT. "
++                        "Nên xóa `.cache.pkl` và reload backtest để pairing chuẩn."
++                    )
++
+                 cache_p = os.path.join(BACKTEST_DIR, f"{ohlc_ref_name}_{timeframe_sel}_indicators.cache.pkl")
+-                dna_res = regime_analyzer.extract_strategy_dna(df_tf, trades, max_depth=max_depth_input, cache_path=cache_p, strategy_name=selected)
+-                
++                dna_res = regime_analyzer.extract_strategy_dna(
++                    df_tf, trades,
++                    max_depth=max_depth_input,
++                    cache_path=cache_p,
++                    strategy_name=selected,
++                    exp_threshold=float(exp_thr_input),
++                    filter_mode="block_toxic",
++                )
++
+                 if "error" in dna_res:
+                     st.error(dna_res["error"])
+                 else:
+                     regime_analyzer.save_regime_registry(selected, dna_res, ohlc_ref_name, timeframe_sel)
+                     if service and drive_folder_id:
+                         sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.REGISTRY_FILE)
+-                    st.success(f"✅ Giải mã thành công & đã tự động lưu vào Registry!")
++                    st.success("✅ DNA v2 giải mã thành công & đã lưu Registry!")
+                     render_dna_tabs(dna_res)
+             except Exception as e:
+                 st.error(f"Lỗi khi giải mã DNA: {e}")
++                import traceback
++                st.code(traceback.format_exc())
+ 
+     # ── SIDEBAR EXPORT BUTTON ──
+     st.sidebar.markdown("---")

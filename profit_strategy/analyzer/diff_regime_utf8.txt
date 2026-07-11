@@ -1,0 +1,1019 @@
+﻿diff --git a/profit_strategy/analyzer/regime_analyzer.py b/profit_strategy/analyzer/regime_analyzer.py
+index 859dbb6..a4c37b0 100644
+--- a/profit_strategy/analyzer/regime_analyzer.py
++++ b/profit_strategy/analyzer/regime_analyzer.py
+@@ -198,10 +198,165 @@ def calc_regime_indicators(df_h1, cache_path=None):
+ # ============================================================
+ # SUPERVISED STRATEGY PROFILING (AI REGIME DNA)
+ # ============================================================
++
++# Features used for DNA.
++# - Excludes same-bar Returns (noise / leakage).
++# - Excludes Hurst by default: Python multi-lag R/S ≠ simplified MQL5 Hurst → threshold không portable.
++#   (Hurst vẫn tính trong calc_regime_indicators cho clustering / live contrast.)
++DNA_FEATURE_COLS = ['ADX', 'ATR%', 'Choppiness', 'BB_Width', 'EMA_Dist%', 'Vol_ZScore', 'AutoCorr']
++
++MQL5_VAR_MAP = {
++    "ADX": "adx_val", "ATR%": "atr_pct_val", "Choppiness": "chop_val",
++    "Returns": "ret_val", "BB_Width": "bb_width_val", "EMA_Dist%": "ema_dist_val",
++    "Vol_ZScore": "vol_zscore_val", "Hurst": "hurst_val", "AutoCorr": "autocorr_val"
++}
++
++
++def pair_in_out_open_times(trades_df):
++    """
++    Ensure each closed trade has a valid OpenTime.
++
++    MT5 deal exports often use different Order IDs for IN vs OUT, so Order-based
++    joins match 0 rows and code falls back to close Time (lookahead bias).
++    This FIFO volume-aware pairing recovers entry time from IN deals when present,
++    or from a parallel raw deals frame stored on trades_df attrs.
++    """
++    if trades_df is None or trades_df.empty:
++        return trades_df
++
++    out = trades_df.copy()
++    if 'OpenTime' in out.columns and out['OpenTime'].notna().sum() >= max(1, int(0.8 * len(out))):
++        out['OpenTime'] = pd.to_datetime(out['OpenTime'], errors='coerce')
++        return out
++
++    # Prefer reconstructing from full deal stream if caller attached it
++    raw_deals = getattr(trades_df, 'attrs', {}).get('raw_deals')
++    if raw_deals is None and {'_in_time', '_in_volume'}.issubset(out.columns):
++        return out
++
++    if raw_deals is not None and 'Direction' in raw_deals.columns:
++        deals = raw_deals.copy()
++        deals['Time'] = pd.to_datetime(deals['Time'], errors='coerce')
++        if 'Volume' in deals.columns:
++            deals['Volume'] = pd.to_numeric(deals['Volume'], errors='coerce')
++        ins = deals[deals['Direction'].astype(str).str.strip().str.lower() == 'in'].sort_values('Time')
++        outs = deals[deals['Direction'].astype(str).str.strip().str.lower() == 'out'].sort_values('Time')
++        in_recs = ins.to_dict('records')
++        used = set()
++        open_times = []
++        for _, o in outs.iterrows():
++            best_i = None
++            best = None
++            o_vol = float(o['Volume']) if 'Volume' in o and pd.notna(o.get('Volume')) else None
++            for i, inn in enumerate(in_recs):
++                if i in used:
++                    continue
++                if inn['Time'] > o['Time']:
++                    break
++                inn_vol = float(inn['Volume']) if 'Volume' in inn and pd.notna(inn.get('Volume')) else None
++                if o_vol is not None and inn_vol is not None and abs(inn_vol - o_vol) < 1e-9:
++                    best, best_i = inn, i
++                elif best is None:
++                    best, best_i = inn, i
++            if best is not None:
++                used.add(best_i)
++                open_times.append(best['Time'])
++            else:
++                open_times.append(pd.NaT)
++        # Align by close time + profit if possible
++        outs = outs.copy()
++        outs['OpenTime'] = open_times
++        # Map back onto trades_df by Time/Profit
++        key_cols = ['Time']
++        if 'Profit' in out.columns and 'Profit' in outs.columns:
++            key_cols.append('Profit')
++        merged = out.drop(columns=['OpenTime'], errors='ignore').merge(
++            outs[key_cols + ['OpenTime']].drop_duplicates(key_cols),
++            on=key_cols, how='left'
++        )
++        if merged['OpenTime'].notna().sum() > 0:
++            return merged
++
++    # Last resort: if OpenTime mostly missing, do NOT silently use close time —
++    # leave NaT so caller can error clearly.
++    if 'OpenTime' not in out.columns:
++        out['OpenTime'] = pd.NaT
++    else:
++        out['OpenTime'] = pd.to_datetime(out['OpenTime'], errors='coerce')
++    return out
++
++
++def ensure_trade_open_times_from_deals(df_deals):
++    """
++    From a full MT5 Deals table (IN + OUT rows), return closed trades with OpenTime.
++    FIFO volume-aware pairing — robust when Order IDs differ between IN/OUT.
++    """
++    if df_deals is None or df_deals.empty:
++        return pd.DataFrame()
++
++    deals = df_deals.copy()
++    deals['Time'] = pd.to_datetime(deals['Time'], errors='coerce')
++    deals = deals.dropna(subset=['Time'])
++    for nc in ['Profit', 'Volume', 'Price', 'Balance']:
++        if nc in deals.columns:
++            deals[nc] = pd.to_numeric(deals[nc], errors='coerce')
++
++    if 'Direction' not in deals.columns:
++        return deals
++
++    ins = deals[deals['Direction'].astype(str).str.strip().str.lower() == 'in'].sort_values('Time')
++    outs = deals[deals['Direction'].astype(str).str.strip().str.lower() == 'out'].sort_values('Time')
++    if outs.empty:
++        return pd.DataFrame()
++
++    in_recs = ins.to_dict('records')
++    used = set()
++    rows = []
++    for _, o in outs.iterrows():
++        best_i = None
++        best = None
++        o_vol = float(o['Volume']) if 'Volume' in o.index and pd.notna(o.get('Volume')) else None
++        for i, inn in enumerate(in_recs):
++            if i in used:
++                continue
++            if inn['Time'] > o['Time']:
++                break
++            inn_vol = float(inn['Volume']) if inn.get('Volume') is not None and pd.notna(inn.get('Volume')) else None
++            if o_vol is not None and inn_vol is not None and abs(inn_vol - o_vol) < 1e-9:
++                best, best_i = inn, i
++            elif best is None:
++                best, best_i = inn, i
++        if best is None:
++            continue
++        used.add(best_i)
++        row = o.to_dict()
++        row['OpenTime'] = best['Time']
++        row['OpenPrice'] = best.get('Price', np.nan)
++        row['TradeType'] = best.get('Type', np.nan)
++        rows.append(row)
++
++    if not rows:
++        return pd.DataFrame()
++    result = pd.DataFrame(rows)
++    result['Duration'] = (result['Time'] - result['OpenTime']).dt.total_seconds() / 3600.0
++    return result.reset_index(drop=True)
++
++
++def last_closed_bar_index(bar_index, t_entry):
++    """Return last fully closed bar strictly before entry (no partial-bar leakage)."""
++    ts = pd.Timestamp(t_entry)
++    # bar_index is assumed sorted
++    pos = bar_index.searchsorted(ts, side='left') - 1
++    if pos < 0:
++        return None
++    return bar_index[pos]
++
++
+ def map_trades_to_candles(df_ohlc, trades_df):
+     """
+-    Map each closed trade to candle on df_ohlc based on entry time (OpenTime or Time).
+-    Assigns label Y: +1 (Win), -1 (Loss), 0 (No trade).
++    Map each closed trade to the last CLOSED candle before entry time.
++    Assigns label Y: +1 (Win), -1 (Loss), 0 (No trade) on candle index.
++    Prefer trade-level build_trade_feature_table() for DNA training.
+     """
+     if df_ohlc.empty or trades_df.empty:
+         return pd.Series(0, index=df_ohlc.index), pd.Series(0.0, index=df_ohlc.index)
+@@ -212,14 +367,12 @@ def map_trades_to_candles(df_ohlc, trades_df):
+     for _, trade in trades_df.iterrows():
+         t_entry = trade.get('OpenTime')
+         if pd.isna(t_entry):
+-            t_entry = trade.get('Time')
+-        if pd.isna(t_entry):
++            # Do not fall back to close Time — that is lookahead.
+             continue
+-
+         try:
+             t_entry = pd.to_datetime(t_entry)
+-            pos = idx_sorted.asof(t_entry)
+-            if pd.notna(pos):
++            pos = last_closed_bar_index(idx_sorted, t_entry)
++            if pos is not None and pos in trade_pnl.index:
+                 pnl = float(trade.get('Profit', 0.0))
+                 trade_pnl.loc[pos] += pnl
+         except Exception:
+@@ -228,75 +381,205 @@ def map_trades_to_candles(df_ohlc, trades_df):
+     y_series = pd.Series(np.where(trade_pnl > 0, 1, np.where(trade_pnl < 0, -1, 0)), index=df_ohlc.index)
+     return y_series, trade_pnl
+ 
++
++def build_trade_feature_table(df_h1, trades_df, indicators=None, cache_path=None):
++    """
++    One row per trade: regime features at last closed bar before OpenTime + PnL.
++    This avoids candle-level aggregation bias and exit-time lookahead.
++    """
++    if indicators is None:
++        indicators = calc_regime_indicators(df_h1, cache_path=cache_path)
++
++    trades = trades_df.copy()
++    if 'OpenTime' not in trades.columns or trades['OpenTime'].isna().all():
++        return None, "Thiếu OpenTime — không thể map bối cảnh lúc vào lệnh (tránh lookahead). Hãy đảm bảo load_backtest ghép IN/OUT đúng."
++
++    trades['OpenTime'] = pd.to_datetime(trades['OpenTime'], errors='coerce')
++    trades = trades.dropna(subset=['OpenTime', 'Profit'] if 'Profit' in trades.columns else ['OpenTime'])
++    if trades.empty:
++        return None, "Không còn lệnh nào có OpenTime hợp lệ sau khi làm sạch."
++
++    available_cols = [c for c in DNA_FEATURE_COLS if c in indicators.columns]
++    rows = []
++    bar_index = indicators.index
++    for _, tr in trades.iterrows():
++        bar = last_closed_bar_index(bar_index, tr['OpenTime'])
++        if bar is None or bar not in indicators.index:
++            continue
++        feat = indicators.loc[bar, available_cols]
++        if feat.isna().any():
++            continue
++        row = feat.to_dict()
++        row['OpenTime'] = tr['OpenTime']
++        row['CloseTime'] = tr.get('Time', pd.NaT)
++        row['Profit'] = float(tr.get('Profit', 0.0))
++        row['entry_bar'] = bar
++        rows.append(row)
++
++    if len(rows) < 10:
++        return None, f"Không đủ mẫu trade-level (tìm thấy {len(rows)}, cần ≥ 10)."
++
++    tbl = pd.DataFrame(rows).sort_values('OpenTime').reset_index(drop=True)
++    return tbl, None
++
++
++def _equity_metrics(pnl_series, bal0=5000.0):
++    """Core metrics for filter impact evaluation."""
++    pnl = np.asarray(pnl_series, dtype=float)
++    if len(pnl) == 0:
++        return {"n": 0, "net": 0.0, "wr": 0.0, "pf": 0.0, "maxdd": 0.0, "exp": 0.0, "recovery": 0.0}
++    eq = bal0 + np.cumsum(pnl)
++    peak = np.maximum.accumulate(eq)
++    dd = (eq - peak) / np.where(peak == 0, np.nan, peak) * 100.0
++    wins = pnl[pnl > 0].sum()
++    losses = pnl[pnl < 0].sum()
++    net = float(pnl.sum())
++    maxdd = float(np.nanmin(dd)) if len(dd) else 0.0
++    pf = float(wins / abs(losses)) if losses != 0 else 99.0
++    return {
++        "n": int(len(pnl)),
++        "net": round(net, 2),
++        "wr": round(float((pnl > 0).mean() * 100), 1),
++        "pf": round(pf, 2),
++        "maxdd": round(maxdd, 2),
++        "exp": round(float(pnl.mean()), 2),
++        "recovery": round(net / max(0.01, abs(maxdd)), 2),
++    }
++
++
++def _paths_from_tree(tree, feature_names, leaf_predicate):
++    """Collect conjunction paths for leaves where leaf_predicate(node_id) is True."""
++    paths = []
++
++    def dfs(node_id, conditions):
++        left = tree.children_left[node_id]
++        right = tree.children_right[node_id]
++        if left == right:
++            if leaf_predicate(node_id):
++                paths.append(list(conditions))
++            return
++        feat = feature_names[tree.feature[node_id]]
++        thr = tree.threshold[node_id]
++        dfs(left, conditions + [f"({feat} <= {thr:.4f})"])
++        dfs(right, conditions + [f"({feat} > {thr:.4f})"])
++
++    dfs(0, [])
++    return paths
++
++
++def tree_to_mql5_expectancy(reg, feature_names, exp_threshold=0.0, mode="block_toxic"):
++    """
++    Convert expectancy DecisionTreeRegressor into MQL5 filter.
++
++    mode='block_toxic': isSafeRegime = NOT (toxic leaf paths)  [recommended]
++    mode='allow_good':  isSafeRegime = good leaf paths only
++    """
++    tree = reg.tree_
++
++    def leaf_value(node_id):
++        # sklearn regressor: value shape (n_outputs,)
++        return float(tree.value[node_id][0][0])
++
++    toxic_paths = _paths_from_tree(tree, feature_names, lambda n: leaf_value(n) <= exp_threshold)
++    good_paths = _paths_from_tree(tree, feature_names, lambda n: leaf_value(n) > exp_threshold)
++
++    def to_mql(paths, join_or=True):
++        if not paths:
++            return None
++        rules = [" && ".join(p) for p in paths]
++        body = rules[0] if len(rules) == 1 else " || \n    ".join([f"({r})" for r in rules])
++        for k, v in MQL5_VAR_MAP.items():
++            body = body.replace(k, v)
++        return body
++
++    if mode == "allow_good":
++        body = to_mql(good_paths)
++        if not body:
++            return "// AI không tìm thấy vùng expectancy dương với ngưỡng hiện tại."
++        cond = f"bool isSafeRegime = {body};"
++        logic_note = "ALLOW-LIST: chỉ vào lệnh khi rơi vào leaf expectancy > threshold"
++    else:
++        body = to_mql(toxic_paths)
++        if not body:
++            # No toxic leaves — always safe
++            cond = "bool isSafeRegime = true; // Không có leaf độc (exp <= threshold)"
++            logic_note = "Không chặn vùng nào — mọi leaf có expectancy > threshold"
++        else:
++            cond = f"bool isToxicRegime = {body};\nbool isSafeRegime = !isToxicRegime;"
++            logic_note = "BLOCK-LIST: chỉ chặn leaf có expectancy <= threshold (giữ phần lớn lệnh lãi)"
++
++    mql5_code = f"""// --- AI Regime DNA v2 (Expectancy Block-List) ---
++// Mục tiêu: giảm drawdown bằng cách CHẶN vùng expectancy âm, không cố đoán win/loss.
++// {logic_note}
++// exp_threshold = {exp_threshold:.4f}
++// Cần tính trên nến H1 ĐÃ ĐÓNG (shift=1): ADX, ATR%, Chop, BB_Width, EMA_Dist%, Vol_ZScore, Hurst, AutoCorr
++
++input int RegimeFilterMode = 0; // 0: Block All | 1: Shadow Mode (giảm lot)
++
++{cond}
++
++if (!isSafeRegime) {{
++    if (RegimeFilterMode == 0) {{
++        Print("[DNA v2] Toxic regime (expectancy thap) -> BLOCK entry.");
++        return;
++    }} else if (RegimeFilterMode == 1) {{
++        Print("[DNA v2] Toxic regime -> SHADOW MODE.");
++        // lot_size = InpShadowLotSize;
++    }}
++}}"""
++    return mql5_code
++
++
+ def tree_to_mql5(clf, feature_names):
+-    """Convert fitted DecisionTree into MQL5 boolean filter rule."""
++    """Legacy classifier → MQL5 (win-majority allow-list). Kept for backward compat."""
+     tree = clf.tree_
+     win_paths = []
+ 
+     def dfs(node_id, current_conditions):
+         if tree.children_left[node_id] == tree.children_right[node_id]:
+             val = tree.value[node_id][0]
+-            if len(val) > 1 and val[1] > val[0]:  # Majority Win
++            if len(val) > 1 and val[1] > val[0]:
+                 win_paths.append(list(current_conditions))
+             return
+-
+         feat_name = feature_names[tree.feature[node_id]]
+         thresh = tree.threshold[node_id]
+-
+         dfs(tree.children_left[node_id], current_conditions + [f"({feat_name} <= {thresh:.3f})"])
+         dfs(tree.children_right[node_id], current_conditions + [f"({feat_name} > {thresh:.3f})"])
+ 
+     dfs(0, [])
+-
+     if not win_paths:
+         return "// AI không tìm thấy luật thắng rõ ràng với độ sâu hiện tại."
+ 
+     rules_str = [" && ".join(path) for path in win_paths]
+     full_cond = rules_str[0] if len(rules_str) == 1 else " || \n    ".join([f"({r})" for r in rules_str])
+-
+-    mql5_var_map = {
+-        "ADX": "adx_val", "ATR%": "atr_pct_val", "Choppiness": "chop_val",
+-        "Returns": "ret_val", "BB_Width": "bb_width_val", "EMA_Dist%": "ema_dist_val",
+-        "Vol_ZScore": "vol_zscore_val", "Hurst": "hurst_val", "AutoCorr": "autocorr_val"
+-    }
+-
+     code_body = full_cond
+-    for k, v in mql5_var_map.items():
++    for k, v in MQL5_VAR_MAP.items():
+         code_body = code_body.replace(k, v)
+ 
+-    mql5_code = f"""// --- AI Supervised Regime Filter (Reverse Strategy DNA) ---
+-// Định nghĩa các chỉ số bối cảnh tại thời điểm nến hiện tại:
+-// double adx_val = ...;
+-// double chop_val = ...;
+-// double hurst_val = ...;
++    return f"""// --- AI Supervised Regime Filter (LEGACY Win/Loss Allow-List) ---
++// CẢNH BÁO: Allow-list theo win-rate thường cắt lệnh lãi lớn (R:R cao) → giảm profit, DD không giảm.
++// Khuyến nghị dùng DNA v2 Expectancy Block-List.
+ 
+-input int RegimeFilterMode = 1; // 0: Block All (Khóa tín hiệu), 1: Shadow Mode (Canary Testing - 0.01 Lot)
++input int RegimeFilterMode = 1;
+ 
+ bool isWinningRegime = {code_body};
+ 
+ if (!isWinningRegime) {{
+     if (RegimeFilterMode == 0) {{
+-        Print("[Regime Filter] Bối cảnh thị trường không phù hợp -> KHÓA TÍN HIỆU (Block All).");
+-        return; // Đứng ngoài hoàn toàn
+-    }} else if (RegimeFilterMode == 1) {{
+-        Print("[Regime Filter] Bối cảnh xấu -> Chuyển sang SHADOW MODE (Canary Testing). Giảm Volume về tối thiểu 0.01 lot hoặc ghi log lệnh ảo.");
+-        // Ví dụ áp dụng trong EA của bạn:
+-        // lot_size = 0.01;
+-        // is_shadow_trade = true;
++        return;
+     }}
+ }}"""
+-    return mql5_code
+ 
+-def compute_range_analysis(X, y, top_features):
++def compute_range_analysis(X, y_pnl, top_features):
+     """
+-    Computes quantile/binned range analysis for top features to avoid point-split overfitting.
+-    Returns dictionary of zones and their win rates.
++    Quantile range analysis with win-rate AND expectancy (mean PnL) per bin.
+     """
+     range_stats = {}
++    y_pnl = pd.Series(y_pnl).reset_index(drop=True)
+     for col in top_features.keys():
+         if col not in X.columns:
+             continue
+-        series = X[col]
++        series = X[col].reset_index(drop=True)
+         try:
+             bins = pd.qcut(series, q=3, duplicates='drop')
+         except Exception:
+@@ -304,35 +587,38 @@ def compute_range_analysis(X, y, top_features):
+                 bins = pd.cut(series, bins=3)
+             except Exception:
+                 continue
+-        df_temp = pd.DataFrame({'bin': bins.astype(str), 'y': y})
+-        grouped = df_temp.groupby('bin', observed=False)
++        df_temp = pd.DataFrame({'bin': bins.astype(str), 'pnl': y_pnl})
+         stats = []
+-        for bin_name, group in grouped:
++        for bin_name, group in df_temp.groupby('bin', observed=False):
+             total = len(group)
+             if total == 0:
+                 continue
+-            wins = (group['y'] == 1).sum()
+-            wr = round(wins / total * 100, 1)
++            wins = int((group['pnl'] > 0).sum())
+             stats.append({
+                 "range": bin_name,
+                 "total_trades": int(total),
+-                "win_count": int(wins),
+-                "win_rate": wr
++                "win_count": wins,
++                "win_rate": round(wins / total * 100, 1),
++                "expectancy": round(float(group['pnl'].mean()), 2),
++                "net_pnl": round(float(group['pnl'].sum()), 2),
+             })
+         range_stats[col] = stats
+     return range_stats
+ 
+-def evaluate_feature_stability_over_time(X, y, available_cols, max_depth=3, n_periods=4):
++
++def evaluate_feature_stability_over_time(X, y_pnl, available_cols, max_depth=3, n_periods=4):
+     """
+-    Phân tích độ ổn định ADN theo thời gian (Time-Decay / Yearly Stability Analysis).
+-    Chia lịch sử giao dịch thành n_periods chu kỳ thời gian liên tiếp để xem luật lọc có bị Concept Drift không.
++    Time-decay stability using expectancy regressor (not win/loss classifier).
+     """
+     try:
+-        from sklearn.tree import DecisionTreeClassifier
++        from sklearn.tree import DecisionTreeRegressor
+     except ImportError:
+         return {"error": "Thiếu thư viện scikit-learn."}
+ 
+-    if len(X) < 40 or len(y) < 40:
++    y_pnl = pd.Series(y_pnl).reset_index(drop=True)
++    X = X.reset_index(drop=True)
++
++    if len(X) < 40:
+         return {"error": "Không đủ số lượng mẫu lệnh (cần tối thiểu 40 lệnh) để chia chu kỳ thời gian."}
+ 
+     chunk_size = len(X) // n_periods
+@@ -343,59 +629,58 @@ def evaluate_feature_stability_over_time(X, y, available_cols, max_depth=3, n_pe
+     for p in range(n_periods):
+         start_idx = p * chunk_size
+         end_idx = (p + 1) * chunk_size if p < n_periods - 1 else len(X)
+-        
+         X_sub = X.iloc[start_idx:end_idx]
+-        y_sub = y.iloc[start_idx:end_idx]
+-        
+-        if len(y_sub.unique()) < 2:
++        y_sub = y_pnl.iloc[start_idx:end_idx]
++        if len(y_sub) < 15:
+             continue
+-            
+-        min_leaf = max(2, int(len(y_sub) * 0.05))
+-        clf_sub = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf, class_weight='balanced', random_state=42)
+-        clf_sub.fit(X_sub, y_sub)
+-        acc_sub = clf_sub.score(X_sub, y_sub)
+-        
+-        imp_sub = pd.Series(clf_sub.feature_importances_, index=available_cols)
++
++        min_leaf = max(5, int(len(y_sub) * 0.08))
++        reg_sub = DecisionTreeRegressor(max_depth=max_depth, min_samples_leaf=min_leaf, random_state=42)
++        reg_sub.fit(X_sub, y_sub)
++        pred = reg_sub.predict(X_sub)
++        # Rank correlation / sign accuracy of expectancy
++        sign_acc = float(((pred > 0) == (y_sub > 0)).mean()) if len(y_sub) else 0.0
++
++        imp_sub = pd.Series(reg_sub.feature_importances_, index=available_cols)
+         top_sub = imp_sub[imp_sub > 0].to_dict()
+-        
+         for f, w in top_sub.items():
+             feature_appearance[f] += 1
+             feature_weights_sum[f] += float(w)
+-            
+-        t_start = str(X_sub.index[0])[:10]
+-        t_end = str(X_sub.index[-1])[:10]
+-        
++
++        t_start = str(X_sub.index[0]) if not hasattr(X_sub.index[0], 'strftime') else str(X_sub.index[0])[:10]
++        # Prefer OpenTime column if present in attrs — use positional range
+         period_results.append({
+             "period_idx": p + 1,
+-            "time_range": f"{t_start} -> {t_end}",
++            "time_range": f"chunk {p + 1}/{n_periods}",
+             "sample_count": len(y_sub),
+-            "win_rate": round((y_sub == 1).sum() / len(y_sub) * 100, 1),
+-            "accuracy": round(float(acc_sub) * 100, 1),
++            "win_rate": round(float((y_sub > 0).mean() * 100), 1),
++            "expectancy": round(float(y_sub.mean()), 2),
++            "accuracy": round(sign_acc * 100, 1),
+             "top_features": top_sub
+         })
+ 
+     valid_periods = len(period_results)
+     if valid_periods == 0:
+-        return {"error": "Không thể phân tích ổn định do các chu kỳ bị lệch nhãn."}
++        return {"error": "Không thể phân tích ổn định do các chu kỳ quá mỏng."}
+ 
+     stability_summary = []
+     robust_features = []
+     drift_warnings = []
+-
+     for f in available_cols:
+         count = feature_appearance[f]
+         if count == 0:
+             continue
+         consistency_pct = round(count / valid_periods * 100, 1)
+         avg_weight = round(feature_weights_sum[f] / valid_periods, 3)
+-        
+-        status = "🟢 Robust DNA (Ổn định cao)" if consistency_pct >= 70 else ("🟡 Moderate (Ổn định trung bình)" if consistency_pct >= 40 else "🔴 Concept Drift (Nguy cơ thoái hóa)")
+-        
++        status = (
++            "🟢 Robust DNA (Ổn định cao)" if consistency_pct >= 70
++            else ("🟡 Moderate (Ổn định trung bình)" if consistency_pct >= 40
++                  else "🔴 Concept Drift (Nguy cơ thoái hóa)")
++        )
+         if consistency_pct >= 70:
+             robust_features.append(f)
+         elif consistency_pct <= 35:
+             drift_warnings.append(f)
+-            
+         stability_summary.append({
+             "feature": f,
+             "appearance_count": f"{count}/{valid_periods} chu kỳ",
+@@ -403,9 +688,7 @@ def evaluate_feature_stability_over_time(X, y, available_cols, max_depth=3, n_pe
+             "avg_importance": avg_weight,
+             "status": status
+         })
+-
+     stability_summary = sorted(stability_summary, key=lambda x: x["consistency_pct"], reverse=True)
+-
+     return {
+         "valid_periods": valid_periods,
+         "period_details": period_results,
+@@ -414,6 +697,43 @@ def evaluate_feature_stability_over_time(X, y, available_cols, max_depth=3, n_pe
+         "drift_warnings": drift_warnings
+     }
+ 
++
++def _leaf_table(reg, X, y_pnl):
++    """Per-leaf expectancy stats for a fitted regressor."""
++    leaves = reg.apply(X)
++    df = pd.DataFrame({"leaf": leaves, "pnl": np.asarray(y_pnl, dtype=float)})
++    rows = []
++    for leaf, g in df.groupby("leaf"):
++        rows.append({
++            "leaf": int(leaf),
++            "n": int(len(g)),
++            "net_pnl": round(float(g["pnl"].sum()), 2),
++            "expectancy": round(float(g["pnl"].mean()), 2),
++            "win_rate": round(float((g["pnl"] > 0).mean() * 100), 1),
++            "tree_value": round(float(reg.tree_.value[leaf][0][0]), 2),
++        })
++    return sorted(rows, key=lambda r: r["expectancy"])
++
++
++def simulate_filter_impact(y_pnl, keep_mask, bal0=5000.0):
++    """Compare baseline vs filtered equity metrics."""
++    y_pnl = pd.Series(y_pnl).reset_index(drop=True)
++    keep_mask = np.asarray(keep_mask, dtype=bool)
++    base = _equity_metrics(y_pnl, bal0)
++    filt = _equity_metrics(y_pnl[keep_mask], bal0)
++    blocked = y_pnl[~keep_mask]
++    return {
++        "baseline": base,
++        "filtered": filt,
++        "blocked_n": int((~keep_mask).sum()),
++        "blocked_net_pnl": round(float(blocked.sum()), 2) if len(blocked) else 0.0,
++        "blocked_avg_pnl": round(float(blocked.mean()), 2) if len(blocked) else 0.0,
++        "delta_net": round(filt["net"] - base["net"], 2),
++        "delta_maxdd": round(filt["maxdd"] - base["maxdd"], 2),  # positive = DD improved (less negative)
++        "delta_pf": round(filt["pf"] - base["pf"], 2),
++        "block_rate_pct": round(float((~keep_mask).mean() * 100), 1),
++    }
++
+ def unsupervised_regime_clustering(df_h1, trades_df, n_clusters=3):
+     """
+     Phân cụm không giám sát (Unsupervised Regime Clustering) bằng K-Means.
+@@ -515,86 +835,184 @@ def unsupervised_regime_clustering(df_h1, trades_df, n_clusters=3):
+         "best_win_rate": best_wr
+     }
+ 
+-def extract_strategy_dna(df_h1, trades_df, max_depth=3, cache_path=None, strategy_name=None):
++def extract_strategy_dna(df_h1, trades_df, max_depth=3, cache_path=None, strategy_name=None,
++                         exp_threshold=None, filter_mode="block_toxic", bal0=5000.0,
++                         hard_toxic_exp=-5.0):
+     """
+-    Supervised Strategy Profiling with Anti-Overfitting (Regularization + Purged CV + OOS Holdout).
+-    Trains DecisionTree to classify Win (+1) vs Loss (-1) candles based on context features.
++    Supervised Strategy Profiling v2 — Expectancy DNA (anti-lookahead + DD-aware).
++
++    Key design changes vs v1:
++    1. Trade-level samples at ENTRY (last closed bar before OpenTime) — no exit-time leakage.
++    2. DecisionTreeRegressor on PnL (expectancy), not Win/Loss classifier.
++       High R:R strategies (WR~30%) still profit in leaves with WR 25% — WR allow-list kills edge.
++    3. BLOCK-LIST only CLEARLY toxic leaves (default exp <= -5$), not near-zero leaves
++       that would cut hundreds of trades for almost no edge.
++    4. Validates filter by equity metrics (net / maxDD / PF) IS + OOS, not classification accuracy.
++
++    exp_threshold: if None, auto-pick best among candidates using OOS net/DD tradeoff.
++    hard_toxic_exp: floor for "clearly toxic" (-5 default). Near-zero leaves are kept.
+     """
+     try:
+-        from sklearn.tree import DecisionTreeClassifier, export_text
+-        from sklearn.model_selection import cross_val_score
++        from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier, export_text
+     except ImportError:
+         return {"error": "Thiếu thư viện scikit-learn. Vui lòng chạy `pip install scikit-learn`."}
+ 
+-    indicators = calc_regime_indicators(df_h1, cache_path=cache_path)
+-    y_series, _ = map_trades_to_candles(indicators, trades_df)
+-
+-    trade_mask = y_series != 0
+-    if trade_mask.sum() < 10:
+-        return {"error": f"Không đủ mẫu giao dịch khớp với chuỗi OHLC (tìm thấy {trade_mask.sum()} lệnh, cần tối thiểu 10)."}
+-
+-    feature_cols = ['ADX', 'ATR%', 'Choppiness', 'Returns', 'BB_Width', 'EMA_Dist%', 'Vol_ZScore', 'Hurst', 'AutoCorr']
+-    available_cols = [c for c in feature_cols if c in indicators.columns]
+-
+-    X = indicators.loc[trade_mask, available_cols].dropna()
+-    y = y_series.loc[X.index]
+-
+-    if len(y.unique()) < 2:
+-        val = "THẮNG" if y.iloc[0] > 0 else "THUA"
+-        return {"error": f"Toàn bộ {len(y)} lệnh khớp đều là lệnh {val}. Cần cả lệnh Thắng và Thua để phân tích đối chiếu."}
+-
+-    # ── ITEM 1: Strict Out-of-Sample (OOS) Holdout & Purged CV ──
+-    oos_size = max(5, int(len(y) * 0.20)) if len(y) >= 25 else 0
++    # Repair OpenTime if Order-join failed (common with MT5 deal exports)
++    trades_work = trades_df.copy()
++    need_pair = (
++        'OpenTime' not in trades_work.columns
++        or trades_work['OpenTime'].isna().mean() > 0.2
++    )
++    if need_pair:
++        # Attempt Order join salvage is already done upstream; try raw FIFO if attrs present
++        raw = getattr(trades_df, 'attrs', {}).get('raw_deals')
++        if raw is not None:
++            repaired = ensure_trade_open_times_from_deals(raw)
++            if not repaired.empty:
++                trades_work = repaired
++        else:
++            # If OpenTime missing entirely, fail clearly rather than use close Time
++            if 'OpenTime' not in trades_work.columns or trades_work['OpenTime'].isna().all():
++                return {
++                    "error": (
++                        "Không có OpenTime hợp lệ. DNA v2 từ chối map theo Time đóng lệnh (lookahead). "
++                        "Hãy reload backtest với pairing IN/OUT (strategy_analyzer đã được cập nhật) "
++                        "hoặc truyền deals có Direction=in/out."
++                    )
++                }
++
++    tbl, err = build_trade_feature_table(df_h1, trades_work, cache_path=cache_path)
++    if err:
++        return {"error": err}
++
++    available_cols = [c for c in DNA_FEATURE_COLS if c in tbl.columns]
++    X = tbl[available_cols].copy()
++    y_pnl = tbl['Profit'].astype(float)
++    y_cls = np.where(y_pnl > 0, 1, -1)
++
++    if len(np.unique(y_cls)) < 2:
++        val = "THẮNG" if y_cls[0] > 0 else "THUA"
++        return {"error": f"Toàn bộ {len(y_pnl)} lệnh đều là {val}. Cần cả Thắng và Thua."}
++
++    # Time-ordered OOS holdout (last 20%)
++    oos_size = max(5, int(len(y_pnl) * 0.20)) if len(y_pnl) >= 25 else 0
+     if oos_size > 0:
+-        X_train = X.iloc[:-oos_size]
+-        y_train = y.iloc[:-oos_size]
+-        X_oos = X.iloc[-oos_size:]
+-        y_oos = y.iloc[-oos_size:]
++        X_train, y_train = X.iloc[:-oos_size], y_pnl.iloc[:-oos_size]
++        X_oos, y_oos = X.iloc[-oos_size:], y_pnl.iloc[-oos_size:]
+     else:
+-        X_train, y_train = X, y
+-        X_oos, y_oos = X, y
+-
+-    min_leaf = max(3, int(len(y_train) * 0.03))
+-    clf_train = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf, class_weight='balanced', random_state=42)
+-    clf_train.fit(X_train, y_train)
+-
+-    train_acc = clf_train.score(X_train, y_train)
+-    oos_acc = clf_train.score(X_oos, y_oos) if oos_size > 0 else train_acc
+-
+-    # Purged / Embargo Time-Series CV on X_train to prevent rolling window leakage
+-    cv_folds = min(5, len(y_train) // 5)
++        X_train, y_train = X, y_pnl
++        X_oos, y_oos = X, y_pnl
++
++    min_leaf = max(15, int(len(y_train) * 0.04))
++    # Expectancy regressor (primary)
++    reg_train = DecisionTreeRegressor(max_depth=max_depth, min_samples_leaf=min_leaf, random_state=42)
++    reg_train.fit(X_train, y_train)
++
++    # Candidate thresholds: prefer hard-toxic only (avoid near-zero leaves that over-block)
++    thr_candidates = []
++    if exp_threshold is not None:
++        thr_candidates.append(float(exp_threshold))
++    thr_candidates.extend([hard_toxic_exp, -10.0, -5.0, -2.0, 0.0])
++    # unique preserve order
++    seen = set()
++    thr_candidates = [t for t in thr_candidates if not (t in seen or seen.add(t))]
++
++    def _score_oos(imp):
++        """Higher is better: reward DD improvement + keep most OOS profit."""
++        b, f = imp["baseline"], imp["filtered"]
++        if f["n"] < 10:
++            return -1e9
++        dd_gain = f["maxdd"] - b["maxdd"]  # positive = better
++        net_ratio = f["net"] / b["net"] if abs(b["net"]) > 1e-6 else 0.0
++        # Heavily penalize destroying OOS profit or blocking >50%
++        if net_ratio < 0.5 or imp["block_rate_pct"] > 55:
++            return -1e6 + net_ratio * 100
++        return dd_gain * 3.0 + net_ratio * 10.0 - imp["block_rate_pct"] * 0.05
++
++    best_thr = thr_candidates[0]
++    best_score = -1e18
++    best_oos_imp = None
++    for thr_try in thr_candidates:
++        p = reg_train.predict(X_oos if oos_size > 0 else X_train)
++        y_eval = y_oos if oos_size > 0 else y_train
++        imp_try = simulate_filter_impact(y_eval, p > thr_try, bal0)
++        sc = _score_oos(imp_try)
++        if sc > best_score:
++            best_score = sc
++            best_thr = thr_try
++            best_oos_imp = imp_try
++
++    exp_threshold = float(best_thr)
++    recommended_threshold = exp_threshold
++    oos_impact = best_oos_imp
++
++    # Purged time-series CV on filter quality with selected threshold
++    cv_folds = min(5, len(y_train) // 40) if len(y_train) >= 80 else 0
++    cv_scores = []
++    cv_dd_improve = []
+     if cv_folds >= 2:
+-        purged_scores = []
+         fold_size = len(y_train) // cv_folds
+-        embargo_gap = max(2, int(len(y_train) * 0.03))
++        embargo = max(2, int(len(y_train) * 0.02))
+         for f in range(cv_folds):
+-            val_start = f * fold_size
+-            val_end = (f + 1) * fold_size if f < cv_folds - 1 else len(y_train)
+-            
+-            train_idx = [i for i in range(len(y_train)) if i < val_start - embargo_gap or i > val_end + embargo_gap]
+-            val_idx = list(range(val_start, val_end))
+-            
+-            if len(train_idx) < 10 or len(val_idx) < 2:
++            vs, ve = f * fold_size, (f + 1) * fold_size if f < cv_folds - 1 else len(y_train)
++            tr_idx = [i for i in range(len(y_train)) if i < vs - embargo or i >= ve + embargo]
++            va_idx = list(range(vs, ve))
++            if len(tr_idx) < 30 or len(va_idx) < 10:
+                 continue
+-            clf_fold = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf, class_weight='balanced', random_state=42)
+-            clf_fold.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
+-            purged_scores.append(clf_fold.score(X_train.iloc[val_idx], y_train.iloc[val_idx]))
+-        cv_acc = float(np.mean(purged_scores)) if purged_scores else float(train_acc)
+-    else:
+-        cv_acc = float(train_acc)
++            reg_f = DecisionTreeRegressor(max_depth=max_depth, min_samples_leaf=min_leaf, random_state=42)
++            reg_f.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
++            pred_va = reg_f.predict(X_train.iloc[va_idx])
++            keep = pred_va > exp_threshold
++            if keep.sum() < 5:
++                continue
++            base_m = _equity_metrics(y_train.iloc[va_idx])
++            filt_m = _equity_metrics(y_train.iloc[va_idx][keep])
++            cv_scores.append(1.0 if filt_m["maxdd"] >= base_m["maxdd"] and filt_m["exp"] >= 0 else 0.0)
++            cv_dd_improve.append(filt_m["maxdd"] - base_m["maxdd"])
++    cv_acc = float(np.mean(cv_scores)) if cv_scores else 0.0
++    cv_avg_dd_delta = float(np.mean(cv_dd_improve)) if cv_dd_improve else 0.0
++
++    oos_ok = (
++        oos_impact["filtered"]["maxdd"] >= oos_impact["baseline"]["maxdd"] - 1.0
++        and oos_impact["filtered"]["exp"] > 0
++        and oos_impact["filtered"]["net"] >= oos_impact["baseline"]["net"] * 0.55
++        and oos_impact["block_rate_pct"] < 55
++    )
++    oos_status = (
++        "PASS (OOS: giữ edge + DD ổn)" if oos_ok
++        else ("CAUTION (OOS yếu)" if oos_impact["filtered"]["exp"] > 0 else "FAIL (OOS phá edge)")
++    )
+ 
+-    # Fit final tree on full X for MQL5 code generation
+-    clf = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf, class_weight='balanced', random_state=42)
+-    clf.fit(X, y)
++    # Final tree on full sample for MQL5 export
++    reg = DecisionTreeRegressor(max_depth=max_depth, min_samples_leaf=min_leaf, random_state=42)
++    reg.fit(X, y_pnl)
+ 
+-    imp = pd.Series(clf.feature_importances_, index=available_cols).sort_values(ascending=False)
++    # Legacy classifier for comparison only
++    clf = DecisionTreeClassifier(
++        max_depth=max_depth, min_samples_leaf=min_leaf, class_weight='balanced', random_state=42
++    )
++    clf.fit(X, y_cls)
++    pred_cls = clf.predict(X)
++    legacy_impact = simulate_filter_impact(y_pnl, pred_cls == 1, bal0)
++
++    pred_exp = reg.predict(X)
++    keep_mask = pred_exp > exp_threshold
++    impact = simulate_filter_impact(y_pnl, keep_mask, bal0)
++
++    imp = pd.Series(reg.feature_importances_, index=available_cols).sort_values(ascending=False)
+     top_features = imp[imp > 0].to_dict()
+ 
+-    tree_text = export_text(clf, feature_names=available_cols)
+-    mql5_code = tree_to_mql5(clf, available_cols)
++    tree_text = export_text(reg, feature_names=available_cols)
++    mql5_code = tree_to_mql5_expectancy(reg, available_cols, exp_threshold=exp_threshold, mode=filter_mode)
++    mql5_legacy = tree_to_mql5(clf, available_cols)
+ 
+-    win_context = X[y == 1].mean().to_dict()
+-    loss_context = X[y == -1].mean().to_dict()
++    leaf_stats = _leaf_table(reg, X, y_pnl)
++    toxic_leaves = [L for L in leaf_stats if L["expectancy"] <= exp_threshold]
++    good_leaves = [L for L in leaf_stats if L["expectancy"] > exp_threshold]
++
++    win_mask = y_pnl > 0
++    win_context = X[win_mask].mean().to_dict()
++    loss_context = X[~win_mask].mean().to_dict()
+ 
+     features_csv_rel = ""
+     if strategy_name:
+@@ -603,40 +1021,106 @@ def extract_strategy_dna(df_h1, trades_df, max_depth=3, cache_path=None, strateg
+             out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest result")
+             os.makedirs(out_dir, exist_ok=True)
+             features_csv_path = os.path.join(out_dir, f"{base_name}_regime_features.csv")
+-            
+             export_df = X.copy()
+-            export_df['Regime_Label'] = y.map({1: 'WIN', -1: 'LOSS'})
+-            export_df.to_csv(features_csv_path, index_label="Time")
++            export_df['OpenTime'] = tbl['OpenTime'].values
++            export_df['Profit'] = y_pnl.values
++            export_df['Regime_Label'] = np.where(y_pnl > 0, 'WIN', 'LOSS')
++            export_df['Pred_Expectancy'] = pred_exp
++            export_df['Filter_Keep'] = keep_mask
++            export_df.to_csv(features_csv_path, index_label="trade_idx")
+             features_csv_rel = f"backtest result/{base_name}_regime_features.csv"
+         except Exception as e:
+             print("Error exporting features CSV:", e)
+ 
+-    stability_res = evaluate_feature_stability_over_time(X, y, available_cols, max_depth=max_depth)
+-    clustering_res = unsupervised_regime_clustering(df_h1, trades_df, n_clusters=3)
++    stability_res = evaluate_feature_stability_over_time(X, y_pnl, available_cols, max_depth=max_depth)
++    clustering_res = unsupervised_regime_clustering(df_h1, trades_work, n_clusters=3)
++
++    # Train "accuracy" redefined as fraction of blocked trades that were losses (precision of block)
++    blocked = y_pnl[~keep_mask]
++    block_precision = float((blocked <= 0).mean()) if len(blocked) else 0.0
++    # Also report correlation of predicted exp with actual (rank)
++    try:
++        from scipy.stats import spearmanr
++        spearman = float(spearmanr(pred_exp, y_pnl).correlation)
++    except Exception:
++        spearman = float(np.corrcoef(pred_exp, y_pnl)[0, 1]) if len(y_pnl) > 2 else 0.0
+ 
+     return {
+         "success": True,
+-        "sample_count": len(y),
+-        "win_count": int((y == 1).sum()),
+-        "loss_count": int((y == -1).sum()),
+-        "accuracy": float(train_acc),
++        "dna_version": "v2_expectancy",
++        "sample_count": int(len(y_pnl)),
++        "win_count": int((y_pnl > 0).sum()),
++        "loss_count": int((y_pnl <= 0).sum()),
++        # Keep keys for UI backward compat — now mean filter-quality metrics
++        "accuracy": float(block_precision) if len(blocked) else float((pred_exp > 0).mean()),
+         "cv_accuracy": float(cv_acc),
+-        "oos_accuracy": float(oos_acc),
++        "oos_accuracy": float(
++            (oos_impact["filtered"]["maxdd"] - oos_impact["baseline"]["maxdd"] + 10) / 20
++        ),  # soft score for display
+         "oos_sample_count": int(oos_size),
+-        "oos_status": "PASS (OOS >= 58%)" if oos_acc >= 0.58 else ("CAUTION (OOS 50-58%)" if oos_acc >= 0.50 else "FAIL (< 50% - Overfit)"),
++        "oos_status": oos_status,
+         "min_samples_leaf": min_leaf,
++        "exp_threshold": float(exp_threshold),
++        "recommended_threshold": float(recommended_threshold),
++        "filter_mode": filter_mode,
++        "spearman_exp_pnl": round(spearman, 3) if spearman == spearman else 0.0,
++        "block_precision": round(block_precision * 100, 1),
++        "cv_avg_dd_delta": round(cv_avg_dd_delta, 2),
+         "top_features": top_features,
+         "tree_text": tree_text,
+         "mql5_code": mql5_code,
++        "mql5_legacy_code": mql5_legacy,
+         "win_context": win_context,
+         "loss_context": loss_context,
+         "features_csv_path": features_csv_rel,
+-        "range_analysis": compute_range_analysis(X, y, top_features),
++        "range_analysis": compute_range_analysis(X, y_pnl, top_features),
+         "feature_stability_analysis": stability_res,
+-        "unsupervised_clustering_analysis": clustering_res
++        "unsupervised_clustering_analysis": clustering_res,
++        "leaf_stats": leaf_stats,
++        "toxic_leaves": toxic_leaves,
++        "good_leaves": good_leaves,
++        "filter_impact": impact,
++        "filter_impact_oos": oos_impact,
++        "legacy_winrate_filter_impact": legacy_impact,
++        "diagnosis": _build_dna_diagnosis(impact, oos_impact, legacy_impact),
+     }
+ 
+ 
++def _build_dna_diagnosis(impact, oos_impact, legacy_impact):
++    """Human-readable diagnosis comparing v2 block-list vs legacy allow-list."""
++    lines = []
++    base, filt = impact["baseline"], impact["filtered"]
++    lines.append(
++        f"Baseline: Net ${base['net']:,.0f} | MaxDD {base['maxdd']:.1f}% | PF {base['pf']} | "
++        f"n={base['n']} | Exp ${base['exp']}"
++    )
++    lines.append(
++        f"DNA v2 (block toxic): Net ${filt['net']:,.0f} (Δ {impact['delta_net']:+.0f}) | "
++        f"MaxDD {filt['maxdd']:.1f}% (Δ DD {impact['delta_maxdd']:+.1f}pp) | "
++        f"PF {filt['pf']} | chặn {impact['block_rate_pct']}% lệnh "
++        f"(blocked net ${impact['blocked_net_pnl']:,.0f})"
++    )
++    leg = legacy_impact["filtered"]
++    lines.append(
++        f"Legacy WR allow-list: Net ${leg['net']:,.0f} | MaxDD {leg['maxdd']:.1f}% | "
++        f"PF {leg['pf']} | chặn {legacy_impact['block_rate_pct']}% "
++        f"(thường cắt cả lệnh lãi lớn → profit giảm, DD không cải thiện)"
++    )
++    oos_b, oos_f = oos_impact["baseline"], oos_impact["filtered"]
++    lines.append(
++        f"OOS holdout: baseline Net ${oos_b['net']:,.0f} / DD {oos_b['maxdd']:.1f}% → "
++        f"filtered Net ${oos_f['net']:,.0f} / DD {oos_f['maxdd']:.1f}% "
++        f"(block {oos_impact['block_rate_pct']}%)"
++    )
++    if impact["delta_maxdd"] > 0.5 and impact["delta_net"] >= -abs(base["net"]) * 0.25:
++        lines.append("✅ v2 đạt mục tiêu: DD giảm (hoặc không xấu hơn nhiều) mà không phá phần lớn profit.")
++    elif impact["delta_net"] < -abs(base["net"]) * 0.3 and impact["delta_maxdd"] < 1:
++        lines.append("⚠️ Filter vẫn đang cắt quá nhiều edge. Nới exp_threshold (vd -2 hoặc -5) hoặc giảm max_depth.")
++    else:
++        lines.append("ℹ️ Kiểm tra OOS: nếu OOS FAIL thì chưa deploy live — concept drift / overfit.")
++    return lines
++
++
+ # ============================================================
+ # REGIME PERSISTENT REGISTRY (Lưu trữ ADN chiến lược)
+ # ============================================================
+@@ -670,6 +1154,7 @@ def save_regime_registry(strategy_name, dna_res, symbol_ohlc, timeframe):
+             "last_updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             "symbol_ohlc": symbol_ohlc,
+             "timeframe": timeframe,
++            "dna_version": dna_res.get("dna_version", "v2_expectancy"),
+             "accuracy": dna_res.get("accuracy", 0),
+             "cv_accuracy": dna_res.get("cv_accuracy", 0),
+             "oos_accuracy": dna_res.get("oos_accuracy", 0),
+@@ -677,15 +1162,25 @@ def save_regime_registry(strategy_name, dna_res, symbol_ohlc, timeframe):
+             "sample_count": dna_res.get("sample_count", 0),
+             "win_count": dna_res.get("win_count", 0),
+             "loss_count": dna_res.get("loss_count", 0),
++            "exp_threshold": dna_res.get("exp_threshold", 0),
++            "block_precision": dna_res.get("block_precision", 0),
+             "top_features": dna_res.get("top_features", {}),
+             "tree_text": dna_res.get("tree_text", ""),
+             "mql5_code": dna_res.get("mql5_code", ""),
++            "mql5_legacy_code": dna_res.get("mql5_legacy_code", ""),
+             "win_context": dna_res.get("win_context", {}),
+             "loss_context": dna_res.get("loss_context", {}),
+             "features_csv_path": dna_res.get("features_csv_path", ""),
+             "range_analysis": dna_res.get("range_analysis", {}),
+             "feature_stability_analysis": dna_res.get("feature_stability_analysis", {}),
+-            "unsupervised_clustering_analysis": dna_res.get("unsupervised_clustering_analysis", {})
++            "unsupervised_clustering_analysis": dna_res.get("unsupervised_clustering_analysis", {}),
++            "leaf_stats": dna_res.get("leaf_stats", []),
++            "toxic_leaves": dna_res.get("toxic_leaves", []),
++            "good_leaves": dna_res.get("good_leaves", []),
++            "filter_impact": dna_res.get("filter_impact", {}),
++            "filter_impact_oos": dna_res.get("filter_impact_oos", {}),
++            "legacy_winrate_filter_impact": dna_res.get("legacy_winrate_filter_impact", {}),
++            "diagnosis": dna_res.get("diagnosis", []),
+         }
+         data[strategy_name] = entry
+         with open(REGISTRY_FILE, "w", encoding="utf-8") as f:

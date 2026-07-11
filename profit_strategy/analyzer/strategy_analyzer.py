@@ -34,6 +34,13 @@ except ImportError:
 # ============================================================
 # GOOGLE DRIVE SYNC
 # ============================================================
+
+class RawDealsWrapper:
+    def __init__(self, df):
+        self.df = df
+    def __eq__(self, other):
+        return id(self) == id(other)
+
 def get_secret(key, default=None):
     try:
         if key in st.secrets:
@@ -50,15 +57,29 @@ def get_drive_service():
 
     try:
         from google.oauth2.credentials import Credentials as OAuthCredentials
+        from google.auth.exceptions import RefreshError
         
         # Phương án 1: OAuth 2.0 User Flow từ Streamlit Cloud Secrets [google_oauth_token]
         oauth_secret = get_secret("google_oauth_token")
         if oauth_secret:
-            creds = OAuthCredentials.from_authorized_user_info(dict(oauth_secret), SCOPES)
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            if creds and creds.valid:
-                return build('drive', 'v3', credentials=creds)
+            try:
+                creds = OAuthCredentials.from_authorized_user_info(dict(oauth_secret), SCOPES)
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                if creds and creds.valid:
+                    return build('drive', 'v3', credentials=creds)
+            except RefreshError as re:
+                st.sidebar.error(
+                    "⚠️ **Token Google Drive trên Streamlit Cloud Secrets đã hết hạn (`invalid_grant`).**\n\n"
+                    "**Nguyên nhân:** OAuth App trên Google Cloud Console đang ở chế độ `Testing` (tự hết hạn sau 7 ngày).\n\n"
+                    "**Cách khắc phục vĩnh viễn:**\n"
+                    "1. Vào Google Cloud Console -> **OAuth consent screen** -> bấm **PUBLISH APP**.\n"
+                    "2. Chạy lại app ở máy Local để đăng nhập cấp lại `token.json` mới.\n"
+                    "3. Copy nội dung `token.json` mới vào `[google_oauth_token]` trong Secrets trên Streamlit Cloud!"
+                )
+                return None
+            except Exception as e:
+                st.sidebar.warning(f"Lỗi khởi tạo Drive từ Secrets: {e}")
 
         # Phương án 2: OAuth 2.0 User Flow từ file local (token.json hoặc token.pickle)
         if os.path.exists('token.json'):
@@ -68,14 +89,27 @@ def get_drive_service():
                 creds = pickle.load(token)
                 
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            if os.path.exists('token.json'):
-                with open('token.json', 'w', encoding='utf-8') as f:
-                    f.write(creds.to_json())
-            elif os.path.exists('token.pickle'):
-                with open('token.pickle', 'wb') as token:
-                    pickle.dump(creds, token)
+            try:
+                creds.refresh(Request())
+                if os.path.exists('token.json'):
+                    with open('token.json', 'w', encoding='utf-8') as f:
+                        f.write(creds.to_json())
+                elif os.path.exists('token.pickle'):
+                    with open('token.pickle', 'wb') as token:
+                        pickle.dump(creds, token)
+            except Exception as e:
+                # Token hết hạn 7 ngày / thu hồi -> Xóa file cũ để kích hoạt lại quy trình xác thực qua trình duyệt
+                if os.path.exists('token.json'):
+                    try: os.remove('token.json')
+                    except Exception: pass
+                if os.path.exists('token.pickle'):
+                    try: os.remove('token.pickle')
+                    except Exception: pass
+                creds = None
         elif not creds or not creds.valid:
+            pass
+
+        if not creds or not creds.valid:
             if os.path.exists('credentials.json'):
                 flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
                 creds = flow.run_local_server(port=0)
@@ -221,59 +255,118 @@ def get_mt5_metric(raw_df, label_str, header_idx):
                         return v
     return None
 
-@st.cache_data
-def load_backtest(file_path):
-    import pickle
-    cache_path = file_path + ".cache.pkl"
-    if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(file_path):
-        try:
-            with open(cache_path, "rb") as f:
-                trades, metrics = pickle.load(f)
-            return trades, metrics, None
-        except Exception:
-            pass
+# Bump when trades schema / OpenTime pairing changes — invalidates stale .cache.pkl
+BACKTEST_CACHE_VERSION = 3
 
-    # Cache missed, start progress display
-    status = None
-    if hasattr(st, "status"):
-        status = st.status(f"🔍 Đang phân tích file: {os.path.basename(file_path)}", expanded=True)
-    else:
-        status_placeholder = st.empty()
 
-    def log_progress(msg):
-        if status:
-            status.write(msg)
-        else:
-            status_placeholder.text(msg)
+def _open_time_coverage(trades):
+    """Fraction of rows with valid OpenTime (0..1)."""
+    if trades is None or len(trades) == 0:
+        return 0.0
+    if 'OpenTime' not in trades.columns:
+        return 0.0
+    return float(pd.to_datetime(trades['OpenTime'], errors='coerce').notna().mean())
 
-    log_progress("📥 Bước 1: Đang nạp tệp dữ liệu vào bộ nhớ...")
+
+def _normalize_deals_direction(series):
+    """Map MT5 Direction variants → in/out."""
+    s = series.astype(str).str.strip().str.lower()
+    s = s.replace({
+        'in': 'in', 'out': 'out',
+        'entry': 'in', 'exit': 'out',
+        'enter': 'in', 'close': 'out',
+        'buy': 'in', 'sell': 'out',  # rare mis-exports
+        '0': 'in', '1': 'out',
+    })
+    return s
+
+
+def _pair_open_times_onto_trades(trades, deals_df, log_progress=None):
+    """
+    Ensure trades has OpenTime via Order-join then FIFO volume pairing.
+    deals_df must contain full IN+OUT deal stream when available.
+    """
+    log = log_progress or (lambda m: None)
+    if trades is None or len(trades) == 0:
+        return trades, 0
+
+    out = trades.copy()
+    open_matched = 0
+    df = deals_df
+
+    if df is not None and 'Direction' in df.columns:
+        df = df.copy()
+        df['_dir'] = _normalize_deals_direction(df['Direction'])
+        if 'Order' in df.columns and 'Order' in out.columns:
+            entries = df[df['_dir'] == 'in'].copy()
+            if not entries.empty:
+                entry_map = entries.set_index('Order')[['Time', 'Price', 'Type']].rename(
+                    columns={'Time': 'OpenTime', 'Price': 'OpenPrice', 'Type': 'TradeType'})
+                # drop stale OpenTime before merge
+                out = out.drop(columns=[c for c in ['OpenTime', 'OpenPrice', 'TradeType'] if c in out.columns], errors='ignore')
+                out = out.merge(entry_map, left_on='Order', right_index=True, how='left')
+                open_matched = int(out['OpenTime'].notna().sum()) if 'OpenTime' in out.columns else 0
+                log(f"🔗 Order-join OpenTime: {open_matched}/{len(out)}")
+
+        if open_matched < max(1, int(0.95 * len(out))):
+            try:
+                import importlib
+                import regime_analyzer as _ra
+                _ra = importlib.reload(_ra)
+                # Use normalized Direction for FIFO
+                deals_for_fifo = df.copy()
+                deals_for_fifo['Direction'] = df['_dir']
+                paired = _ra.ensure_trade_open_times_from_deals(deals_for_fifo)
+                if paired is not None and not paired.empty and 'OpenTime' in paired.columns:
+                    key = ['Time', 'Profit'] if 'Profit' in out.columns and 'Profit' in paired.columns else ['Time']
+                    keep_cols = ['OpenTime']
+                    if 'OpenPrice' in paired.columns:
+                        keep_cols.append('OpenPrice')
+                    if 'TradeType' in paired.columns:
+                        keep_cols.append('TradeType')
+                    out = out.drop(columns=[c for c in keep_cols if c in out.columns], errors='ignore')
+                    # avoid duplicate keys after merge
+                    merge_src = paired[key + keep_cols].drop_duplicates(key, keep='first')
+                    out = out.merge(merge_src, on=key, how='left')
+                    open_matched = int(out['OpenTime'].notna().sum()) if 'OpenTime' in out.columns else 0
+                    log(f"✅ FIFO IN/OUT OpenTime: {open_matched}/{len(out)}")
+            except Exception as e:
+                log(f"⚠️ FIFO OpenTime failed: {e}")
+
+    if 'OpenTime' in out.columns:
+        out['OpenTime'] = pd.to_datetime(out['OpenTime'], errors='coerce')
+        if 'Time' in out.columns:
+            out['Duration'] = (pd.to_datetime(out['Time'], errors='coerce') - out['OpenTime']).dt.total_seconds() / 3600.0
+    return out, open_matched
+
+
+def extract_mt5_deals_table(file_path):
+    """Load full MT5 Deals table (IN+OUT) from backtest xlsx/csv. Returns DataFrame or None."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if file_path.lower().endswith('.csv'):
-            try: raw = pd.read_csv(file_path, header=None, encoding='utf-16le', sep='\t')
-            except: raw = pd.read_csv(file_path, header=None)
+            try:
+                raw = pd.read_csv(file_path, header=None, encoding='utf-16le', sep='\t')
+            except Exception:
+                raw = pd.read_csv(file_path, header=None)
         else:
             try:
                 raw = pd.read_excel(file_path, engine='calamine', header=None)
             except Exception:
                 raw = pd.read_excel(file_path, engine='openpyxl', header=None)
 
-    log_progress("🔎 Bước 2: Đang quét cấu trúc báo cáo MT5 để tìm bảng Deals...")
-    # Find Deals table
     deals_mask = raw[0].astype(str).str.strip() == 'Deals'
-    if deals_mask.any():
-        deals_start = raw[deals_mask].index[0]
-    else:
-        if status:
-            status.update(label="❌ Lỗi: Không tìm thấy bảng Deals trong tệp!", state="error")
-        return None, None, None
+    if not deals_mask.any():
+        # fallback: any cell equals Deals
+        deals_mask = raw.apply(lambda col: col.astype(str).str.strip() == 'Deals').any(axis=1)
+    if not deals_mask.any():
+        return None
 
-    log_progress("📊 Bước 3: Đang trích xuất và làm sạch dữ liệu giao dịch...")
+    deals_start = raw[deals_mask].index[0]
     header_idx = deals_start + 1
     df = raw.iloc[header_idx + 1:].copy()
     df.columns = raw.iloc[header_idx].values
 
-    # Clean columns
     col_map = {}
     for c in df.columns:
         cs = str(c).strip().lower()
@@ -291,33 +384,148 @@ def load_backtest(file_path):
         elif cs == 'comment': col_map[c] = 'Comment'
         elif cs == 'order': col_map[c] = 'Order'
     df.rename(columns=col_map, inplace=True)
-
+    if 'Time' not in df.columns:
+        return None
     df['Time'] = pd.to_datetime(df['Time'], errors='coerce')
     df.dropna(subset=['Time'], inplace=True)
-
     for nc in ['Profit', 'Balance', 'Volume', 'Price', 'Swap', 'Commission']:
         if nc in df.columns:
             df[nc] = pd.to_numeric(df[nc], errors='coerce')
-
-    # Filter only closed trades (direction=out or has profit != 0)
     if 'Direction' in df.columns:
-        trades = df[df['Direction'].astype(str).str.strip().str.lower() == 'out'].copy()
+        df['Direction'] = _normalize_deals_direction(df['Direction'])
+    # drop trailing empty / balance-only junk rows without type+direction
+    if 'Direction' in df.columns:
+        df = df[df['Direction'].isin(['in', 'out']) | df['Profit'].notna()].copy()
+    return df.reset_index(drop=True)
+
+
+def ensure_trades_have_open_time(trades, backtest_path=None, deals_df=None, log_progress=None):
+    """
+    Public helper for DNA train: guarantee OpenTime on trades.
+    Re-reads deals from backtest_path if needed (Streamlit cache strips attrs).
+    """
+    log = log_progress or (lambda m: None)
+    if trades is None or len(trades) == 0:
+        return trades, 0.0
+
+    cov = _open_time_coverage(trades)
+    if cov >= 0.95:
+        return trades, cov
+
+    raw = deals_df
+    if raw is None:
+        wrap = getattr(trades, 'attrs', {}).get('raw_deals')
+        raw = wrap.df if hasattr(wrap, 'df') else wrap
+    if (raw is None or (hasattr(raw, 'empty') and raw.empty)) and backtest_path and os.path.exists(backtest_path):
+        log(f"📥 Re-load Deals từ file để ghép OpenTime: {os.path.basename(backtest_path)}")
+        raw = extract_mt5_deals_table(backtest_path)
+
+    if raw is None or (hasattr(raw, 'empty') and raw.empty):
+        log("⚠️ Không lấy được bảng Deals để ghép OpenTime.")
+        return trades, cov
+
+    paired, n_matched = _pair_open_times_onto_trades(trades, raw, log_progress=log)
+    try:
+        paired.attrs['raw_deals'] = RawDealsWrapper(raw)
+        paired.attrs['open_time_matched'] = n_matched
+        paired.attrs['open_time_total'] = len(paired)
+    except Exception:
+        pass
+    return paired, _open_time_coverage(paired)
+
+
+@st.cache_data
+def load_backtest(file_path):
+    import pickle
+    cache_path = file_path + ".cache.pkl"
+
+    def _cache_usable(trades_obj):
+        if trades_obj is None or len(trades_obj) == 0:
+            return False
+        # Require OpenTime for DNA v2 (versioned cache)
+        return _open_time_coverage(trades_obj) >= 0.8
+
+    if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(file_path):
+        try:
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            if isinstance(cached, tuple) and len(cached) >= 2:
+                trades, metrics = cached[0], cached[1]
+                cache_ver = metrics.get('_cache_version', 0) if isinstance(metrics, dict) else 0
+                if cache_ver >= BACKTEST_CACHE_VERSION and _cache_usable(trades):
+                    # Re-pair if Streamlit/pickle dropped coverage edge cases
+                    if _open_time_coverage(trades) < 0.95:
+                        trades, _ = ensure_trades_have_open_time(trades, backtest_path=file_path)
+                    return trades, metrics, None
+                # stale cache (no OpenTime) → fall through rebuild
+        except Exception:
+            pass
+
+    # Cache missed, start progress display
+    status = None
+    if hasattr(st, "status"):
+        status = st.status(f"🔍 Đang phân tích file: {os.path.basename(file_path)}", expanded=True)
+    else:
+        status_placeholder = st.empty()
+
+    def log_progress(msg):
+        if status:
+            status.write(msg)
+        else:
+            status_placeholder.text(msg)
+
+    log_progress("📥 Bước 1: Đang nạp tệp dữ liệu vào bộ nhớ...")
+    df = extract_mt5_deals_table(file_path)
+    if df is None or df.empty:
+        if status:
+            status.update(label="❌ Lỗi: Không tìm thấy bảng Deals trong tệp!", state="error")
+        return None, None, None
+
+    # header metrics still need raw sheet — light re-read for metrics only
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if file_path.lower().endswith('.csv'):
+            try:
+                raw = pd.read_csv(file_path, header=None, encoding='utf-16le', sep='\t')
+            except Exception:
+                raw = pd.read_csv(file_path, header=None)
+        else:
+            try:
+                raw = pd.read_excel(file_path, engine='calamine', header=None)
+            except Exception:
+                raw = pd.read_excel(file_path, engine='openpyxl', header=None)
+    deals_mask = raw[0].astype(str).str.strip() == 'Deals'
+    if not deals_mask.any():
+        deals_mask = raw.apply(lambda col: col.astype(str).str.strip() == 'Deals').any(axis=1)
+    header_idx = deals_mask.idxmax() + 1 if deals_mask.any() else 0
+
+    log_progress("📊 Bước 3: Đang trích xuất và làm sạch dữ liệu giao dịch...")
+    if 'Direction' in df.columns:
+        trades = df[df['Direction'].isin(['out'])].copy()
+        if trades.empty:
+            # fallback if direction labels unexpected
+            trades = df[df['Profit'].notna() & (df['Profit'] != 0)].copy()
     else:
         trades = df[df['Profit'].notna() & (df['Profit'] != 0)].copy()
 
     log_progress("🔗 Bước 4: Đang đối chiếu các vị thế In/Out (khớp lệnh vào/ra)...")
-    # Build entry info: match each "out" deal to its "in" deal via Order
-    if 'Direction' in df.columns and 'Order' in df.columns:
-        entries = df[df['Direction'].astype(str).str.strip().str.lower() == 'in'].copy()
-        entry_map = entries.set_index('Order')[['Time', 'Price', 'Type']].rename(
-            columns={'Time': 'OpenTime', 'Price': 'OpenPrice', 'Type': 'TradeType'})
-        # Some orders may not exist, use left join
-        if 'Order' in trades.columns:
-            trades = trades.merge(entry_map, left_on='Order', right_index=True, how='left')
+    trades, open_matched = _pair_open_times_onto_trades(trades, df, log_progress=log_progress)
+    cov = _open_time_coverage(trades)
+    if cov < 0.95:
+        log_progress(
+            f"⚠️ OpenTime coverage {open_matched}/{len(trades)} ({cov*100:.1f}%) — "
+            f"DNA có thể map sai nếu martingale/multi-position."
+        )
+    else:
+        log_progress(f"✅ OpenTime OK: {open_matched}/{len(trades)} ({cov*100:.1f}%)")
 
-    # Duration
-    if 'OpenTime' in trades.columns:
-        trades['Duration'] = (trades['Time'] - trades['OpenTime']).dt.total_seconds() / 3600.0
+    try:
+        trades.attrs['raw_deals'] = RawDealsWrapper(df)
+        trades.attrs['open_time_matched'] = open_matched
+        trades.attrs['open_time_total'] = len(trades)
+        trades.attrs['backtest_path'] = file_path
+    except Exception:
+        pass
     trades.reset_index(drop=True, inplace=True)
 
     log_progress("📈 Bước 5: Đang tổng hợp các chỉ số hiệu suất từ Header...")
@@ -343,10 +551,15 @@ def load_backtest(file_path):
         try: metrics['win_rate'] = float(wr_str.split('(')[1].split('%')[0])
         except: pass
 
+    metrics['_cache_version'] = BACKTEST_CACHE_VERSION
+    metrics['open_time_coverage'] = round(_open_time_coverage(trades) * 100, 1)
+
     log_progress("💾 Bước 6: Đang lưu trữ dữ liệu đã phân giải vào bộ nhớ đệm (Cache)...")
     try:
         with open(cache_path, "wb") as f:
-            pickle.dump((trades, metrics), f, protocol=pickle.HIGHEST_PROTOCOL)
+            # Do not pickle RawDealsWrapper (fragile); OpenTime columns are enough.
+            # raw_deals re-loaded from file on DNA train if needed.
+            pickle.dump((trades.copy(), metrics), f, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception:
         pass
 
@@ -355,7 +568,7 @@ def load_backtest(file_path):
     else:
         status_placeholder.empty()
 
-    return trades, metrics, raw
+    return trades, metrics, df
 
 # ============================================================
 # METRICS COMPUTATION
@@ -847,92 +1060,206 @@ def run_monte_carlo(profits, n_sims=10000, init_balance=5000):
 # REGIME DNA TAB RENDERER (UI Helper)
 # ============================================================
 def render_dna_tabs(data_dict):
-    st.markdown(f"**Độ chính xác Train**: `{data_dict.get('accuracy', 0)*100:.1f}%` | **Purged CV (Chống Overfit)**: `{data_dict.get('cv_accuracy', 0)*100:.1f}%` | **Out-of-Sample (Holdout OOS)**: `{data_dict.get('oos_accuracy', 0)*100:.1f}%` ({data_dict.get('oos_status', 'N/A')}) | **Mẫu**: `{data_dict.get('sample_count', 0)}` lệnh ({data_dict.get('win_count', 0)} Thắng / {data_dict.get('loss_count', 0)} Thua)")
-    
-    if data_dict.get('cv_accuracy', 0) >= 0.65:
-        st.info("🛡️ **Anti-Overfitting Verified**: Điểm số kiểm định chéo Purged K-Fold đạt mức cao và ổn định, bộ lọc đảm bảo không bị overfit vào dữ liệu nhiễu.")
-    if data_dict.get("features_csv_path") and os.path.exists(data_dict["features_csv_path"]):
-        st.markdown(f"📂 **Bảng dữ liệu chỉ số bối cảnh từng lệnh đã lưu sẵn**: `{data_dict['features_csv_path']}`")
-        
-    p_tab1, p_tab2, p_tab3, p_tab4, p_tab5, p_tab6 = st.tabs(["💻 Code MQL5 Bộ Lọc", "📊 Cây Quyết Định (Text)", "⏳ Ổn Định Theo Thời Gian", "🔍 Phân Cụm Không Giám Sát", "⚖️ Đối Chiếu Thắng vs Thua", "📏 Phân Vùng Lãi/Lỗ"])
-    
+    ver = data_dict.get("dna_version", "v1")
+    thr_mode = data_dict.get("threshold_mode", "auto")
+    deploy_src = data_dict.get("deploy_tree_source", "train_only")
+    st.markdown(
+        f"**DNA `{ver}`** | **Mẫu**: `{data_dict.get('sample_count', 0)}` lệnh "
+        f"({data_dict.get('win_count', 0)} Thắng / {data_dict.get('loss_count', 0)} Thua) | "
+        f"**OOS**: `{data_dict.get('oos_status', 'N/A')}` | "
+        f"**thr** `{data_dict.get('exp_threshold', 0)}` (`{thr_mode}`) | "
+        f"**deploy**: `{deploy_src}` | "
+        f"**Block precision**: `{data_dict.get('block_precision', 0)}%` | "
+        f"**OpenTime**: `{data_dict.get('open_time_coverage', 'N/A')}%`"
+    )
+    if data_dict.get("walk_forward_pass_rate") is not None:
+        st.caption(f"Walk-forward pass rate: **{data_dict['walk_forward_pass_rate']}%**")
+
+    for w in (data_dict.get("warnings") or []):
+        st.warning(w)
+
+    # Diagnosis + filter impact (core of v2)
+    if data_dict.get("diagnosis"):
+        st.markdown("### 🩺 Chẩn đoán Filter Impact")
+        for line in data_dict["diagnosis"]:
+            st.markdown(f"- {line}")
+
+    impact = data_dict.get("filter_impact")
+    if impact:
+        c1, c2, c3, c4 = st.columns(4)
+        base, filt = impact["baseline"], impact["filtered"]
+        c1.metric("Net (sau filter)", f"${filt['net']:,.0f}", f"{impact['delta_net']:+.0f}")
+        c2.metric("MaxDD (sau filter)", f"{filt['maxdd']:.1f}%", f"{impact['delta_maxdd']:+.1f}pp")
+        c3.metric("Profit Factor", f"{filt['pf']}", f"{impact['delta_pf']:+.2f}")
+        c4.metric("Tỷ lệ chặn", f"{impact['block_rate_pct']}%", f"blocked net ${impact['blocked_net_pnl']:,.0f}")
+
+    if data_dict.get("legacy_winrate_filter_impact"):
+        leg = data_dict["legacy_winrate_filter_impact"]
+        with st.expander("⚠️ So sánh với filter cũ (Win/Loss Allow-List) — thường là nguyên nhân profit giảm mà DD không giảm"):
+            st.write(leg)
+
+    if data_dict.get("features_csv_path"):
+        st.markdown(f"📂 **Features CSV**: `{data_dict['features_csv_path']}`")
+    if data_dict.get("rule_paths"):
+        n_tox = len((data_dict["rule_paths"] or {}).get("toxic_paths") or [])
+        st.success(f"🌳 Đã lưu **rule_paths** ({n_tox} toxic path) — Live Monitor Streamlit dùng **cùng cây DNA**.")
+
+    p_tab1, p_tab2, p_tab3, p_tab4, p_tab5, p_tab6, p_tab7 = st.tabs([
+        "🌳 Rule Paths (Live)",
+        "📊 Cây Expectancy",
+        "🍃 Leaf Stats",
+        "⏳ Ổn Định Theo Thời Gian",
+        "🔍 Phân Cụm Không Giám Sát",
+        "⚖️ Đối Chiếu Thắng vs Thua",
+        "📏 Phân Vùng Lãi/Lỗ",
+    ])
+
     with p_tab1:
-        st.markdown("Copy toàn bộ câu lệnh điều kiện dưới đây gắn vào đầu hàm `OnTick()` của EA trên MT5:")
-        st.code(data_dict.get("mql5_code", ""), language="mql5")
-        
+        st.markdown(
+            "**Theo dõi chính trên Streamlit Live Monitor** (cùng `rule_paths` bên dưới). "
+            "Không bắt buộc gắn MQL5/MT5."
+        )
+        rp = data_dict.get("rule_paths") or {}
+        if rp:
+            st.json({
+                "mode": rp.get("mode"),
+                "exp_threshold": rp.get("exp_threshold"),
+                "feature_names": rp.get("feature_names"),
+                "toxic_paths": rp.get("toxic_paths"),
+                "good_paths_count": len(rp.get("good_paths") or []),
+            })
+        else:
+            st.info("Chưa có rule_paths — huấn luyện lại DNA v2.")
+        with st.expander("Tham khảo MQL5 (tuỳ chọn — không bắt buộc)"):
+            st.code(data_dict.get("mql5_code", ""), language="mql5")
+            if data_dict.get("mql5_legacy_code"):
+                st.caption("Legacy WR allow-list (không khuyến nghị)")
+                st.code(data_dict["mql5_legacy_code"], language="mql5")
+        if data_dict.get("walk_forward"):
+            with st.expander("Walk-forward folds"):
+                st.dataframe(pd.DataFrame(data_dict["walk_forward"]), hide_index=True)
+        if data_dict.get("threshold_candidates_scored"):
+            with st.expander("Bảng score threshold (auto)"):
+                st.dataframe(pd.DataFrame(data_dict["threshold_candidates_scored"]), hide_index=True)
+
     with p_tab2:
+        st.caption("Cây hồi quy PnL (expectancy). Giá trị leaf = $ kỳ vọng / lệnh.")
         st.text(data_dict.get("tree_text", ""))
         if data_dict.get("top_features"):
-            st.markdown("**Các Đặc Trưng Quan Trọng Nhất (Feature Importances):**")
-            imp_df = pd.DataFrame(list(data_dict["top_features"].items()), columns=["Chỉ số", "Tầm quan trọng"]).sort_values("Tầm quan trọng", ascending=False)
+            st.markdown("**Feature Importances (Expectancy model):**")
+            imp_df = pd.DataFrame(
+                list(data_dict["top_features"].items()), columns=["Chỉ số", "Tầm quan trọng"]
+            ).sort_values("Tầm quan trọng", ascending=False)
             st.dataframe(imp_df, hide_index=True)
-            
+
     with p_tab3:
+        leaves = data_dict.get("leaf_stats") or []
+        if leaves:
+            st.markdown(
+                f"Ngưỡng chặn: **exp ≤ {data_dict.get('exp_threshold', 0)}**. "
+                f"Toxic leaves: **{len(data_dict.get('toxic_leaves') or [])}** | "
+                f"Safe leaves: **{len(data_dict.get('good_leaves') or [])}**"
+            )
+            lf = pd.DataFrame(leaves)
+            st.dataframe(
+                lf.style.background_gradient(subset=["expectancy", "net_pnl"], cmap="RdYlGn"),
+                hide_index=True,
+            )
+        else:
+            st.info("Chưa có leaf stats — hãy huấn luyện lại DNA v2.")
+
+    with p_tab4:
         stab_data = data_dict.get("feature_stability_analysis", {})
         if stab_data and "error" not in stab_data:
-            st.markdown(f"**Phân tích độ ổn định qua {stab_data.get('valid_periods', 0)} chu kỳ thời gian liên tiếp (Time-Decay / Concept Drift):**")
+            st.markdown(
+                f"**Độ ổn định qua {stab_data.get('valid_periods', 0)} chu kỳ "
+                f"(Expectancy regressor):**"
+            )
             if stab_data.get("robust_features"):
-                st.success(f"🟢 **Robust DNA (Các chỉ số ổn định nhất)**: `{', '.join(stab_data['robust_features'])}`")
+                st.success(f"🟢 **Robust DNA**: `{', '.join(stab_data['robust_features'])}`")
             if stab_data.get("drift_warnings"):
-                st.warning(f"🔴 **Concept Drift (Cảnh báo thoái hóa/không ổn định)**: `{', '.join(stab_data['drift_warnings'])}` - Chỉ số này có nguy cơ overfit hoặc thoái hóa theo thời gian.")
-            st.markdown("---")
-            st.markdown("**Bảng Tổng Hợp Độ Ổn Định Từng Chỉ Số:**")
+                st.warning(
+                    f"🔴 **Concept Drift**: `{', '.join(stab_data['drift_warnings'])}`"
+                )
             st_df = pd.DataFrame(stab_data.get("stability_summary", []))
             if not st_df.empty:
-                st_df = st_df.rename(columns={"feature": "Chỉ số", "appearance_count": "Tần suất xuất hiện", "consistency_pct": "Độ ổn định (%)", "avg_importance": "Trọng số TB", "status": "Trạng thái"})
-                st.dataframe(st_df.style.background_gradient(subset=["Độ ổn định (%)"], cmap="RdYlGn"), hide_index=True)
-            with st.expander("🔍 Chi tiết Win Rate & Đặc trưng theo từng chu kỳ"):
+                st_df = st_df.rename(columns={
+                    "feature": "Chỉ số", "appearance_count": "Tần suất",
+                    "consistency_pct": "Độ ổn định (%)", "avg_importance": "Trọng số TB",
+                    "status": "Trạng thái",
+                })
+                st.dataframe(
+                    st_df.style.background_gradient(subset=["Độ ổn định (%)"], cmap="RdYlGn"),
+                    hide_index=True,
+                )
+            with st.expander("Chi tiết theo chu kỳ"):
                 p_df = pd.DataFrame(stab_data.get("period_details", []))
                 if not p_df.empty:
                     p_df = p_df.drop(columns=["top_features"], errors="ignore")
-                    p_df = p_df.rename(columns={"period_idx": "Chu kỳ #", "time_range": "Khoảng thời gian", "sample_count": "Số lệnh", "win_rate": "Win Rate (%)", "accuracy": "Độ chính xác AI (%)"})
                     st.dataframe(p_df, hide_index=True)
         else:
-            st.info("Chưa có dữ liệu phân tích độ ổn định thời gian cho chiến lược này. Vui lòng huấn luyện lại phía dưới.")
-            
-    with p_tab4:
+            st.info(stab_data.get("error", "Chưa có dữ liệu ổn định. Huấn luyện lại."))
+
+    with p_tab5:
         clus_data = data_dict.get("unsupervised_clustering_analysis", {})
         if clus_data and "error" not in clus_data:
-            st.markdown(f"**Phân cụm thị trường không giám sát (K-Means K={clus_data.get('n_clusters', 3)}) & Đối chứng kép:**")
-            st.info(f"🏆 **Cụm thị trường EA hoạt động hiệu quả nhất**: **`{clus_data.get('best_cluster_name', '')}`** (Win Rate cao nhất: **{clus_data.get('best_win_rate', 0)}%**)")
-            st.markdown("---")
-            st.markdown("**Hiệu Suất Thực Tế Của EA Trên Từng Cụm Thị Trường (Unsupervised Validation):**")
+            be = clus_data.get("best_expectancy")
+            be_txt = f"${be}" if be is not None else "N/A"
+            st.info(
+                f"🏆 Cụm tốt nhất (theo **expectancy**): **`{clus_data.get('best_cluster_name', '')}`** "
+                f"(exp {be_txt}/lệnh · WR {clus_data.get('best_win_rate', 0)}%)"
+            )
             tc_df = pd.DataFrame(clus_data.get("trade_cluster_stats", []))
             if not tc_df.empty:
-                tc_df = tc_df.rename(columns={"cluster_name": "Tên cụm bối cảnh (Centroid)", "total_trades": "Tổng lệnh", "win_count": "Thắng", "loss_count": "Thua", "win_rate": "Win Rate (%)", "net_pnl": "Net PnL ($)", "avg_pnl": "TB PnL/Lệnh ($)"})
-                tc_df = tc_df.drop(columns=["cluster_id"], errors="ignore")
-                st.dataframe(tc_df.style.background_gradient(subset=["Win Rate (%)", "Net PnL ($)"], cmap="RdYlGn"), hide_index=True)
-            with st.expander("📊 Xem Hồ Sơ Ngữ Nghĩa Của Từng Cụm (Centroids Profiles)"):
-                cp_df = pd.DataFrame(clus_data.get("cluster_profiles", []))
-                if not cp_df.empty:
-                    cp_df = cp_df.rename(columns={"name": "Tên cụm", "candle_count": "Số nến H1", "pct_time": "Tỷ lệ thời gian (%)", "adx_mean": "ADX TB", "atr_pct_mean": "ATR% TB", "chop_mean": "Chop TB", "hurst_mean": "Hurst TB", "bb_width_mean": "BB Width TB"})
-                    st.dataframe(cp_df, hide_index=True)
+                tc_df = tc_df.rename(columns={
+                    "cluster_name": "Cụm", "total_trades": "Tổng lệnh",
+                    "win_count": "Thắng", "loss_count": "Thua", "win_rate": "Win Rate (%)",
+                    "net_pnl": "Net PnL ($)", "avg_pnl": "Expectancy ($)",
+                    "expectancy": "Exp ($)",
+                }).drop(columns=["cluster_id"], errors="ignore")
+                grad_cols = [c for c in ["Win Rate (%)", "Net PnL ($)", "Expectancy ($)"] if c in tc_df.columns]
+                st.dataframe(
+                    tc_df.style.background_gradient(subset=grad_cols, cmap="RdYlGn") if grad_cols else tc_df,
+                    hide_index=True,
+                )
         else:
-            st.info("Chưa có dữ liệu phân cụm không giám sát. Vui lòng huấn luyện lại phía dưới.")
-            
-    with p_tab5:
+            st.info("Chưa có dữ liệu phân cụm.")
+
+    with p_tab6:
         w_ctx = data_dict.get("win_context", {})
         l_ctx = data_dict.get("loss_context", {})
         if w_ctx:
             contrast_df = pd.DataFrame({
                 "Chỉ số Bối Cảnh": list(w_ctx.keys()),
                 "Khi EA THẮNG (Mean)": list(w_ctx.values()),
-                "Khi EA THUA (Mean)": [l_ctx.get(k, 0) for k in w_ctx.keys()]
+                "Khi EA THUA (Mean)": [l_ctx.get(k, 0) for k in w_ctx.keys()],
             })
-            contrast_df["Chênh Lệch"] = contrast_df["Khi EA THẮNG (Mean)"] - contrast_df["Khi EA THUA (Mean)"]
-            st.dataframe(contrast_df.style.background_gradient(subset=["Chênh Lệch"], cmap="RdYlGn"), hide_index=True)
-            
-    with p_tab6:
+            contrast_df["Chênh Lệch"] = (
+                contrast_df["Khi EA THẮNG (Mean)"] - contrast_df["Khi EA THUA (Mean)"]
+            )
+            st.dataframe(
+                contrast_df.style.background_gradient(subset=["Chênh Lệch"], cmap="RdYlGn"),
+                hide_index=True,
+            )
+
+    with p_tab7:
         range_data = data_dict.get("range_analysis", {})
         if range_data:
-            st.markdown("Phân rã các chỉ số quan trọng thành từng vùng (Range/Bin) để tránh overfit vào một ngưỡng cắt duy nhất:")
+            st.markdown("Phân vùng theo **Win Rate + Expectancy ($)** — đừng chỉ nhìn WR:")
             for feat_name, zones in range_data.items():
-                st.markdown(f"**🔹 Chỉ số: `{feat_name}`**")
-                z_df = pd.DataFrame(zones)
-                z_df = z_df.rename(columns={"range": "Vùng giá trị (Bin)", "total_trades": "Tổng số lệnh", "win_count": "Số lệnh Thắng", "win_rate": "Tỷ lệ Thắng (%)"})
-                st.dataframe(z_df.style.background_gradient(subset=["Tỷ lệ Thắng (%)"], cmap="RdYlGn"), hide_index=True)
+                st.markdown(f"**🔹 `{feat_name}`**")
+                z_df = pd.DataFrame(zones).rename(columns={
+                    "range": "Vùng", "total_trades": "Số lệnh",
+                    "win_count": "Thắng", "win_rate": "WR (%)",
+                    "expectancy": "Expectancy ($)", "net_pnl": "Net ($)",
+                })
+                cols = [c for c in ["WR (%)", "Expectancy ($)", "Net ($)"] if c in z_df.columns]
+                st.dataframe(
+                    z_df.style.background_gradient(subset=cols, cmap="RdYlGn") if cols else z_df,
+                    hide_index=True,
+                )
         else:
-            st.info("Chưa có dữ liệu phân vùng cho chiến lược này.")
+            st.info("Chưa có dữ liệu phân vùng.")
 
 # ============================================================
 # MAIN APP
@@ -973,31 +1300,109 @@ def main():
         st.sidebar.warning("☁️ Google Drive chưa được cấu hình. Vui lòng thêm drive_folder_id và gcp_service_account vào Streamlit Secrets để đồng bộ dữ liệu.")
 
     
-    app_mode = st.sidebar.radio("🧭 Chế độ hiển thị", ["📊 Phân Tích & Tối Ưu DNA", "📡 Giám Sát Bối Cảnh Realtime (Live Monitor)"])
+    # ── URL QUERY PARAMS ROUTING SYNC (Chế độ hiển thị) ──
+    route_options = [
+        "📊 Phân Tích & Tối Ưu DNA",
+        "📡 Giám Sát Bối Cảnh Realtime (Live Monitor)"
+    ]
+    route_keys = {
+        "📊 Phân Tích & Tối Ưu DNA": "dna",
+        "📡 Giám Sát Bối Cảnh Realtime (Live Monitor)": "live"
+    }
+    rev_route_keys = {v: k for k, v in route_keys.items()}
+    
+    current_url_route = st.query_params.get("route", "dna")
+    default_route_idx = 0
+    if current_url_route in rev_route_keys:
+        default_route_idx = route_options.index(rev_route_keys[current_url_route])
+
+    def on_app_mode_change():
+        selected_mode = st.session_state.app_mode_radio
+        route_k = route_keys.get(selected_mode, "dna")
+        st.query_params["route"] = route_k
+        if route_k == "live" and "page" in st.query_params:
+            del st.query_params["page"]
+
+    app_mode = st.sidebar.radio(
+        "🧭 Chế độ hiển thị (Route)",
+        route_options,
+        index=default_route_idx,
+        key="app_mode_radio",
+        on_change=on_app_mode_change
+    )
+    st.query_params["route"] = route_keys.get(app_mode, "dna")
     if app_mode == "📡 Giám Sát Bối Cảnh Realtime (Live Monitor)":
         st.header("📡 Live Regime Monitor (Giám Sát Bối Cảnh Thời Gian Thực)")
-        st.markdown("Hệ thống tự động bốc tách chỉ số thị trường realtime và hiển thị trực quan mức độ phù hợp với các chiến lược EA đã phân tích.")
+        st.markdown(
+            "Đánh giá **cùng cây DNA v2** (`rule_paths`) đã train — **BLOCK = toxic leaf**, "
+            "không còn heuristic mean win/loss. Chỉ theo dõi trên Streamlit (không cần MT5)."
+        )
         
+        import importlib
         import regime_analyzer
+        regime_analyzer = importlib.reload(regime_analyzer)
         registry_data = regime_analyzer.load_regime_registry()
         
         if not registry_data:
             st.warning("⚠️ Chưa có chiến lược nào được giải mã Regime DNA trong hệ thống. Vui lòng chuyển sang chế độ **📊 Phân Tích & Tối Ưu DNA** để huấn luyện AI trước.")
             return
+
+        missing_rules = [k for k, v in registry_data.items() if not (v or {}).get("rule_paths")]
+        if missing_rules:
+            st.warning(
+                f"⚠️ {len(missing_rules)} strategy trong registry **chưa có rule_paths** "
+                f"(registry cũ). Hãy **huấn luyện lại DNA v2** để Live Monitor dùng đúng cây: "
+                f"`{', '.join(missing_rules[:5])}`" + ("…" if len(missing_rules) > 5 else "")
+            )
             
         watchlist = regime_analyzer.load_live_watchlist()
         workspace_dir = os.path.dirname(os.path.abspath(__file__))
         raw_ohlc = sorted(list(set(glob.glob(os.path.join(workspace_dir, "*.csv")) + glob.glob(os.path.join(BACKTEST_DIR, "*.csv")))))
         ohlc_files = [f for f in raw_ohlc if is_ohlc_file(f)]
         ohlc_names = [f"File CSV: {os.path.basename(f)}" for f in ohlc_files]
-        src_options = ["Yahoo Finance API (REST API)", "MetaTrader 5 (Direct Terminal Bridge)"] + ohlc_names
+        # Prefer CSV / Twelve Data (XAU/USD) / MT5; Yahoo GC=F is last-resort proxy
+        src_options = ohlc_names + [
+            regime_analyzer.SOURCE_TWELVE,
+            "Yahoo Finance API (REST API)",
+            "MetaTrader 5 (Direct Terminal Bridge)",
+        ]
+
+        td_key = regime_analyzer.get_twelvedata_api_key(get_secret("TWELVE_DATA_API_KEY"))
+        if not td_key:
+            st.info(
+                "🔑 **Twelve Data:** đặt API key trong Streamlit secrets "
+                "`TWELVE_DATA_API_KEY = \"...\"` hoặc biến môi trường cùng tên. "
+                "Đăng ký free: https://twelvedata.com"
+            )
+        else:
+            st.caption("🔑 Twelve Data API key: đã cấu hình.")
         
         with st.expander("➕ Quản Lý Danh Sách Theo Dõi (Watchlist)", expanded=False):
-            st.markdown("Thêm cặp tiền / mã giao dịch vào danh sách để hệ thống tự động quét mỗi khi vào trang:")
+            st.markdown(
+                "Thêm mã theo dõi. **Online không cần MT5:** Twelve Data `XAU/USD`. "
+                "**Khớp DNA broker:** File CSV MT5."
+            )
             col_w1, col_w2, col_w3, col_w4 = st.columns([2, 1, 1, 1])
             new_src = col_w1.selectbox("🌐 Nguồn dữ liệu:", src_options, key="w_src")
-            def_sym = "GC=F" if "Yahoo" in new_src else ("XAUUSD" if "Meta" in new_src else "")
-            new_sym = col_w2.text_input("Mã (Symbol):", value=def_sym, disabled=new_src.startswith("File CSV"), key="w_sym")
+            if "Twelve" in new_src:
+                def_sym = "XAU/USD"
+                sym_help = "Twelve: XAU/USD, EUR/USD, BTC/USD (hoặc XAUUSD → tự map)."
+            elif "Yahoo" in new_src:
+                def_sym = "GC=F"
+                sym_help = "Yahoo vàng: GC=F. Forex: EURUSD=X."
+            elif "Meta" in new_src:
+                def_sym = "XAUUSD"
+                sym_help = "MT5 Market Watch: XAUUSD / XAUUSDm…"
+            else:
+                def_sym = ""
+                sym_help = "File CSV OHLC."
+            new_sym = col_w2.text_input(
+                "Mã (Symbol):",
+                value=def_sym,
+                disabled=new_src.startswith("File CSV"),
+                key="w_sym",
+                help=sym_help,
+            )
             new_tf = col_w3.selectbox("⏱️ Khung:", ["1h", "4h", "15m", "5m"], index=0, key="w_tf")
             
             if col_w4.button("➕ Thêm ngay", type="secondary"):
@@ -1053,12 +1458,25 @@ def main():
                     p_back = os.path.join(BACKTEST_DIR, sym)
                     target_sym = p_work if os.path.exists(p_work) else p_back
                 with st.spinner(f"Đang kéo dữ liệu live & tính toán bối cảnh cho {sym}..."):
-                    df_live, err_msg = regime_analyzer.fetch_live_ohlc(src, target_sym, tf)
+                    df_live, err_msg = regime_analyzer.fetch_live_ohlc(
+                        src, target_sym, tf, api_key=td_key
+                    )
                 
                 if err_msg or df_live is None or df_live.empty:
                     st.error(f"❌ Lỗi kết nối lấy dữ liệu cho `{sym}`: {err_msg or 'Không có dữ liệu nến.'}")
+                    if "Yahoo" in src:
+                        st.info("💡 Yahoo vàng: **`GC=F`**, hoặc chuyển nguồn **Twelve Data `XAU/USD`** / CSV MT5.")
+                    if "Twelve" in src:
+                        st.info("💡 Kiểm tra API key + symbol dạng **XAU/USD**. Free plan có giới hạn credit/ngày.")
                     st.markdown("---")
                     continue
+
+                used_yf = getattr(df_live, "attrs", {}).get("yahoo_symbol_used")
+                used_td = getattr(df_live, "attrs", {}).get("twelvedata_symbol")
+                if used_yf and used_yf != sym:
+                    st.caption(f"ℹ️ Yahoo resolve `{sym}` → **`{used_yf}`**")
+                if used_td:
+                    st.caption(f"ℹ️ Twelve Data symbol: **`{used_td}`** · nến: {len(df_live)}")
                     
                 eval_res = regime_analyzer.evaluate_live_market(df_live, registry_data)
                 logged = regime_analyzer.log_live_monitor_eval(sym, tf, eval_res)
@@ -1067,35 +1485,49 @@ def main():
                 latest_bar = eval_res.get("latest_bar", {})
                 latest_time = eval_res.get("latest_time", "N/A")
                 
-                st.caption(f"⏱️ Cập nhật nến gần nhất: `{latest_time}`")
-                g_cols = st.columns(4)
-                g_cols[0].metric("ADX (Xu hướng)", f"{latest_bar.get('ADX', 0):.1f}", "Mạnh" if latest_bar.get('ADX', 0) > 25 else "Yếu")
-                hurst_val = latest_bar.get('Hurst', 0.5)
-                h_desc = "Trending" if hurst_val > 0.53 else ("Sideways" if hurst_val < 0.47 else "Random")
-                g_cols[1].metric("Hurst Exponent", f"{hurst_val:.2f}", h_desc)
-                g_cols[2].metric("Choppiness", f"{latest_bar.get('Choppiness', 50):.1f}")
-                g_cols[3].metric("BB Width", f"{latest_bar.get('BB_Width', 0):.3f}")
+                st.caption(f"⏱️ Nến đã đóng gần nhất (DNA features): `{latest_time}`")
+                g_cols = st.columns(6)
+                g_cols[0].metric("ADX", f"{latest_bar.get('ADX', 0):.1f}")
+                g_cols[1].metric("ATR%", f"{latest_bar.get('ATR%', 0):.3f}")
+                g_cols[2].metric("Vol_Z", f"{latest_bar.get('Vol_ZScore', 0):.2f}")
+                g_cols[3].metric("Chop", f"{latest_bar.get('Choppiness', 50):.1f}")
+                g_cols[4].metric("BB Width", f"{latest_bar.get('BB_Width', 0):.3f}")
+                g_cols[5].metric("EMA_Dist%", f"{latest_bar.get('EMA_Dist%', 0):.3f}")
                 
                 evals = eval_res.get("evaluations", {})
                 for s_name, s_info in evals.items():
-                    st_code = s_info["status"]
+                    st_code = s_info.get("status", "CAUTION")
+                    eval_mode = s_info.get("eval_mode", "legacy_centroid")
+                    pred_exp = s_info.get("pred_expectancy")
                     if st_code == "PASS":
-                        badge = "🟢 BẬT EA (PHÙ HỢP TỐT)"
+                        badge = "🟢 BẬT EA (SAFE)"
                         border_color = "#00d4aa"
                     elif st_code == "CAUTION":
-                        badge = "🟡 CẨN TRỌNG (THEO DÕI SÁT)"
+                        badge = "🟡 CẨN TRỌNG"
                         border_color = "#ffa502"
                     else:
-                        badge = "🔴 KHÓA LỆNH / ĐỨNG NGOÀI"
+                        badge = "🔴 KHÓA LỆNH (TOXIC)"
                         border_color = "#ff4757"
-                        
+                    exp_txt = f"${pred_exp:.2f}" if pred_exp is not None else "N/A"
+                    mode_txt = "🌳 Tree DNA" if eval_mode == "tree" else "⚠️ Legacy centroid"
                     st.markdown(f"""
                     <div style="border-left: 5px solid {border_color}; padding: 12px; background: #1a1a2e; margin: 8px 0; border-radius: 6px;">
-                        <span style="font-size: 16px; font-weight: bold; color: {border_color};">{badge}</span> | <span style="color: white; font-weight: bold; font-size: 16px;">{s_name}</span> (Độ khớp: {s_info['match_pct']}%)
+                        <span style="font-size: 16px; font-weight: bold; color: {border_color};">{badge}</span>
+                        | <span style="color: white; font-weight: bold; font-size: 16px;">{s_name}</span>
+                        | pred exp <b style="color:{border_color}">{exp_txt}</b>
+                        | {mode_txt}
                     </div>
                     """, unsafe_allow_html=True)
-                    with st.expander(f"🔍 Lý do khuyến nghị cho {s_name} (Độ chính xác Train {s_info['accuracy']*100:.1f}% | CV {s_info['cv_accuracy']*100:.1f}%)"):
-                        for r in s_info["reasons"]:
+                    bp = s_info.get("block_precision", 0) or 0
+                    acc = s_info.get("accuracy", 0) or 0
+                    acc_pct = acc * 100 if acc <= 1 else acc
+                    with st.expander(
+                        f"🔍 Chi tiết {s_name} | leaf={s_info.get('leaf_id')} | "
+                        f"OOS={s_info.get('oos_status', 'N/A')} | block_prec={bp}% | train_acc~{acc_pct:.0f}%"
+                    ):
+                        if s_info.get("path_text"):
+                            st.code(s_info["path_text"])
+                        for r in s_info.get("reasons") or []:
                             st.markdown(f"- {r}")
                 st.markdown("---")
                 
@@ -1116,7 +1548,10 @@ def main():
                     }
                     for ea_name, ea_data in rec.get("evaluations", {}).items():
                         st_icon = "🟢" if ea_data.get("status") == "PASS" else ("🟡" if ea_data.get("status") == "CAUTION" else "🔴")
-                        row_dict[f"EA {ea_name}"] = f"{st_icon} {ea_data.get('status')} ({ea_data.get('match_pct', 0)}%)"
+                        pe = ea_data.get("pred_expectancy")
+                        pe_s = f" exp${pe:.1f}" if pe is not None else ""
+                        mode = ea_data.get("eval_mode") or ""
+                        row_dict[f"EA {ea_name}"] = f"{st_icon} {ea_data.get('status')}{pe_s} [{mode}]"
                     h_rows.append(row_dict)
                 st.dataframe(pd.DataFrame(h_rows), use_container_width=True)
                 
@@ -1183,169 +1618,15 @@ def main():
     m = compute_metrics(trades, mt5_metrics)
     init_bal = mt5_metrics.get('init_deposit', 5000)
 
-    # ── STEP 1: CORE METRICS ─────────────────────────────────
-    st.header("1️⃣ Chỉ Số Cơ Bản (Core Metrics)")
-    cols = st.columns(6)
-    items = [
-        ("Net Profit", f"${m['Net Profit ($)']:,.2f}", m['Net Profit ($)'] >= 0),
-        ("Win Rate", f"{m['Win Rate (%)']:.1f}%", m['Win Rate (%)'] >= 50),
-        ("Profit Factor", f"{m['Profit Factor']:.2f}" if isinstance(m['Profit Factor'], float) else str(m['Profit Factor']), True),
-        ("Max DD", f"{m['Max DD (%)']:.2f}%", False),
-        ("Sharpe", f"{m['Sharpe Ratio']:.2f}" if isinstance(m['Sharpe Ratio'], float) else str(m['Sharpe Ratio']), True),
-        ("Expectancy", f"${m['Expectancy ($)']:.2f}" if isinstance(m['Expectancy ($)'], float) else str(m['Expectancy ($)']), True),
-    ]
-    for col, (label, value, is_pos) in zip(cols, items):
-        css = "" if is_pos else " neg"
-        col.markdown(f"""<div class="metric-card">
-            <div class="metric-value{css}">{value}</div>
-            <div class="metric-label">{label}</div></div>""", unsafe_allow_html=True)
-
-    cols2 = st.columns(4)
-    items2 = [
-        ("Total Trades", f"{m['Total Trades']}"),
-        ("Avg Win", f"${m['Avg Win ($)']:.2f}"),
-        ("Avg Loss", f"${m['Avg Loss ($)']:.2f}"),
-        ("Avg R:R", f"{m['Avg R:R']:.2f}"),
-    ]
-    for col, (label, value) in zip(cols2, items2):
-        col.metric(label, value)
-
-    st.markdown("---")
-    st.subheader("Hoạt Động & Hiệu Suất Định Kỳ")
-    cols_extra = st.columns(5)
-    cols_extra[0].metric("Lệnh / Ngày", f"{m.get('Avg Trades/Day', 0):.2f}")
-    cols_extra[1].metric("Ngày Không Lệnh", f"{m.get('Days Without Trades', 0)} ({m.get('Days Without Trades %', 0):.1f}%)")
-    cols_extra[2].metric("Daily Return", f"${m.get('Daily Return ($)', 0):.2f}")
-    cols_extra[3].metric("Weekly Return", f"${m.get('Weekly Return ($)', 0):.2f}")
-    cols_extra[4].metric("Monthly Return", f"${m.get('Monthly Return ($)', 0):.2f}")
-
+    # ── PRE-COMPUTE SHARED METRICS FOR REPORT & ALL PAGES ──────────────────
     stag_start, stag_end, stag_duration = get_longest_stagnation(trades)
-    if stag_duration > 0:
-        st.info(f"🐢 **Thời gian phục hồi đỉnh lâu nhất (Longest Drawdown Duration)**: Kéo dài **{stag_duration} ngày**, từ **{stag_start.strftime('%d/%m/%Y')}** đến **{stag_end.strftime('%d/%m/%Y')}**. "
-                f"Đây là khoảng thời gian chiến lược bị chôn vốn, không tạo ra đỉnh lợi nhuận mới.")
-
-    # ── Phân tích chuỗi lệnh & ngày liên tiếp ──
-    st.markdown("### 📈 Phân Tích Chuỗi Giao Gịch & Chu Kỳ Tháng")
-    
-    # Calculate streaks
     avg_win_streak, max_win_streak, avg_loss_streak, max_loss_streak = get_streaks(profits)
     avg_win_days, max_win_days, avg_loss_days, max_loss_days = get_daily_streaks(trades)
     win_months, loss_months, win_month_ratio = get_monthly_win_loss_ratio(trades)
-    
-    cols3 = st.columns(3)
-    with cols3[0]:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div style="font-size: 14px; color: #888; font-weight: bold; margin-bottom: 8px;">Chuỗi Lệnh Liên Tiếp (Avg / Max)</div>
-            <div style="font-size: 18px; font-weight: bold; color: #00d4aa; text-align: left;">🟢 Lãi liên tiếp: {avg_win_streak:.1f} lệnh <span style="font-size: 12px; color: #888;">(Cực đại: {max_win_streak})</span></div>
-            <div style="font-size: 18px; font-weight: bold; color: #ff4757; text-align: left; margin-top: 4px;">🔴 Lỗ liên tiếp: {avg_loss_streak:.1f} lệnh <span style="font-size: 12px; color: #888;">(Cực đại: {max_loss_streak})</span></div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    with cols3[1]:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div style="font-size: 14px; color: #888; font-weight: bold; margin-bottom: 8px;">Chuỗi Ngày Liên Tiếp (Avg / Max)</div>
-            <div style="font-size: 18px; font-weight: bold; color: #00d4aa; text-align: left;">🟢 Ngày lãi liên tiếp: {avg_win_days:.1f} ngày <span style="font-size: 12px; color: #888;">(Cực đại: {max_win_days})</span></div>
-            <div style="font-size: 18px; font-weight: bold; color: #ff4757; text-align: left; margin-top: 4px;">🔴 Ngày lỗ liên tiếp: {avg_loss_days:.1f} ngày <span style="font-size: 12px; color: #888;">(Cực đại: {max_loss_days})</span></div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    with cols3[2]:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div style="font-size: 14px; color: #888; font-weight: bold; margin-bottom: 8px;">Tỉ Lệ Tháng Lãi / Lỗ</div>
-            <div style="font-size: 20px; font-weight: bold; color: #ffa502; text-align: left; margin-top: 4px;">📅 {win_months} tháng Lãi / {loss_months} tháng Lỗ</div>
-            <div style="font-size: 16px; font-weight: bold; color: #888; text-align: left; margin-top: 4px;">Tỷ lệ: {win_month_ratio:.1f}% tháng lãi</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    st.markdown("<br>", unsafe_allow_html=True)
-
     sideways_periods = get_sideways_periods(trades, stag_threshold, stag_min_days)
-    if sideways_periods:
-        periods_str = ", ".join([f"{p['duration']} ngày (từ {p['start'].strftime('%d/%m/%y')})" for p in sideways_periods])
-        st.info(f"📏 **Phát hiện {len(sideways_periods)} Giai đoạn đi ngang (Biến động < {stag_threshold}%, kéo dài > {stag_min_days} ngày)**: {periods_str}")
 
-    # ── STEP 2: EQUITY & DRAWDOWN ────────────────────────────
-    st.header("2️⃣ Đường Cong Vốn & Drawdown")
-    fig_eq = chart_equity_dd(trades, sideways_periods)
-    if fig_eq: st.plotly_chart(fig_eq, width='stretch')
-
-    # ── Monthly Heatmap + Scatter ─────────────────────────────
-    st.header("3️⃣ Trực Quan Hóa (Visualization)")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("📅 Heatmap Lợi Nhuận Tháng/Năm")
-        st.plotly_chart(chart_monthly_heatmap(trades), width='stretch')
-    with c2:
-        st.subheader("🎯 Scatter Plot Lệnh")
-        st.plotly_chart(chart_scatter_rr(trades), width='stretch')
-
-    # ── Time Analysis ─────────────────────────────────────────
-    st.header("4️⃣ Phân Tích Thời Gian (Time-Series)")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("⏰ Lợi nhuận theo Giờ")
-        fig_h = chart_hourly(trades)
-        if fig_h: st.plotly_chart(fig_h, width='stretch')
-    with c2:
-        st.subheader("📆 Lợi nhuận theo Thứ")
-        fig_d = chart_dow(trades)
-        if fig_d: st.plotly_chart(fig_d, width='stretch')
-
-    # ── Duration Analysis ─────────────────────────────────────
-    fig_dur = chart_duration(trades)
-    if fig_dur:
-        st.subheader("⏱️ Thời gian giữ lệnh vs Profit")
-        st.plotly_chart(fig_dur, width='stretch')
-
-    # ── STEP 3: ADVANCED QUANT ────────────────────────────────
-    st.header("5️⃣ Phân Tích Chuyên Sâu (Quant Insights)")
-
-    # Distribution + KS Test
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("📊 Phân Phối Lợi Nhuận & KS Test")
-        st.plotly_chart(chart_profit_distribution(profits), width='stretch')
-        ks_stat, ks_pval = run_ks_test(profits)
-        if ks_pval < 0.05:
-            st.warning(f"**KS Test**: D={ks_stat:.4f}, p={ks_pval:.4e} → Phân phối **KHÔNG phải Normal**. "
-                       f"Chiến lược có thể phụ thuộc vào các lệnh \"duôi béo\" (fat-tail).")
-        else:
-            st.success(f"**KS Test**: D={ks_stat:.4f}, p={ks_pval:.4e} → Phân phối gần Normal. "
-                       f"Lợi nhuận đều đặn, ít phụ thuộc vào lệnh lớn bất thường.")
-
-    # Monte Carlo
-    with c2:
-        st.subheader("🎲 Monte Carlo Simulation")
-        with st.spinner("Đang chạy 10,000 mô phỏng..."):
-            mc = run_monte_carlo(profits, n_sims=10000, init_balance=init_bal)
-
-        fig_mc = go.Figure()
-        fig_mc.add_trace(go.Histogram(x=mc['final_equity'], nbinsx=80, marker_color='#7c4dff', opacity=0.7))
-        fig_mc.add_vline(x=init_bal, line_dash='dash', line_color='#ff4757',
-                         annotation_text=f'Vốn ban đầu: ${init_bal:,.0f}')
-        fig_mc.update_layout(height=350, template='plotly_dark',
-                             xaxis_title='Final Equity ($)', yaxis_title='Count',
-                             margin=dict(l=50, r=20, t=30, b=30))
-        st.plotly_chart(fig_mc, width='stretch')
-
-        risk_of_ruin = (mc['final_equity'] <= init_bal * 0.5).mean() * 100
-        median_eq = mc['final_equity'].median()
-        p5 = mc['final_equity'].quantile(0.05)
-        p95 = mc['final_equity'].quantile(0.95)
-        worst_dd = mc['max_dd_pct'].min()
-
-        mc_cols = st.columns(3)
-        mc_cols[0].metric("Xác suất cháy TK (< 50% vốn)", f"{risk_of_ruin:.2f}%")
-        mc_cols[1].metric("Equity trung vị", f"${median_eq:,.0f}")
-        mc_cols[2].metric("Worst DD (MC)", f"{worst_dd:.1f}%")
-        st.caption(f"📌 Khoảng tin cậy 90%: **${p5:,.0f}** — **${p95:,.0f}**")
-
-    mc_data = {'risk_of_ruin': risk_of_ruin, 'median_eq': median_eq, 'p5': p5, 'p95': p95, 'worst_dd': worst_dd}
-
-    # Hourly / DOW profit series for export
+    mc_data = None
+    wfe_data = None
     tcol_h = 'OpenTime' if 'OpenTime' in trades.columns and trades['OpenTime'].notna().any() else 'Time'
     hour_profit_export = None
     dow_profit_export = None
@@ -1355,133 +1636,352 @@ def main():
             hour_profit_export = _hdf.groupby(_hdf[tcol_h].dt.hour)['Profit'].sum()
             dow_profit_export = _hdf.groupby(_hdf[tcol_h].dt.dayofweek)['Profit'].sum()
 
-    # ── STEP 6: REGIME & LOSS ATTRIBUTION ─────────────────────────
-    st.header("6️⃣ Phân Tích Cấu Trúc Lỗ (Loss Attribution)")
+    insights = []
+    if isinstance(m.get('Profit Factor'), (int, float)) and m['Profit Factor'] >= 2.0:
+        insights.append(f"🟢 **Profit Factor xuất sắc ({m['Profit Factor']:.2f})**: Chiến lược có lợi thế kỳ vọng rất cao.")
+    if isinstance(m.get('Max DD (%)'), (int, float)) and m['Max DD (%)'] <= 10.0:
+        insights.append(f"🟢 **Quản trị rủi ro tốt (Max DD {m['Max DD (%)']:.2f}%)**: Sụt giảm vốn thấp.")
+
     insights_loss = []
+    if 'Type' in trades.columns and 'Close Time' in trades.columns:
+        trades_copy = trades.copy()
+        trades_copy['Month'] = trades_copy['Close Time'].dt.to_period('M')
+        _mstats = trades_copy.groupby('Month').apply(lambda df: pd.Series({
+            'Net Profit $': df['Profit'].sum(),
+            'Trades': len(df),
+            'Win Rate %': (df['Profit'] > 0).mean() * 100 if len(df) > 0 else 0
+        })).reset_index()
+        _losers = _mstats[_mstats['Net Profit $'] < 0]
+        if not _losers.empty:
+            _top_losers = _losers.sort_values('Net Profit $').head(10)
+            insights_loss.append(f"🔍 **Phân tích tổng quan các tháng rủi ro nhất:** Tổng mức sụt giảm trong {len(_top_losers)} tháng tệ nhất là **${_top_losers['Net Profit $'].sum():,.0f}**.")
+
+    # ── ROUTE PHÂN TRANG BÁO CÁO (SYNC WITH URL QUERY PARAMS) ──
+    sub_page_options = [
+        "📄 Tất Cả Báo Cáo (1️⃣ - 9️⃣)",
+        "📊 1️⃣ - 4️⃣: Chỉ Số Cơ Bản & Biểu Đồ",
+        "🔬 5️⃣ - 8️⃣: Quant Insights & WFE",
+        "🧬 9️⃣: AI Strategy Profiling (DNA v2)"
+    ]
+    sub_page_keys = {
+        "📄 Tất Cả Báo Cáo (1️⃣ - 9️⃣)": "all",
+        "📊 1️⃣ - 4️⃣: Chỉ Số Cơ Bản & Biểu Đồ": "core_charts",
+        "🔬 5️⃣ - 8️⃣: Quant Insights & WFE": "quant_wfe",
+        "🧬 9️⃣: AI Strategy Profiling (DNA v2)": "dna_ai"
+    }
+    rev_sub_page_keys = {v: k for k, v in sub_page_keys.items()}
     
-    if 'Type' in trades.columns:
-        c1, c2 = st.columns(2)
-        trades['RawType'] = trades['Type'].astype(str).str.lower().str.strip()
+    current_url_subpage = st.query_params.get("page", "all")
+    default_subpage_idx = 0
+    if current_url_subpage in rev_sub_page_keys:
+        default_subpage_idx = sub_page_options.index(rev_sub_page_keys[current_url_subpage])
+
+    def on_subpage_change():
+        selected_sp = st.session_state.subpage_radio
+        st.query_params["page"] = sub_page_keys.get(selected_sp, "all")
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("📑 Route Phân Trang")
+    sub_page = st.sidebar.radio(
+        "Chọn phân trang báo cáo:",
+        sub_page_options,
+        index=default_subpage_idx,
+        key="subpage_radio",
+        on_change=on_subpage_change
+    )
+    st.query_params["page"] = sub_page_keys.get(sub_page, "all")
+    current_sub_route = sub_page_keys.get(sub_page, "all")
+
+    # Hiển thị nhanh thanh phân trang ở đầu báo cáo
+    sub_top_cols = st.columns([1, 4])
+    with sub_top_cols[0]:
+        st.markdown("### 📑 Phân Trang:")
+    with sub_top_cols[1]:
+        def on_top_subpage_change():
+            top_val = st.session_state.subpage_radio_top
+            st.session_state.subpage_radio = top_val
+            st.query_params["page"] = sub_page_keys.get(top_val, "all")
+
+        st.radio(
+            "Chọn phân trang nhanh:",
+            sub_page_options,
+            index=default_subpage_idx,
+            key="subpage_radio_top",
+            horizontal=True,
+            on_change=on_top_subpage_change,
+            label_visibility="collapsed"
+        )
+    st.markdown("---")
+
+    # ── STEP 1: CORE METRICS ─────────────────────────────────
+    if current_sub_route in ["all", "core_charts"]:
+        st.header("1️⃣ Chỉ Số Cơ Bản (Core Metrics)")
+        cols = st.columns(6)
+        items = [
+            ("Net Profit", f"${m['Net Profit ($)']:,.2f}", m['Net Profit ($)'] >= 0),
+            ("Win Rate", f"{m['Win Rate (%)']:.1f}%", m['Win Rate (%)'] >= 50),
+            ("Profit Factor", f"{m['Profit Factor']:.2f}" if isinstance(m['Profit Factor'], float) else str(m['Profit Factor']), True),
+            ("Max DD", f"{m['Max DD (%)']:.2f}%", False),
+            ("Sharpe", f"{m['Sharpe Ratio']:.2f}" if isinstance(m['Sharpe Ratio'], float) else str(m['Sharpe Ratio']), True),
+            ("Expectancy", f"${m['Expectancy ($)']:.2f}" if isinstance(m['Expectancy ($)'], float) else str(m['Expectancy ($)']), True),
+        ]
+        for col, (label, value, is_pos) in zip(cols, items):
+            css = "" if is_pos else " neg"
+            col.markdown(f"""<div class="metric-card">
+                <div class="metric-value{css}">{value}</div>
+                <div class="metric-label">{label}</div></div>""", unsafe_allow_html=True)
+
+        cols2 = st.columns(4)
+        items2 = [
+            ("Total Trades", f"{m['Total Trades']}"),
+            ("Avg Win", f"${m['Avg Win ($)']:.2f}"),
+            ("Avg Loss", f"${m['Avg Loss ($)']:.2f}"),
+            ("Avg R:R", f"{m['Avg R:R']:.2f}"),
+        ]
+        for col, (label, value) in zip(cols2, items2):
+            col.metric(label, value)
+
+        st.markdown("---")
+        st.subheader("Hoạt Động & Hiệu Suất Định Kỳ")
+        cols_extra = st.columns(5)
+        cols_extra[0].metric("Lệnh / Ngày", f"{m.get('Avg Trades/Day', 0):.2f}")
+        cols_extra[1].metric("Ngày Không Lệnh", f"{m.get('Days Without Trades', 0)} ({m.get('Days Without Trades %', 0):.1f}%)")
+        cols_extra[2].metric("Daily Return", f"${m.get('Daily Return ($)', 0):.2f}")
+        cols_extra[3].metric("Weekly Return", f"${m.get('Weekly Return ($)', 0):.2f}")
+        cols_extra[4].metric("Monthly Return", f"${m.get('Monthly Return ($)', 0):.2f}")
+
+        if stag_duration > 0:
+            st.info(f"🐢 **Thời gian phục hồi đỉnh lâu nhất (Longest Drawdown Duration)**: Kéo dài **{stag_duration} ngày**, từ **{stag_start.strftime('%d/%m/%Y')}** đến **{stag_end.strftime('%d/%m/%Y')}**. "
+                    f"Đây là khoảng thời gian chiến lược bị chôn vốn, không tạo ra đỉnh lợi nhuận mới.")
+
+        # ── Phân tích chuỗi lệnh & ngày liên tiếp ──
+        st.markdown("### 📈 Phân Tích Chuỗi Giao Gịch & Chu Kỳ Tháng")
         
-        if 'Direction' in trades.columns:
-            buy_mask = trades['RawType'].isin(['sell', '1'])
-            sell_mask = trades['RawType'].isin(['buy', '0'])
-        else:
-            buy_mask = trades['RawType'].isin(['buy', '0'])
-            sell_mask = trades['RawType'].isin(['sell', '1'])
-        
-        long_trades = trades[buy_mask]
-        short_trades = trades[sell_mask]
-        
-        long_profit = long_trades['Profit'].sum()
-        short_profit = short_trades['Profit'].sum()
-        
-        fig_dir = go.Figure()
-        fig_dir.add_trace(go.Bar(name='Long (Buy)', x=['Lợi nhuận'], y=[long_profit], marker_color='#00d4aa' if long_profit >= 0 else '#ff4757'))
-        fig_dir.add_trace(go.Bar(name='Short (Sell)', x=['Lợi nhuận'], y=[short_profit], marker_color='#00d4aa' if short_profit >= 0 else '#ff4757'))
-        
-        fig_dir.update_layout(height=350, template='plotly_dark', barmode='group',
-                              title='Lợi Nhuận Theo Hướng Giao Dịch', margin=dict(l=50, r=20, t=40, b=30))
-        with c1:
-            st.plotly_chart(fig_dir, width='stretch')
+        cols3 = st.columns(3)
+        with cols3[0]:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div style="font-size: 14px; color: #888; font-weight: bold; margin-bottom: 8px;">Chuỗi Lệnh Liên Tiếp (Avg / Max)</div>
+                <div style="font-size: 18px; font-weight: bold; color: #00d4aa; text-align: left;">🟢 Lãi liên tiếp: {avg_win_streak:.1f} lệnh <span style="font-size: 12px; color: #888;">(Cực đại: {max_win_streak})</span></div>
+                <div style="font-size: 18px; font-weight: bold; color: #ff4757; text-align: left; margin-top: 4px;">🔴 Lỗ liên tiếp: {avg_loss_streak:.1f} lệnh <span style="font-size: 12px; color: #888;">(Cực đại: {max_loss_streak})</span></div>
+            </div>
+            """, unsafe_allow_html=True)
             
-        # Monthly Regime Analysis
-        df_monthly = trades.copy()
-        df_monthly['YearMonth'] = df_monthly['Time'].dt.to_period('M')
+        with cols3[1]:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div style="font-size: 14px; color: #888; font-weight: bold; margin-bottom: 8px;">Chuỗi Ngày Liên Tiếp (Avg / Max)</div>
+                <div style="font-size: 18px; font-weight: bold; color: #00d4aa; text-align: left;">🟢 Ngày lãi liên tiếp: {avg_win_days:.1f} ngày <span style="font-size: 12px; color: #888;">(Cực đại: {max_win_days})</span></div>
+                <div style="font-size: 18px; font-weight: bold; color: #ff4757; text-align: left; margin-top: 4px;">🔴 Ngày lỗ liên tiếp: {avg_loss_days:.1f} ngày <span style="font-size: 12px; color: #888;">(Cực đại: {max_loss_days})</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        with cols3[2]:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div style="font-size: 14px; color: #888; font-weight: bold; margin-bottom: 8px;">Tỉ Lệ Tháng Lãi / Lỗ</div>
+                <div style="font-size: 20px; font-weight: bold; color: #ffa502; text-align: left; margin-top: 4px;">📅 {win_months} tháng Lãi / {loss_months} tháng Lỗ</div>
+                <div style="font-size: 16px; font-weight: bold; color: #888; text-align: left; margin-top: 4px;">Tỷ lệ: {win_month_ratio:.1f}% tháng lãi</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if sideways_periods:
+            periods_str = ", ".join([f"{p['duration']} ngày (từ {p['start'].strftime('%d/%m/%y')})" for p in sideways_periods])
+            st.info(f"📏 **Phát hiện {len(sideways_periods)} Giai đoạn đi ngang (Biến động < {stag_threshold}%, kéo dài > {stag_min_days} ngày)**: {periods_str}")
+
+        # ── STEP 2: EQUITY & DRAWDOWN ────────────────────────────
+        st.header("2️⃣ Đường Cong Vốn & Drawdown")
+        fig_eq = chart_equity_dd(trades, sideways_periods)
+        if fig_eq: st.plotly_chart(fig_eq, width='stretch')
+
+        # ── Monthly Heatmap + Scatter ─────────────────────────────
+        st.header("3️⃣ Trực Quan Hóa (Visualization)")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("📅 Heatmap Lợi Nhuận Tháng/Năm")
+            st.plotly_chart(chart_monthly_heatmap(trades), width='stretch')
+        with c2:
+            st.subheader("🎯 Scatter Plot Lệnh")
+            st.plotly_chart(chart_scatter_rr(trades), width='stretch')
+
+        # ── Time Analysis ─────────────────────────────────────────
+        st.header("4️⃣ Phân Tích Thời Gian (Time-Series)")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("⏰ Lợi nhuận theo Giờ")
+            fig_h = chart_hourly(trades)
+            if fig_h: st.plotly_chart(fig_h, width='stretch')
+        with c2:
+            st.subheader("📆 Lợi nhuận theo Thứ")
+            fig_d = chart_dow(trades)
+            if fig_d: st.plotly_chart(fig_d, width='stretch')
+
+        # ── Duration Analysis ─────────────────────────────────────
+        fig_dur = chart_duration(trades)
+        if fig_dur:
+            st.subheader("⏱️ Thời gian giữ lệnh vs Profit")
+            st.plotly_chart(fig_dur, width='stretch')
+
+    # ── STEP 3: ADVANCED QUANT ────────────────────────────────
+    if current_sub_route in ["all", "quant_wfe"]:
+        st.header("5️⃣ Phân Tích Chuyên Sâu (Quant Insights)")
+
+        # Distribution + KS Test
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("📊 Phân Phối Lợi Nhuận & KS Test")
+            st.plotly_chart(chart_profit_distribution(profits), width='stretch')
+            ks_stat, ks_pval = run_ks_test(profits)
+            if ks_pval < 0.05:
+                st.warning(f"**KS Test**: D={ks_stat:.4f}, p={ks_pval:.4e} → Phân phối **KHÔNG phải Normal**. "
+                           f"Chiến lược có thể phụ thuộc vào các lệnh \"duôi béo\" (fat-tail).")
+            else:
+                st.success(f"**KS Test**: D={ks_stat:.4f}, p={ks_pval:.4e} → Phân phối gần Normal. "
+                           f"Lợi nhuận đều đặn, ít phụ thuộc vào lệnh lớn bất thường.")
+
+        # Monte Carlo
+        with c2:
+            st.subheader("🎲 Monte Carlo Simulation")
+            with st.spinner("Đang chạy 10,000 mô phỏng..."):
+                mc = run_monte_carlo(profits, n_sims=10000, init_balance=init_bal)
+
+            fig_mc = go.Figure()
+            fig_mc.add_trace(go.Histogram(x=mc['final_equity'], nbinsx=80, marker_color='#7c4dff', opacity=0.7))
+            fig_mc.add_vline(x=init_bal, line_dash='dash', line_color='#ff4757',
+                             annotation_text=f'Vốn ban đầu: ${init_bal:,.0f}')
+            fig_mc.update_layout(height=350, template='plotly_dark',
+                                 xaxis_title='Final Equity ($)', yaxis_title='Count',
+                                 margin=dict(l=50, r=20, t=30, b=30))
+            st.plotly_chart(fig_mc, width='stretch')
+
+            risk_of_ruin = (mc['final_equity'] <= init_bal * 0.5).mean() * 100
+            median_eq = mc['final_equity'].median()
+            p5 = mc['final_equity'].quantile(0.05)
+            p95 = mc['final_equity'].quantile(0.95)
+            worst_dd = mc['max_dd_pct'].min()
+
+            mc_cols = st.columns(3)
+            mc_cols[0].metric("Xác suất cháy TK (< 50% vốn)", f"{risk_of_ruin:.2f}%")
+            mc_cols[1].metric("Equity trung vị", f"${median_eq:,.0f}")
+            mc_cols[2].metric("Worst DD (MC)", f"{worst_dd:.1f}%")
+            st.caption(f"📌 Khoảng tin cậy 90%: **${p5:,.0f}** — **${p95:,.0f}**")
+
+        mc_data = {'risk_of_ruin': risk_of_ruin, 'median_eq': median_eq, 'p5': p5, 'p95': p95, 'worst_dd': worst_dd}
+
+        # ── STEP 6: REGIME & LOSS ATTRIBUTION ─────────────────────────
+        st.header("6️⃣ Phân Tích Cấu Trúc Lỗ (Loss Attribution)")
+        insights_loss = []
         
-        def regime_stats(g):
-            wins = (g['Profit'] > 0).sum()
-            total = len(g)
-            wr = wins / total * 100 if total > 0 else 0
+        if 'Type' in trades.columns:
+            c1, c2 = st.columns(2)
+            trades['RawType'] = trades['Type'].astype(str).str.lower().str.strip()
             
             if 'Direction' in trades.columns:
-                buy_pnl = g[g['RawType'].isin(['sell', '1'])]['Profit'].sum()
-                sell_pnl = g[g['RawType'].isin(['buy', '0'])]['Profit'].sum()
+                buy_mask = trades['RawType'].isin(['sell', '1'])
+                sell_mask = trades['RawType'].isin(['buy', '0'])
             else:
-                buy_pnl = g[g['RawType'].isin(['buy', '0'])]['Profit'].sum()
-                sell_pnl = g[g['RawType'].isin(['sell', '1'])]['Profit'].sum()
+                buy_mask = trades['RawType'].isin(['buy', '0'])
+                sell_mask = trades['RawType'].isin(['sell', '1'])
+            
+            long_trades = trades[buy_mask]
+            short_trades = trades[sell_mask]
+            
+            long_profit = long_trades['Profit'].sum()
+            short_profit = short_trades['Profit'].sum()
+            
+            fig_dir = go.Figure()
+            fig_dir.add_trace(go.Bar(name='Long (Buy)', x=['Lợi nhuận'], y=[long_profit], marker_color='#00d4aa' if long_profit >= 0 else '#ff4757'))
+            fig_dir.add_trace(go.Bar(name='Short (Sell)', x=['Lợi nhuận'], y=[short_profit], marker_color='#00d4aa' if short_profit >= 0 else '#ff4757'))
+            
+            fig_dir.update_layout(height=350, template='plotly_dark', barmode='group',
+                                  title='Lợi Nhuận Theo Hướng Giao Dịch', margin=dict(l=50, r=20, t=40, b=30))
+            with c1:
+                st.plotly_chart(fig_dir, width='stretch')
                 
-            return pd.Series({
-                'Net Profit': g['Profit'].sum(),
-                'Trades': total,
-                'Win Rate %': wr,
-                'Long PnL': buy_pnl,
-                'Short PnL': sell_pnl
-            })
+            # Monthly Regime Analysis
+            df_monthly = trades.copy()
+            df_monthly['YearMonth'] = df_monthly['Time'].dt.to_period('M')
             
-        monthly_stats = df_monthly.groupby('YearMonth').apply(regime_stats, include_groups=False).reset_index()
-        monthly_stats['YearMonth'] = monthly_stats['YearMonth'].astype(str)
-        monthly_stats = monthly_stats.sort_values('Net Profit')
-        
-        with c2:
-            st.markdown("**Top 5 Tháng Thua Lỗ Nặng Nhất (Phân Rã Cấu Trúc)**")
-            st.dataframe(monthly_stats.head(5).style.background_gradient(cmap='RdYlGn', subset=['Net Profit', 'Win Rate %']), height=280)
-            
-        losing_months = monthly_stats[monthly_stats['Net Profit'] < 0]
-        if len(losing_months) > 0:
-            top_losers = losing_months.head(5)
-            
-            # Aggregate stats
-            total_loss = top_losers['Net Profit'].sum()
-            long_loss_sum = top_losers['Long PnL'].sum()
-            short_loss_sum = top_losers['Short PnL'].sum()
-            
-            avg_trades_all = monthly_stats['Trades'].mean()
-            avg_trades_losers = top_losers['Trades'].mean()
-            
-            insights_loss.append(f"🔍 **Phân tích tổng quan các tháng rủi ro nhất:** Tổng mức sụt giảm trong {len(top_losers)} tháng tệ nhất là **${total_loss:,.0f}**.")
-            
-            # Directional Bias Insight
-            if long_loss_sum < 0 and short_loss_sum > 0:
-                insights_loss.append(f"👉 **Điểm yếu ở chiều Buy**: Gần như toàn bộ thiệt hại đến từ các lệnh Long (Lỗ ${long_loss_sum:,.0f} so với mức Lãi ${short_loss_sum:,.0f} của lệnh Short). Điều này chứng tỏ EA rất nhạy cảm với các đợt sập giá mạnh (Downtrend regime). Khuyến nghị: **Tăng cường bộ lọc xu hướng giảm** (ví dụ cấm Buy khi giá nằm dưới EMA khung lớn).")
-            elif short_loss_sum < 0 and long_loss_sum > 0:
-                insights_loss.append(f"👉 **Điểm yếu ở chiều Sell**: Hầu hết thiệt hại đến từ các lệnh Short (Lỗ ${short_loss_sum:,.0f} so với mức Lãi ${long_loss_sum:,.0f} của lệnh Buy). EA đang chịu đòn nặng khi thị trường có nhịp tăng phi mã (Uptrend regime). Khuyến nghị: **Tránh bắt đỉnh** khi cấu trúc thị trường đang thể hiện lực nén tăng mạnh.")
-            elif long_loss_sum < 0 and short_loss_sum < 0:
-                if long_loss_sum < short_loss_sum * 2:
-                    insights_loss.append(f"👉 **Điểm yếu đa chiều (Thiên về Buy)**: EA lỗ cả 2 đầu nhưng lệnh Buy mất tiền nhiều hơn gấp đôi lệnh Sell. Hệ thống thường xuyên vào lệnh sai nhịp ở các giai đoạn giảm giá.")
-                elif short_loss_sum < long_loss_sum * 2:
-                    insights_loss.append(f"👉 **Điểm yếu đa chiều (Thiên về Sell)**: EA lỗ cả 2 đầu nhưng lệnh Sell mất tiền nhiều hơn gấp đôi lệnh Buy.")
+            def regime_stats(g):
+                wins = (g['Profit'] > 0).sum()
+                total = len(g)
+                wr = wins / total * 100 if total > 0 else 0
+                
+                if 'Direction' in trades.columns:
+                    buy_pnl = g[g['RawType'].isin(['sell', '1'])]['Profit'].sum()
+                    sell_pnl = g[g['RawType'].isin(['buy', '0'])]['Profit'].sum()
                 else:
-                    insights_loss.append(f"👉 **Điểm yếu đa chiều (Cân bằng)**: Các tháng lỗ phân bổ đều ở cả chiều Buy và Sell. Cấu trúc thị trường lúc này hoàn toàn không phù hợp với logic của EA, cắn Stop Loss cả hai bên.")
-
-            # Volatility / Choppiness Insight
-            if avg_trades_losers > avg_trades_all * 1.3:
-                insights_loss.append(f"👉 **Nhận diện Regime (Whipsaw/Choppy)**: Số lượng lệnh trong các tháng lỗ cao bất thường (Trung bình {avg_trades_losers:.0f} lệnh/tháng so với mức trung bình {avg_trades_all:.0f} bình thường). Đây là dấu hiệu của thị trường dao động nhiễu, đi ngang biên độ hẹp cắn Stop Loss liên tục. Khuyến nghị: Thêm bộ lọc **ADX < 20** hoặc **ATR hẹp** để ngừng giao dịch.")
-            elif avg_trades_losers < avg_trades_all * 0.7:
-                insights_loss.append(f"👉 **Nhận diện Regime (Trend Expansion)**: Số lượng lệnh cực kỳ ít nhưng lỗ lại sâu. Nghĩa là thị trường chạy một mạch ngược hướng kỳ vọng, không có nhịp hồi để EA thoát lệnh. Khuyến nghị: Sử dụng bộ lọc động lượng (Momentum) để né các cú breakout giả hoặc cắt lỗ sớm.")
-            else:
-                insights_loss.append(f"👉 **Nhận diện Regime**: Tần suất giao dịch không thay đổi nhiều so với bình thường. Nguyên nhân lỗ chủ yếu do tỷ lệ Win Rate giảm mạnh trong các tháng này (trung bình chỉ đạt {(top_losers['Win Rate %'].mean()):.1f}%). Cần xem lại khoảng cách cắt lỗ (SL) có đang quá hẹp khiến giá dễ chạm tới hay không.")
-
-    for ins in insights_loss:
-        st.info(ins)
-
-    # ── STEP 7: WFE ANALYSIS ─────────────────────────
-    st.header("7️⃣ Đánh Giá Walk-Forward Efficiency (WFE)")
-    wfe_data = None  # Will be populated from tab1
-    st.markdown("""
-    Đánh giá độ ổn định của chiến lược trong tương lai (Out-of-Sample) so với quá trình tối ưu (In-Sample).
-    
-    Công thức:
-    $$WFE = \\frac{\\text{Lợi nhuận thực tế (Out-of-Sample)}}{\\text{Lợi nhuận kỳ vọng từ Backtest (In-Sample)}}$$
-    """)
-    
-    wfe_tab1, wfe_tab2 = st.tabs(["🕒 Chia IS/OOS theo thời gian", "📝 Nhập thủ công In-Sample Profit"])
-    
-    with wfe_tab1:
-        if 'Time' in trades.columns and len(trades) > 0:
-            min_date = trades['Time'].min().date()
-            max_date = trades['Time'].max().date()
-            
-            if min_date < max_date:
-                split_date = st.slider(
-                    "Chọn ngày bắt đầu Out-of-Sample", 
-                    min_value=min_date, 
-                    max_value=max_date, 
-                    value=min_date + (max_date - min_date)//2
-                )
+                    buy_pnl = g[g['RawType'].isin(['buy', '0'])]['Profit'].sum()
+                    sell_pnl = g[g['RawType'].isin(['sell', '1'])]['Profit'].sum()
+                    
+                return pd.Series({
+                    'Net Profit': g['Profit'].sum(),
+                    'Trades': total,
+                    'Win Rate %': wr,
+                    'Long PnL': buy_pnl,
+                    'Short PnL': sell_pnl
+                })
                 
-                is_trades = trades[trades['Time'].dt.date < split_date]
-                oos_trades = trades[trades['Time'].dt.date >= split_date]
+            monthly_stats = df_monthly.groupby('YearMonth').apply(regime_stats, include_groups=False).reset_index()
+            monthly_stats['YearMonth'] = monthly_stats['YearMonth'].astype(str)
+            monthly_stats = monthly_stats.sort_values('Net Profit')
+            
+            with c2:
+                st.markdown("**Top 5 Tháng Thua Lỗ Nặng Nhất (Phân Rã Cấu Trúc)**")
+                st.dataframe(monthly_stats.head(5).style.background_gradient(cmap='RdYlGn', subset=['Net Profit', 'Win Rate %']), height=280)
+                
+            losing_months = monthly_stats[monthly_stats['Net Profit'] < 0]
+            if len(losing_months) > 0:
+                top_losers = losing_months.head(5)
+                
+                # Aggregate stats
+                total_loss = top_losers['Net Profit'].sum()
+                long_loss_sum = top_losers['Long PnL'].sum()
+                short_loss_sum = top_losers['Short PnL'].sum()
+                
+                avg_trades_all = monthly_stats['Trades'].mean()
+                avg_trades_losers = top_losers['Trades'].mean()
+                
+                insights_loss.append(f"🔍 **Phân tích tổng quan các tháng rủi ro nhất:** Tổng mức sụt giảm trong {len(top_losers)} tháng tệ nhất là **${total_loss:,.0f}**.")
+                
+                # Directional Bias Insight
+                if long_loss_sum < 0 and short_loss_sum > 0:
+                    insights_loss.append(f"👉 **Điểm yếu ở chiều Buy**: Gần như toàn bộ thiệt hại đến từ các lệnh Long (Lỗ ${long_loss_sum:,.0f} so với mức Lãi ${short_loss_sum:,.0f} của lệnh Short). Điều này chứng tỏ EA rất nhạy cảm với các đợt sập giá mạnh (Downtrend regime). Khuyến nghị: **Tăng cường bộ lọc xu hướng giảm** (ví dụ cấm Buy khi giá nằm dưới EMA khung lớn).")
+                elif short_loss_sum < 0 and long_loss_sum > 0:
+                    insights_loss.append(f"👉 **Điểm yếu ở chiều Sell**: Hầu hết thiệt hại đến từ các lệnh Short (Lỗ ${short_loss_sum:,.0f} so với mức Lãi ${long_loss_sum:,.0f} của lệnh Buy). EA đang chịu đòn nặng khi thị trường có nhịp tăng phi mã (Uptrend regime). Khuyến nghị: **Tránh bắt đỉnh** khi cấu trúc thị trường đang thể hiện lực nén tăng mạnh.")
+                elif long_loss_sum < 0 and short_loss_sum < 0:
+                    if long_loss_sum < short_loss_sum * 2:
+                        insights_loss.append(f"👉 **Điểm yếu đa chiều (Thiên về Buy)**: EA lỗ cả 2 đầu nhưng lệnh Buy mất tiền nhiều hơn gấp đôi lệnh Sell. Hệ thống thường xuyên vào lệnh sai nhịp ở các giai đoạn giảm giá.")
+                    elif short_loss_sum < long_loss_sum * 2:
+                        insights_loss.append(f"👉 **Điểm yếu đa chiều (Thiên về Sell)**: EA lỗ cả 2 đầu nhưng lệnh Sell mất tiền nhiều hơn gấp đôi lệnh Buy.")
+                    else:
+                        insights_loss.append(f"👉 **Điểm yếu đa chiều (Cân bằng)**: Các tháng lỗ phân bổ đều ở cả chiều Buy và Sell. Cấu trúc thị trường lúc này hoàn toàn không phù hợp với logic của EA, cắn Stop Loss cả hai bên.")
+
+                # Volatility / Choppiness Insight
+                if avg_trades_losers > avg_trades_all * 1.3:
+                    insights_loss.append(f"👉 **Nhận diện Regime (Whipsaw/Choppy)**: Số lượng lệnh trong các tháng lỗ cao bất thường (Trung bình {avg_trades_losers:.0f} lệnh/tháng so với mức trung bình {avg_trades_all:.0f} bình thường). Đây là dấu hiệu của thị trường dao động nhiễu, đi ngang biên độ hẹp cắn Stop Loss liên tục. Khuyến nghị: Thêm bộ lọc **ADX < 20** hoặc **ATR hẹp** để ngừng giao dịch.")
+                elif avg_trades_losers < avg_trades_all * 0.7:
+                    insights_loss.append(f"👉 **Nhận diện Regime (Trend Expansion)**: Số lượng lệnh cực kỳ ít nhưng lỗ lại sâu. Nghĩa là thị trường chạy một mạch ngược hướng kỳ vọng, không có nhịp hồi để EA thoát lệnh. Khuyến nghị: Sử dụng bộ lọc động lượng (Momentum) để né các cú breakout giả hoặc cắt lỗ sớm.")
+                else:
+                    insights_loss.append(f"👉 **Nhận diện Regime**: Tần suất giao dịch không thay đổi nhiều so với bình thường. Nguyên nhân lỗ chủ yếu do tỷ lệ Win Rate giảm mạnh trong các tháng này (trung bình chỉ đạt {(top_losers['Win Rate %'].mean()):.1f}%). Cần xem lại khoảng cách cắt lỗ (SL) có đang quá hẹp khiến giá dễ chạm tới hay không.")
+
+        for ins in insights_loss:
+            st.info(ins)
+
+        # ── STEP 7: WFE ANALYSIS ──────────────────────────────────
+        st.header("7️⃣ Phân Tích Độ Bền (WFE - Walk Forward Efficiency)")
+        wfe_tab1, wfe_tab2 = st.tabs(["📊 Tính từ dữ liệu backtest (Split)", "✏️ Nhập thủ công"])
+        with wfe_tab1:
+            if 'Time' in trades.columns:
+                min_date = trades['Time'].min()
+                max_date = trades['Time'].max()
+                split_date = min_date + (max_date - min_date) * 0.7
+                st.write(f"Chia dữ liệu tại: {split_date.strftime('%d/%m/%Y')}")
+                
+                is_trades = trades[trades['Time'] <= split_date]
+                oos_trades = trades[trades['Time'] > split_date]
                 
                 is_profit = is_trades['Profit'].sum()
                 oos_profit = oos_trades['Profit'].sum()
@@ -1545,128 +2045,243 @@ def main():
                 st.error("❌ **WFE Âm**: Chiến lược thua lỗ trong OOS.")
 
     # ── INSIGHTS SUMMARY ──────────────────────────────────────
-    st.header("8️⃣ 💡 Tổng Kết Hiệu Suất")
-    insights = []
-    if isinstance(m['Profit Factor'], float) and m['Profit Factor'] > 1.5:
-        insights.append("✅ **Profit Factor > 1.5**: Chiến lược có lợi thế rõ ràng.")
-    elif isinstance(m['Profit Factor'], float) and m['Profit Factor'] < 1.0:
-        insights.append("❌ **Profit Factor < 1.0**: Chiến lược đang THUA ròng. Cần xem lại logic.")
-    if m['Max DD (%)'] > 30:
-        insights.append("⚠️ **Max DD > 30%**: Rủi ro sụt giảm vốn quá cao. Cân nhắc giảm lot hoặc thêm filter.")
-    if m['Avg R:R'] > 1.5:
-        insights.append("✅ **R:R trung bình > 1.5**: Chiến lược cho phép win rate thấp mà vẫn có lãi.")
-    elif m['Avg R:R'] < 1.0:
-        insights.append("⚠️ **R:R < 1.0**: Mỗi lệnh thua lớn hơn lệnh thắng. Cần win rate cao để bù đắp.")
-    if risk_of_ruin > 5:
-        insights.append(f"🔴 **Risk of Ruin = {risk_of_ruin:.1f}%**: Xác suất cháy tài khoản đáng lo ngại.")
-    else:
-        insights.append(f"🟢 **Risk of Ruin = {risk_of_ruin:.1f}%**: Xác suất cháy tài khoản thấp.")
-    if ks_pval < 0.05:
-        insights.append("📊 **Fat-tail detected**: Profit phụ thuộc vào một số lệnh lớn bất thường. "
-                        "Nếu mất các lệnh này, hiệu suất sẽ giảm đáng kể.")
+    if current_sub_route in ["all", "quant_wfe"]:
+        st.header("8️⃣ 💡 Tổng Kết Hiệu Suất")
+        insights = []
+        if isinstance(m['Profit Factor'], float) and m['Profit Factor'] > 1.5:
+            insights.append("✅ **Profit Factor > 1.5**: Chiến lược có lợi thế rõ ràng.")
+        elif isinstance(m['Profit Factor'], float) and m['Profit Factor'] < 1.0:
+            insights.append("❌ **Profit Factor < 1.0**: Chiến lược đang THUA ròng. Cần xem lại logic.")
+        if m['Max DD (%)'] > 30:
+            insights.append("⚠️ **Max DD > 30%**: Rủi ro sụt giảm vốn quá cao. Cân nhắc giảm lot hoặc thêm filter.")
+        if m['Avg R:R'] > 1.5:
+            insights.append("✅ **R:R trung bình > 1.5**: Chiến lược cho phép win rate thấp mà vẫn có lãi.")
+        elif m['Avg R:R'] < 1.0:
+            insights.append("⚠️ **R:R < 1.0**: Mỗi lệnh thua lớn hơn lệnh thắng. Cần win rate cao để bù đắp.")
+        if risk_of_ruin > 5:
+            insights.append(f"🔴 **Risk of Ruin = {risk_of_ruin:.1f}%**: Xác suất cháy tài khoản đáng lo ngại.")
+        else:
+            insights.append(f"🟢 **Risk of Ruin = {risk_of_ruin:.1f}%**: Xác suất cháy tài khoản thấp.")
+        if ks_pval < 0.05:
+            insights.append("📊 **Fat-tail detected**: Profit phụ thuộc vào một số lệnh lớn bất thường. "
+                            "Nếu mất các lệnh này, hiệu suất sẽ giảm đáng kể.")
 
-    # Time insights
-    tcol = 'OpenTime' if 'OpenTime' in trades.columns and trades['OpenTime'].notna().any() else 'Time'
-    if tcol in trades.columns:
-        tdf = trades[[tcol, 'Profit']].dropna(subset=[tcol, 'Profit']).copy()
-        tdf['Hour'] = tdf[tcol].dt.hour
-        hour_profit = tdf.groupby('Hour')['Profit'].sum()
-        if not hour_profit.empty:
-            worst_hour = hour_profit.idxmin()
-            best_hour = hour_profit.idxmax()
-            if hour_profit[worst_hour] < 0:
-                insights.append(f"⏰ **Giờ thua lỗ nhiều nhất**: {worst_hour}:00 (${hour_profit[worst_hour]:,.0f}). "
-                               f"Cân nhắc tạo bộ lọc thời gian để tránh phiên này.")
-            insights.append(f"⏰ **Giờ lãi nhiều nhất**: {best_hour}:00 (${hour_profit[best_hour]:,.0f}).")
+        # Time insights
+        tcol = 'OpenTime' if 'OpenTime' in trades.columns and trades['OpenTime'].notna().any() else 'Time'
+        if tcol in trades.columns:
+            tdf = trades[[tcol, 'Profit']].dropna(subset=[tcol, 'Profit']).copy()
+            tdf['Hour'] = tdf[tcol].dt.hour
+            hour_profit = tdf.groupby('Hour')['Profit'].sum()
+            if not hour_profit.empty:
+                worst_hour = hour_profit.idxmin()
+                best_hour = hour_profit.idxmax()
+                if hour_profit[worst_hour] < 0:
+                    insights.append(f"⏰ **Giờ thua lỗ nhiều nhất**: {worst_hour}:00 (${hour_profit[worst_hour]:,.0f}). "
+                                   f"Cân nhắc tạo bộ lọc thời gian để tránh phiên này.")
+                insights.append(f"⏰ **Giờ lãi nhiều nhất**: {best_hour}:00 (${hour_profit[best_hour]:,.0f}).")
 
-    for ins in insights:
-        st.markdown(ins)
+        for ins in insights:
+            st.markdown(ins)
 
     # ── STEP 9: AI STRATEGY PROFILING (REGIME DNA) ────────────────
-    st.header("9️⃣ 🧬 AI Strategy Profiling (Reverse Regime DNA)")
-    st.markdown("""
-    Giải mã "ADN bối cảnh" của chiến lược: Học máy (Decision Tree) đối chiếu bối cảnh lúc Thắng vs Thua để tự động bốc tách ra luật lọc MQL5 gắn ngược lại vào EA.
-    """)
+    if current_sub_route in ["all", "dna_ai"]:
+        st.header("9️⃣ 🧬 AI Strategy Profiling (Reverse Regime DNA v2)")
+        st.markdown("""
+        **DNA v2 (Expectancy Block-List)** — theo dõi **trên Streamlit Live Monitor** (không cần gắn MT5):
+        1. Map regime tại **OpenTime** (nến đã đóng) — chống lookahead.
+        2. Học **expectancy ($/lệnh)** → **block-list leaf toxic**.
+        3. Deploy tree = **train-only** (khớp OOS); Live Monitor chạy **cùng `rule_paths`**.
+        """)
 
-    import regime_analyzer
-    saved_profile = regime_analyzer.load_regime_registry(selected)
-    
-    if saved_profile:
-        st.success(f"💾 **Đã tìm thấy Hồ sơ Regime DNA lưu trữ trong Registry** (Cập nhật: `{saved_profile.get('last_updated', 'N/A')}` | Khung: `{saved_profile.get('timeframe', '1h')}`). Bạn không cần tốn thời gian chạy lại!")
-        with st.expander("⚡ Xem ngay Hồ sơ Regime DNA đã lưu cho chiến lược này", expanded=True):
-            render_dna_tabs(saved_profile)
-
-    workspace_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    ohlc_upload = st.file_uploader("📥 Tải lên file dữ liệu giá OHLC (.csv) từ máy của bạn:", type=["csv"])
-    if ohlc_upload is not None:
-        file_key_ohlc = f"{ohlc_upload.name}_{ohlc_upload.size}"
-        if st.session_state.get("last_ohlc_key") != file_key_ohlc:
-            save_ohlc_path = os.path.join(BACKTEST_DIR, ohlc_upload.name)
-            with open(save_ohlc_path, "wb") as f:
-                f.write(ohlc_upload.getbuffer())
-            with open(os.path.join(workspace_dir, ohlc_upload.name), "wb") as f:
-                f.write(ohlc_upload.getbuffer())
-            st.success(f"Đã lưu file OHLC lên server: `{ohlc_upload.name}`")
-            if service and drive_folder_id:
-                with st.spinner("☁️ Đang đồng bộ file OHLC sang Google Drive..."):
-                    sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=save_ohlc_path)
-            st.session_state["last_ohlc_key"] = file_key_ohlc
+        import importlib
+        import regime_analyzer
+        # Streamlit keeps modules in memory — reload so DNA signature/fixes always apply
+        regime_analyzer = importlib.reload(regime_analyzer)
+        saved_profile = regime_analyzer.load_regime_registry(selected)
         
-    raw_ohlc = sorted(list(set(glob.glob(os.path.join(workspace_dir, "*.csv")) + glob.glob(os.path.join(BACKTEST_DIR, "*.csv")))))
-    ohlc_files = [f for f in raw_ohlc if is_ohlc_file(f)]
-    ohlc_names = [os.path.basename(f) for f in ohlc_files]
-    
-    ohlc_source_mode = st.radio("🔌 Nguồn lấy lịch sử giá OHLC để soi bối cảnh:", ["🌐 Tải từ Yahoo Finance API (Tự động & Khuyên dùng)", "📂 Chọn file CSV (Đã tải lên hoặc có sẵn)"], horizontal=True)
-    
-    ohlc_ref_name = ""
-    sel_ohlc = None
-    
-    if ohlc_source_mode == "🌐 Tải từ Yahoo Finance API (Tự động & Khuyên dùng)":
-        col_ps1, col_ps2 = st.columns([2, 1])
-        prof_symbol = col_ps1.text_input("Nhập mã giao dịch (Symbol trên Yahoo Finance):", value="GC=F", help="Ví dụ: GC=F (Vàng Futures), EURUSD=X (Forex EURUSD), BTC-USD")
-        prof_period = col_ps2.selectbox("Thời gian lịch sử:", ["2y", "1y", "5y", "60d"], index=0, help="Nên chọn 2y hoặc 5y để khớp tốt nhất với lịch sử backtest")
-        ohlc_ref_name = f"Yahoo_{prof_symbol}_{prof_period}"
-    else:
-        if not ohlc_names:
-            st.warning("⚠️ Chưa có file CSV nào trên server. Vui lòng sử dụng tính năng tải lên file CSV ở trên.")
-        else:
-            sel_ohlc = st.selectbox("📥 Chọn file CSV có sẵn trên hệ thống:", ohlc_names)
-            ohlc_ref_name = sel_ohlc
+        if saved_profile:
+            has_rules = bool(saved_profile.get("rule_paths"))
+            msg = (
+                f"💾 **Hồ sơ DNA** (cập nhật: `{saved_profile.get('last_updated', 'N/A')}` | "
+                f"TF: `{saved_profile.get('timeframe', '1h')}`)"
+            )
+            if has_rules:
+                st.success(msg + " · có **rule_paths** cho Live Monitor.")
+            else:
+                st.warning(msg + " · **thiếu rule_paths** (registry cũ) — nên train lại.")
+            with st.expander("⚡ Xem ngay Hồ sơ Regime DNA đã lưu cho chiến lược này", expanded=True):
+                render_dna_tabs(saved_profile)
+
+        workspace_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        ohlc_upload = st.file_uploader("📥 Tải lên file dữ liệu giá OHLC (.csv) từ máy của bạn:", type=["csv"])
+        if ohlc_upload is not None:
+            file_key_ohlc = f"{ohlc_upload.name}_{ohlc_upload.size}"
+            if st.session_state.get("last_ohlc_key") != file_key_ohlc:
+                save_ohlc_path = os.path.join(BACKTEST_DIR, ohlc_upload.name)
+                with open(save_ohlc_path, "wb") as f:
+                    f.write(ohlc_upload.getbuffer())
+                with open(os.path.join(workspace_dir, ohlc_upload.name), "wb") as f:
+                    f.write(ohlc_upload.getbuffer())
+                st.success(f"Đã lưu file OHLC lên server: `{ohlc_upload.name}`")
+                if service and drive_folder_id:
+                    with st.spinner("☁️ Đang đồng bộ file OHLC sang Google Drive..."):
+                        sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=save_ohlc_path)
+                st.session_state["last_ohlc_key"] = file_key_ohlc
             
-    prof_col3, prof_col4 = st.columns([1, 2])
-    max_depth_input = prof_col3.number_input("Độ sâu cây AI (Max Depth)", min_value=1, max_value=5, value=3)
-    timeframe_sel = prof_col4.selectbox("Khung thời gian soi bối cảnh", ["1h", "4h"], index=0)
-    
-    if st.button("🚀 Huấn luyện AI & Bốc tách Luật Regime DNA", type="primary"):
-        with st.spinner("Đang chuẩn bị dữ liệu lịch sử giá & tính toán 12+ chỉ số bối cảnh..."):
-            try:
-                if ohlc_source_mode == "🌐 Tải từ Yahoo Finance API (Tự động & Khuyên dùng)":
-                    df_tf, err_msg = regime_analyzer.fetch_historical_ohlc(prof_symbol, timeframe=timeframe_sel, period=prof_period)
-                    if err_msg or df_tf is None or df_tf.empty:
-                        st.error(f"❌ Lỗi tải dữ liệu từ Yahoo Finance: {err_msg or 'Không có dữ liệu.'}")
+        raw_ohlc = sorted(list(set(glob.glob(os.path.join(workspace_dir, "*.csv")) + glob.glob(os.path.join(BACKTEST_DIR, "*.csv")))))
+        ohlc_files = [f for f in raw_ohlc if is_ohlc_file(f)]
+        ohlc_names = [os.path.basename(f) for f in ohlc_files]
+        
+        ohlc_source_mode = st.radio(
+            "🔌 Nguồn OHLC để soi bối cảnh:",
+            [
+                "📂 Chọn file CSV MT5 (Khuyến nghị — cùng clock với backtest)",
+                "🟣 Twelve Data API (XAU/USD spot — không cần MT5)",
+                "🌐 Yahoo Finance API (GC=F futures — có thể lệch)",
+            ],
+            horizontal=True,
+        )
+        
+        ohlc_ref_name = ""
+        sel_ohlc = None
+        prof_symbol = "XAU/USD"
+        prof_period = "2y"
+        hist_source = "csv"
+        
+        if ohlc_source_mode.startswith("🟣"):
+            hist_source = "twelvedata"
+            st.caption(
+                "Twelve Data: **XAU/USD** spot (gần CFD hơn Yahoo GC=F). "
+                "Vẫn có thể lệch nhẹ vs broker — free plan giới hạn nến/credit."
+            )
+            td_key_dna = regime_analyzer.get_twelvedata_api_key(get_secret("TWELVE_DATA_API_KEY"))
+            if not td_key_dna:
+                st.warning("⚠️ Chưa thấy `TWELVE_DATA_API_KEY` trong secrets/env.")
+            col_ps1, col_ps2 = st.columns([2, 1])
+            prof_symbol = col_ps1.text_input(
+                "Symbol Twelve Data:",
+                value="XAU/USD",
+                help="XAU/USD, EUR/USD, BTC/USD — hoặc XAUUSD (tự map).",
+            )
+            prof_period = col_ps2.selectbox("Period:", ["2y", "1y", "60d", "5y"], index=0)
+            ohlc_ref_name = f"Twelve_{prof_symbol.replace('/', '')}_{prof_period}"
+        elif ohlc_source_mode.startswith("🌐"):
+            hist_source = "yahoo"
+            st.caption(
+                "⚠️ Yahoo vàng: **`GC=F`** (futures). DNA production nên CSV MT5."
+            )
+            col_ps1, col_ps2 = st.columns([2, 1])
+            prof_symbol = col_ps1.text_input(
+                "Symbol Yahoo:",
+                value="GC=F",
+                help="Vàng: GC=F | Forex: EURUSD=X | Crypto: BTC-USD.",
+            )
+            prof_period = col_ps2.selectbox("Period:", ["2y", "1y", "5y", "60d"], index=0)
+            ohlc_ref_name = f"Yahoo_{prof_symbol}_{prof_period}"
+        else:
+            hist_source = "csv"
+            if not ohlc_names:
+                st.warning("⚠️ Chưa có file CSV. Tải lên OHLC MT5 export ở trên.")
+            else:
+                sel_ohlc = st.selectbox("📥 File CSV OHLC:", ohlc_names)
+                ohlc_ref_name = sel_ohlc
+            
+        prof_col3, prof_col4, prof_col5, prof_col6 = st.columns([1, 1, 1, 1])
+        max_depth_input = prof_col3.number_input("Độ sâu cây AI (Max Depth)", min_value=1, max_value=5, value=3)
+        timeframe_sel = prof_col4.selectbox("Khung soi bối cảnh", ["1h", "4h"], index=0)
+        thr_mode_ui = prof_col5.selectbox(
+            "Chế độ ngưỡng thr",
+            ["auto (OOS pick)", "fixed"],
+            index=0,
+            help="auto: chọn thr tối ưu theo OOS. fixed: dùng đúng số bên cạnh.",
+        )
+        exp_thr_input = prof_col6.number_input(
+            "Ngưỡng expectancy ($)",
+            min_value=-20.0, max_value=20.0, value=-5.0, step=1.0,
+            help="fixed: chặn leaf exp ≤ giá trị này. auto: giá trị này là 1 candidate + các mốc -10/-5/-2/0.",
+        )
+
+        if st.button("🚀 Huấn luyện AI & Bốc tách Luật Regime DNA", type="primary"):
+            with st.spinner("Đang map OpenTime + tính chỉ số bối cảnh tại ENTRY + train expectancy tree..."):
+                try:
+                    if hist_source == "twelvedata":
+                        td_key_dna = regime_analyzer.get_twelvedata_api_key(get_secret("TWELVE_DATA_API_KEY"))
+                        df_tf, err_msg = regime_analyzer.fetch_historical_ohlc(
+                            prof_symbol,
+                            timeframe=timeframe_sel,
+                            period=prof_period,
+                            source="twelvedata",
+                            api_key=td_key_dna,
+                        )
+                        if err_msg or df_tf is None or df_tf.empty:
+                            st.error(f"❌ Lỗi Twelve Data: {err_msg or 'Không có dữ liệu.'}")
+                            return
+                        st.caption(
+                            f"Twelve Data: {len(df_tf)} nến · "
+                            f"`{getattr(df_tf, 'attrs', {}).get('twelvedata_symbol', prof_symbol)}`"
+                        )
+                    elif hist_source == "yahoo":
+                        df_tf, err_msg = regime_analyzer.fetch_historical_ohlc(
+                            prof_symbol, timeframe=timeframe_sel, period=prof_period, source="yahoo"
+                        )
+                        if err_msg or df_tf is None or df_tf.empty:
+                            st.error(f"❌ Lỗi Yahoo Finance: {err_msg or 'Không có dữ liệu.'}")
+                            return
+                    else:
+                        if not sel_ohlc:
+                            st.error("❌ Vui lòng chọn hoặc tải lên file CSV trước.")
+                            return
+                        ohlc_path = ohlc_files[ohlc_names.index(sel_ohlc)]
+                        df_m1 = regime_analyzer.load_ohlc(ohlc_path)
+                        df_tf = regime_analyzer.resample_ohlc(df_m1, timeframe_sel)
+
+                    # Always ensure OpenTime before DNA (st.cache_data / old .cache.pkl often strip pairing)
+                    def _dna_log(msg):
+                        st.caption(msg)
+
+                    trades_for_dna, ot_cov = ensure_trades_have_open_time(
+                        trades, backtest_path=file_path, log_progress=_dna_log
+                    )
+                    if ot_cov < 0.5:
+                        st.error(
+                            f"❌ OpenTime coverage chỉ {ot_cov*100:.1f}% — không thể train DNA "
+                            f"(tránh lookahead). Kiểm tra file backtest có bảng Deals với Direction in/out."
+                        )
                         return
-                else:
-                    if not sel_ohlc:
-                        st.error("❌ Vui lòng chọn hoặc tải lên file CSV trước.")
-                        return
-                    ohlc_path = ohlc_files[ohlc_names.index(sel_ohlc)]
-                    df_m1 = regime_analyzer.load_ohlc(ohlc_path)
-                    df_tf = regime_analyzer.resample_ohlc(df_m1, timeframe_sel)
-                
-                cache_p = os.path.join(BACKTEST_DIR, f"{ohlc_ref_name}_{timeframe_sel}_indicators.cache.pkl")
-                dna_res = regime_analyzer.extract_strategy_dna(df_tf, trades, max_depth=max_depth_input, cache_path=cache_p, strategy_name=selected)
-                
-                if "error" in dna_res:
-                    st.error(dna_res["error"])
-                else:
-                    regime_analyzer.save_regime_registry(selected, dna_res, ohlc_ref_name, timeframe_sel)
-                    if service and drive_folder_id:
-                        sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.REGISTRY_FILE)
-                    st.success(f"✅ Giải mã thành công & đã tự động lưu vào Registry!")
-                    render_dna_tabs(dna_res)
-            except Exception as e:
-                st.error(f"Lỗi khi giải mã DNA: {e}")
+                    if ot_cov < 0.95:
+                        st.warning(f"⚠️ OpenTime coverage {ot_cov*100:.1f}% < 95% — pairing một phần.")
+                    else:
+                        st.info(f"✅ OpenTime sẵn sàng: {ot_cov*100:.1f}% lệnh có thời điểm vào lệnh.")
+
+                    cache_p = os.path.join(BACKTEST_DIR, f"{ohlc_ref_name}_{timeframe_sel}_indicators.cache.pkl")
+                    thr_mode = "fixed" if thr_mode_ui.startswith("fixed") else "auto"
+                    dna_res = regime_analyzer.extract_strategy_dna(
+                        df_tf, trades_for_dna,
+                        max_depth=max_depth_input,
+                        cache_path=cache_p,
+                        strategy_name=selected,
+                        exp_threshold=float(exp_thr_input),
+                        filter_mode="block_toxic",
+                        threshold_mode=thr_mode,
+                    )
+
+                    if "error" in dna_res:
+                        st.error(dna_res["error"])
+                    else:
+                        regime_analyzer.save_regime_registry(selected, dna_res, ohlc_ref_name, timeframe_sel)
+                        if service and drive_folder_id:
+                            sync_drive(service, drive_folder_id, BACKTEST_DIR, force_upload_file=regime_analyzer.REGISTRY_FILE)
+                        st.success(
+                            f"✅ DNA v2 OK · thr={dna_res.get('exp_threshold')} ({dna_res.get('threshold_mode')}) · "
+                            f"toxic paths={len((dna_res.get('rule_paths') or {}).get('toxic_paths') or [])} · "
+                            f"đã lưu Registry cho Live Monitor"
+                        )
+                        render_dna_tabs(dna_res)
+                except Exception as e:
+                    st.error(f"Lỗi khi giải mã DNA: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
     # ── SIDEBAR EXPORT BUTTON ──
     st.sidebar.markdown("---")
