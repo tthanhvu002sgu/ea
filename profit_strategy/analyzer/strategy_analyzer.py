@@ -1577,10 +1577,10 @@ def main():
                         "Thời gian quét": rec.get("timestamp_logged", ""),
                         "Mã": rec.get("symbol", ""),
                         "Khung": rec.get("timeframe", ""),
-                        "ADX": f"{rec.get('adx', 0):.1f}",
-                        "Hurst": f"{rec.get('hurst', 0.5):.2f}",
-                        "Choppiness": f"{rec.get('choppiness', 50):.1f}",
-                        "BB Width": f"{rec.get('bb_width', 0):.3f}"
+                        "ADX": f"{rec.get('adx'):.1f}" if rec.get('adx') is not None else "N/A",
+                        "Hurst": f"{rec.get('hurst'):.2f}" if rec.get('hurst') is not None else "N/A",
+                        "Choppiness": f"{rec.get('choppiness'):.1f}" if rec.get('choppiness') is not None else "N/A",
+                        "BB Width": f"{rec.get('bb_width'):.3f}" if rec.get('bb_width') is not None else "N/A"
                     }
                     for ea_name, ea_data in rec.get("evaluations", {}).items():
                         st_icon = "🟢" if ea_data.get("status") == "PASS" else ("🟡" if ea_data.get("status") == "CAUTION" else "🔴")
