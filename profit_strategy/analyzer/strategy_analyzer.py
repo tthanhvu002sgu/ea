@@ -184,9 +184,23 @@ def sync_drive(service, folder_id, local_dir, force_upload_file=None):
         
         # Download từ Drive về local
         critical_json_files = {"strategy_regime_registry.json", "live_watchlist.json", "live_monitor_history.json"}
+        from datetime import datetime
         for name, file_id in file_id_map.items():
             local_path = os.path.join(local_dir, name)
             should_download = not os.path.exists(local_path) or os.path.getsize(local_path) == 0
+            
+            # Nếu file đã tồn tại cục bộ, so sánh thời gian sửa đổi của Drive với local để quyết định tải lại
+            if not should_download and os.path.exists(local_path):
+                try:
+                    drive_mod_time_str = drive_files[name].get('modifiedTime', '').replace('Z', '+00:00')
+                    drive_mtime = datetime.fromisoformat(drive_mod_time_str).timestamp()
+                    local_mtime = os.path.getmtime(local_path)
+                    # Nếu file trên Drive mới hơn (trên 2 giây để tránh lệch đồng hồ nhỏ), tải về cập nhật
+                    if drive_mtime > local_mtime + 2:
+                        should_download = True
+                except Exception:
+                    pass
+
             # Khi đồng bộ chung (force_upload_file is None), luôn tải các file cấu hình JSON quan trọng từ Drive nếu trên Drive có
             if not force_upload_file and name in critical_json_files:
                 should_download = True
